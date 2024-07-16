@@ -1,8 +1,8 @@
 #ifndef _DYNAMIC_LIMITS_CONFIG_H
 #define _DYNAMIC_LIMITS_CONFIG_H
 
-#include <slurm/slurm.h>
 #include <time.h>
+#include "slurm/slurm.h"
 #include "src/common/list.h"
 
 typedef struct {

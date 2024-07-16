@@ -1,5 +1,51 @@
-#include <slurm/slurm.h>
-#include <slurm/slurm_errno.h>
+/*****************************************************************************\
+ * job_submit_dynamic_limits.c - modify CPU limits based on idle resources
+ * 
+ * update slurm.conf with the following:
+ * JobSubmitPlugins=job_submit/dynamic_limits
+ * JobSubmitPluginsPartitionConfig=partition1:90:5:60,DEFAULT:95:10:15
+ * This plugin will adjust CPU limits for accounts, QOSs, etc based on the 
+ * idle resources in the partition. By DEFAULT the plugin will reduce CPU 
+ * limits by 10% if the partition is more than 95% utilized, and increase
+ * CPU limits by 10% if the partition is less than 95% utilized. The plugin
+ * will wait 15 minutes between adjustments and will not adjust limits if
+ * the cooldown period has not passed.
+ *****************************************************************************
+ *  Copyright (C) SchedMD LLC.
+ *
+ *  This file is part of Slurm, a resource management program.
+ *  For details, see <https://slurm.schedmd.com/>.
+ *  Please also read the included file: DISCLAIMER.
+ *
+ *  Slurm is free software; you can redistribute it and/or modify it under
+ *  the terms of the GNU General Public License as published by the Free
+ *  Software Foundation; either version 2 of the License, or (at your option)
+ *  any later version.
+ *
+ *  In addition, as a special exception, the copyright holders give permission
+ *  to link the code of portions of this program with the OpenSSL library under
+ *  certain conditions as described in each individual source file, and
+ *  distribute linked combinations including the two. You must obey the GNU
+ *  General Public License in all respects for all of the code used other than
+ *  OpenSSL. If you modify file(s) with this exception, you may extend this
+ *  exception to your version of the file(s), but you are not obligated to do
+ *  so. If you do not wish to do so, delete this exception statement from your
+ *  version.  If you delete this exception statement from all source files in
+ *  the program, then also delete it here.
+ *
+ *  Slurm is distributed in the hope that it will be useful, but WITHOUT ANY
+ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ *  FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+ *  details.
+ *
+ *  You should have received a copy of the GNU General Public License along
+ *  with Slurm; if not, write to the Free Software Foundation, Inc.,
+ *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
+\*****************************************************************************/
+
+#include "slurm/slurm.h"
+#include "slurm/slurm_errno.h"
+
 #include "src/common/node_select.h"
 #include "src/slurmctld/slurmctld.h"
 #include "src/common/slurm_accounting_storage.h"

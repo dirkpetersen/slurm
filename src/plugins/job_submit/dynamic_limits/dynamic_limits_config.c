@@ -1,5 +1,6 @@
-#include <slurm/slurm.h>
-#include <slurm/slurm_errno.h>
+#include "slurm/slurm.h"
+#include "slurm/slurm_errno.h"
+
 #include "src/common/xstring.h"
 #include "src/common/xmalloc.h"
 #include "src/common/parse_config.h"
