@@ -3,6 +3,7 @@
 SUBDIRS = \
 	all_partitions \
 	defaults \
+	dynamic_limits \
 	logging \
 	lua \
 	partition \
