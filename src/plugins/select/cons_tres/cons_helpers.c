@@ -46,58 +46,6 @@
 
 /* Global variables */
 
-/*
- * Get configured DefCpuPerGPU information from a list
- * (either global or per partition list)
- * Returns NO_VAL64 if configuration parameter not set
- */
-extern uint64_t cons_helpers_get_def_cpu_per_gpu(List job_defaults_list)
-{
-	uint64_t cpu_per_gpu = NO_VAL64;
-	list_itr_t *iter;
-	job_defaults_t *job_defaults;
-
-	if (!job_defaults_list)
-		return cpu_per_gpu;
-
-	iter = list_iterator_create(job_defaults_list);
-	while ((job_defaults = (job_defaults_t *) list_next(iter))) {
-		if (job_defaults->type == JOB_DEF_CPU_PER_GPU) {
-			cpu_per_gpu = job_defaults->value;
-			break;
-		}
-	}
-	list_iterator_destroy(iter);
-
-	return cpu_per_gpu;
-}
-
-/*
- * Get configured DefMemPerGPU information from a list
- * (either global or per partition list)
- * Returns NO_VAL64 if configuration parameter not set
- */
-extern uint64_t cons_helpers_get_def_mem_per_gpu(List job_defaults_list)
-{
-	uint64_t mem_per_gpu = NO_VAL64;
-	list_itr_t *iter;
-	job_defaults_t *job_defaults;
-
-	if (!job_defaults_list)
-		return mem_per_gpu;
-
-	iter = list_iterator_create(job_defaults_list);
-	while ((job_defaults = (job_defaults_t *) list_next(iter))) {
-		if (job_defaults->type == JOB_DEF_MEM_PER_GPU) {
-			mem_per_gpu = job_defaults->value;
-			break;
-		}
-	}
-	list_iterator_destroy(iter);
-
-	return mem_per_gpu;
-}
-
 extern bitstr_t **cons_helpers_mark_avail_cores(
 	bitstr_t *node_bitmap, job_record_t *job_ptr)
 {
@@ -112,12 +60,11 @@ extern bitstr_t **cons_helpers_mark_avail_cores(
 	uint16_t core_spec = job_ptr->details->core_spec;
 	uint32_t coff;
 	bool req_gpu = false;
-	uint32_t gpu_plugin_id = gres_get_gpu_plugin_id();
 
 	if ((job_ptr->details->whole_node == 1) ||
 	    (job_ptr->gres_list_req &&
-	     list_find_first(job_ptr->gres_list_req,
-			     gres_find_id, &gpu_plugin_id)))
+	     (list_find_first(job_ptr->gres_list_req, gres_find_gpu_or_alt,
+			      NULL))))
 		req_gpu = true;
 
 	avail_cores = build_core_array();
@@ -160,7 +107,7 @@ extern bitstr_t **cons_helpers_mark_avail_cores(
 
 		if (thread_spec &&
 		    (node_ptr->cpus == node_ptr->tot_cores))
-			/* Each core has one thead, reserve cores here */
+			/* Each core has one thread, reserve cores here */
 			node_core_spec = thread_spec;
 		else
 			node_core_spec = core_spec;

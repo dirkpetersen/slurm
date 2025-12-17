@@ -1,6 +1,5 @@
 /*****************************************************************************\
- *  slurm_acct_gather_energy.c - implementation-independent job energy
- *  accounting plugin definitions
+ *  acct_gather_energy.c - job energy accounting plugin definitions
  *****************************************************************************
  *  Copyright (C) SchedMD LLC.
  *  Copyright (C) 2012 Bull-HN-PHX.
@@ -52,6 +51,7 @@
 #include "src/common/plugin.h"
 #include "src/common/plugrack.h"
 #include "src/common/slurm_protocol_api.h"
+#include "src/common/threadpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 #include "src/interfaces/acct_gather_energy.h"
@@ -71,7 +71,7 @@ typedef struct slurm_acct_gather_energy_ops {
 				   int *full_options_cnt);
 	void (*conf_set)          (int context_id_in,
 				   s_p_hashtbl_t *tbl);
-	void (*conf_values)        (List *data);
+	void (*conf_values)        (list_t **data);
 } slurm_acct_gather_energy_ops_t;
 /*
  * These strings must be kept in the same order as the fields
@@ -185,6 +185,12 @@ extern int acct_gather_energy_fini(void)
 	int rc2, rc = SLURM_SUCCESS;
 
 	slurm_mutex_lock(&g_context_lock);
+
+	if (!init_run) {
+		slurm_mutex_unlock(&g_context_lock);
+		return SLURM_SUCCESS;
+	}
+
 	init_run = false;
 
 	if (watch_node_thread_id) {
@@ -193,6 +199,7 @@ extern int acct_gather_energy_fini(void)
 		slurm_cond_signal(&profile_timer->notify);
 		slurm_mutex_unlock(&profile_timer->notify_mutex);
 		slurm_thread_join(watch_node_thread_id);
+		watch_node_thread_id = 0;
 		slurm_mutex_lock(&g_context_lock);
 	}
 
@@ -239,6 +246,7 @@ extern void acct_gather_energy_pack(acct_gather_energy_t *energy, buf_t *buffer,
 			pack32(0, buffer);
 			pack64(0, buffer);
 			pack_time(0, buffer);
+			pack_time(0, buffer);
 			return;
 		}
 
@@ -248,6 +256,7 @@ extern void acct_gather_energy_pack(acct_gather_energy_t *energy, buf_t *buffer,
 		pack32(energy->current_watts, buffer);
 		pack64(energy->previous_consumed_energy, buffer);
 		pack_time(energy->poll_time, buffer);
+		pack_time(energy->slurmd_start_time, buffer);
 	}
 }
 
@@ -271,6 +280,7 @@ extern int acct_gather_energy_unpack(acct_gather_energy_t **energy,
 		safe_unpack32(&energy_ptr->current_watts, buffer);
 		safe_unpack64(&energy_ptr->previous_consumed_energy, buffer);
 		safe_unpack_time(&energy_ptr->poll_time, buffer);
+		safe_unpack_time(&energy_ptr->slurmd_start_time, buffer);
 	}
 
 	return SLURM_SUCCESS;

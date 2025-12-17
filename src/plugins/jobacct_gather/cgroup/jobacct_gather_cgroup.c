@@ -50,34 +50,9 @@
 #include "src/interfaces/proctrack.h"
 #include "src/slurmd/common/xcpuinfo.h"
 #include "src/slurmd/slurmd/slurmd.h"
-#include "src/plugins/jobacct_gather/cgroup/jobacct_gather_cgroup.h"
 #include "../common/common_jag.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobacct" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobacct/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Job accounting gather cgroup plugin";
 const char plugin_type[] = "jobacct_gather/cgroup";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -137,17 +112,26 @@ static void _prec_extra(jag_prec_t *prec, uint32_t taskid)
 		prec->tres_data[TRES_ARRAY_VMEM].size_read =
 			cgroup_acct_data->total_vmem;
 
+		/*
+		 * Peak memory usage seen for the task.
+		 * memory.peak (Cgroup v2)
+		 * memory.max_usage_in_bytes (Cgroup v1)
+		 *
+		 * It will be set to INFINITE64 in case we don't get this
+		 * metric.
+		 * E.g. in RHEL8 memory.peak interface does not exist.
+		 *
+		 * We overload the size_write variable to store this metric.
+		 */
+		prec->tres_data[TRES_ARRAY_MEM].size_write =
+			cgroup_acct_data->memory_peak;
 	}
 
 	xfree(cgroup_acct_data);
 	return;
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
-extern int init (void)
+extern int init(void)
 {
 	if (running_in_slurmd() &&
 	    ((cgroup_g_initialize(CG_MEMORY) != SLURM_SUCCESS) ||
@@ -159,18 +143,12 @@ extern int init (void)
 	if (running_in_slurmstepd()) {
 		jag_common_init(cgroup_g_get_acct_units());
 
-		if (xcpuinfo_init() != SLURM_SUCCESS) {
-			return SLURM_ERROR;
-		}
-
 		/* Initialize the controllers which we want accounting for. */
 		if (cgroup_g_initialize(CG_MEMORY) != SLURM_SUCCESS) {
-			xcpuinfo_fini();
 			return SLURM_ERROR;
 		}
 
 		if (cgroup_g_initialize(CG_CPUACCT) != SLURM_SUCCESS) {
-			xcpuinfo_fini();
 			return SLURM_ERROR;
 		}
 	}
@@ -179,7 +157,7 @@ extern int init (void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini (void)
+extern void fini(void)
 {
 	if (running_in_slurmstepd()) {
 		/* Only destroy step if it has been previously created */
@@ -193,8 +171,6 @@ extern int fini (void)
 	}
 
 	debug("%s unloaded", plugin_name);
-
-	return SLURM_SUCCESS;
 }
 
 /*
@@ -213,7 +189,7 @@ extern int fini (void)
  *    is a Linux-style stat entry. We disregard the data if they look
  *    wrong.
  */
-extern void jobacct_gather_p_poll_data(List task_list, uint64_t cont_id,
+extern void jobacct_gather_p_poll_data(list_t *task_list, uint64_t cont_id,
 				       bool profile)
 {
 	static jag_callbacks_t callbacks;
@@ -240,6 +216,14 @@ extern int jobacct_gather_p_endpoll(void)
 extern int jobacct_gather_p_add_task(pid_t pid, jobacct_id_t *jobacct_id)
 {
 	int rc = SLURM_SUCCESS;
+
+	/*
+	 * If we are the extern step, then our PID is 0. In that case, we want
+	 * to return and not create any cgroups, as we do not exist as a real
+	 * process.
+	 */
+	if (!pid)
+		return rc;
 
 	if (is_first_task) {
 		/* Only do once in this plugin */

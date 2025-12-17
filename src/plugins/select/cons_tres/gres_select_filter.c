@@ -103,205 +103,191 @@ static bool _set_max_node_gres(sock_gres_t *sock_gres, uint64_t val)
 	return false;
 }
 
+static int _foreach_remove_unusable(void *x, void *arg)
+{
+	sock_gres_t *sock_gres = x;
+	gres_remove_unused_args_t *args = arg;
+	uint64_t max_gres, mem_per_gres = 0, near_gres_cnt = 0;
+	uint16_t cpus_per_gres;
+	uint64_t min_gres = 1, tmp_u64;
+	gres_job_state_t *gres_js = NULL;
+	int s;
+
+	xassert(sock_gres->gres_state_job);
+
+	gres_js = sock_gres->gres_state_job->gres_data;
+	if (args->whole_node)
+		min_gres = sock_gres->total_cnt;
+	else if (gres_js->gres_per_node)
+		min_gres = gres_js->gres_per_node;
+	if (gres_js->gres_per_socket) {
+		tmp_u64 = gres_js->gres_per_socket;
+		if (args->sock_per_node != NO_VAL)
+			tmp_u64 *= args->sock_per_node;
+		min_gres = MAX(min_gres, tmp_u64);
+	}
+	if (gres_js->gres_per_task) {
+		tmp_u64 = gres_js->gres_per_task;
+		if (args->task_per_node != NO_VAL16)
+			tmp_u64 *= args->task_per_node;
+		min_gres = MAX(min_gres, tmp_u64);
+	}
+
+	if (gres_js->cpus_per_gres)
+		cpus_per_gres = gres_js->cpus_per_gres;
+	else if (gres_js->ntasks_per_gres &&
+		 (gres_js->ntasks_per_gres != NO_VAL16))
+		cpus_per_gres = gres_js->ntasks_per_gres * args->cpus_per_task;
+	else
+		cpus_per_gres = gres_js->def_cpus_per_gres;
+	if (cpus_per_gres) {
+		max_gres = args->max_cpus / cpus_per_gres;
+		if ((max_gres == 0) || (gres_js->gres_per_node > max_gres) ||
+		    (gres_js->gres_per_task > max_gres) ||
+		    (gres_js->gres_per_socket > max_gres)) {
+			log_flag(SELECT_TYPE, "Insufficient CPUs for any GRES: max_gres (%"PRIu64") = max_cpus (%d) / cpus_per_gres (%d)",
+				 max_gres, args->max_cpus, cpus_per_gres);
+			return -1;
+		}
+	}
+
+	if (gres_js->mem_per_gres)
+		mem_per_gres = gres_js->mem_per_gres;
+	else
+		mem_per_gres = gres_js->def_mem_per_gres;
+	if (mem_per_gres && (args->avail_mem != NO_VAL64)) {
+		/* NO_VAL64 is set by caller if SELECT_MEMORY not in use */
+		if (mem_per_gres <= args->avail_mem) {
+			sock_gres->max_node_gres =
+				args->avail_mem / mem_per_gres;
+		} else {
+			log_flag(SELECT_TYPE, "Insufficient memory for any GRES: mem_per_gres (%"PRIu64") > avail_mem (%"PRIu64")",
+				 mem_per_gres, args->avail_mem);
+			return -1;
+		}
+	}
+
+	if (sock_gres->cnt_by_sock && !args->avail_cores_by_sock)
+		args->avail_cores_by_sock =
+			_build_avail_cores_by_sock(args->core_bitmap,
+						   args->sockets,
+						   args->cores_per_sock);
+
+	/*
+	 * NOTE: gres_per_socket enforcement is performed by
+	 * _build_sock_gres_by_topo(), called by gres_sock_list_create()
+	 */
+	if (sock_gres->cnt_by_sock && args->enforce_binding) {
+		for (s = 0; s < args->sockets; s++) {
+			if (!(args->avail_cores_by_sock)[s]) {
+				sock_gres->total_cnt -=
+					sock_gres->cnt_by_sock[s];
+				sock_gres->cnt_by_sock[s] = 0;
+			}
+		}
+		near_gres_cnt = sock_gres->total_cnt;
+	} else if (sock_gres->cnt_by_sock) { /* NO enforce_binding */
+		near_gres_cnt = sock_gres->total_cnt;
+		for (s = 0; s < args->sockets; s++) {
+			if (!(args->avail_cores_by_sock)[s]) {
+				near_gres_cnt -= sock_gres->cnt_by_sock[s];
+			}
+		}
+	} else {
+		near_gres_cnt = sock_gres->total_cnt;
+	}
+
+	if (!args->whole_node) {
+		/* If gres_per_node isn't set, try gres_per_job */
+		if (!_set_max_node_gres(sock_gres, gres_js->gres_per_node))
+			(void) _set_max_node_gres(sock_gres,
+						  gres_js->gres_per_job);
+	}
+
+	/* Avoid max_node_gres with ntasks_per_gres and whole node */
+	if (cpus_per_gres &&
+	    ((gres_js->ntasks_per_gres == NO_VAL16) || !args->whole_node)) {
+		int cpu_cnt;
+		cpu_cnt = bit_set_count(args->core_bitmap);
+		cpu_cnt *= args->cpus_per_core;
+		max_gres = cpu_cnt / cpus_per_gres;
+		if (max_gres == 0) {
+			log_flag(SELECT_TYPE, "max_gres == 0 == cpu_cnt (%d) / cpus_per_gres (%d)",
+				 cpu_cnt, cpus_per_gres);
+			return -1;
+		} else if ((sock_gres->max_node_gres == 0) ||
+			   (sock_gres->max_node_gres > max_gres)) {
+			sock_gres->max_node_gres = max_gres;
+		}
+	}
+	if (mem_per_gres && (args->avail_mem != NO_VAL64)) {
+		/* NO_VAL64 is set by caller if SELECT_MEMORY not in use */
+		max_gres = args->avail_mem / mem_per_gres;
+		sock_gres->total_cnt = MIN(sock_gres->total_cnt, max_gres);
+	}
+	if ((sock_gres->total_cnt < min_gres) ||
+	    ((sock_gres->max_node_gres != 0) &&
+	     (sock_gres->max_node_gres < min_gres))) {
+		log_flag(SELECT_TYPE, "min_gres (%"PRIu64") is > max_node_gres (%"PRIu64") or sock_gres->total_cnt (%"PRIu64")",
+			 min_gres, sock_gres->max_node_gres,
+			 sock_gres->total_cnt);
+		return -1;
+	}
+
+	if (gres_id_sharing(sock_gres->gres_state_job->plugin_id)) {
+		*(args->avail_gpus) += sock_gres->total_cnt;
+		if (sock_gres->max_node_gres &&
+		    (sock_gres->max_node_gres < near_gres_cnt))
+			near_gres_cnt = sock_gres->max_node_gres;
+		if (*(args->near_gpus) + near_gres_cnt < 0xff)
+			*(args->near_gpus) += near_gres_cnt;
+		else /* overflow */
+			*(args->near_gpus) = 0xff;
+	}
+
+	return 0;
+}
+
 /*
  * Determine which GRES can be used on this node given the available cores.
  *	Filter out unusable GRES.
  * IN sock_gres_list - list of sock_gres_t entries built by
  *                     gres_sock_list_create()
- * IN avail_mem - memory available for the job
- * IN max_cpus - maximum CPUs available on this node (limited by specialized
- *               cores and partition CPUs-per-node)
- * IN enforce_binding - GRES must be co-allocated with cores
- * IN core_bitmap - Identification of available cores on this node
- * IN sockets - Count of sockets on the node
- * IN cores_per_sock - Count of cores per socket on this node
- * IN cpus_per_core - Count of CPUs per core on this node
- * IN sock_per_node - sockets requested by job per node or NO_VAL
- * IN task_per_node - tasks requested by job per node or NO_VAL16
- * IN cpus_per_task - Count of CPUs per task
- * IN whole_node - we are requesting the whole node or not
- * OUT avail_gpus - Count of available GPUs on this node
- * OUT near_gpus - Count of GPUs available on sockets with available CPUs
+ * IN args->avail_mem - memory available for the job or NO_VAL64
+ *                      (when no SELECT_MEMORY)
+ * IN args->max_cpus - maximum CPUs available on this node (limited by
+ *                     specialized cores and partition CPUs-per-node)
+ * IN args->enforce_binding - GRES must be co-allocated with cores
+ * IN args->core_bitmap - Identification of available cores on this node
+ * IN args->sockets - Count of sockets on the node
+ * IN args->cores_per_sock - Count of cores per socket on this node
+ * IN args->cpus_per_core - Count of CPUs per core on this node
+ * IN args->sock_per_node - sockets requested by job per node or NO_VAL
+ * IN args->task_per_node - tasks requested by job per node or NO_VAL16
+ * IN args->cpus_per_task - Count of CPUs per task
+ * IN args->whole_node - we are requesting the whole node or not
+ * OUT args->avail_gpus - Count of available GPUs on this node
+ * OUT args->near_gpus - Count of GPUs available on sockets with available CPUs
  * RET - 0 if job can use this node, -1 otherwise (some GRES limit prevents use)
  */
-extern int gres_select_filter_remove_unusable(List sock_gres_list,
-					      uint64_t avail_mem,
-					      uint16_t max_cpus,
-					      bool enforce_binding,
-					      bitstr_t *core_bitmap,
-					      uint16_t sockets,
-					      uint16_t cores_per_sock,
-					      uint16_t cpus_per_core,
-					      uint32_t sock_per_node,
-					      uint16_t task_per_node,
-					      uint16_t cpus_per_task,
-					      bool whole_node,
-					      uint16_t *avail_gpus,
-					      uint16_t *near_gpus)
+extern int gres_select_filter_remove_unusable(list_t *sock_gres_list,
+					      gres_remove_unused_args_t *args)
 {
-	list_itr_t *sock_gres_iter;
-	sock_gres_t *sock_gres;
-	bool *avail_cores_by_sock = NULL;
-	uint64_t max_gres, mem_per_gres = 0, near_gres_cnt = 0;
-	uint16_t cpus_per_gres;
-	int s, rc = 0;
+	int rc = SLURM_SUCCESS;
 
-	*avail_gpus = 0;
-	*near_gpus = 0;
-	if (!core_bitmap || !sock_gres_list ||
+	xassert(args);
+	xassert(!args->avail_cores_by_sock); /* for internal use only */
+
+	*(args->avail_gpus) = 0;
+	*(args->near_gpus) = 0;
+	if (!args->core_bitmap || !sock_gres_list ||
 	    (list_count(sock_gres_list) == 0))
 		return rc;
 
-	sock_gres_iter = list_iterator_create(sock_gres_list);
-	while ((sock_gres = (sock_gres_t *) list_next(sock_gres_iter))) {
-		uint64_t min_gres = 1, tmp_u64;
-		gres_job_state_t *gres_js = NULL;
-		xassert(sock_gres->gres_state_job);
+	if (list_for_each(sock_gres_list, _foreach_remove_unusable, args) < 0)
+		rc = SLURM_ERROR;
 
-		gres_js = sock_gres->gres_state_job->gres_data;
-		if (whole_node)
-			min_gres = sock_gres->total_cnt;
-		else if (gres_js->gres_per_node)
-			min_gres = gres_js-> gres_per_node;
-		if (gres_js->gres_per_socket) {
-			tmp_u64 = gres_js->gres_per_socket;
-			if (sock_per_node != NO_VAL)
-				tmp_u64 *= sock_per_node;
-			min_gres = MAX(min_gres, tmp_u64);
-		}
-		if (gres_js->gres_per_task) {
-			tmp_u64 = gres_js->gres_per_task;
-			if (task_per_node != NO_VAL16)
-				tmp_u64 *= task_per_node;
-			min_gres = MAX(min_gres, tmp_u64);
-		}
-
-		if (gres_js->cpus_per_gres)
-			cpus_per_gres = gres_js->cpus_per_gres;
-		else if (gres_js->ntasks_per_gres &&
-			 (gres_js->ntasks_per_gres != NO_VAL16))
-			cpus_per_gres = gres_js->ntasks_per_gres *
-				cpus_per_task;
-		else
-			cpus_per_gres = gres_js->def_cpus_per_gres;
-		if (cpus_per_gres) {
-			max_gres = max_cpus / cpus_per_gres;
-			if ((max_gres == 0) ||
-			    (gres_js->gres_per_node > max_gres) ||
-			    (gres_js->gres_per_task > max_gres) ||
-			    (gres_js->gres_per_socket > max_gres)){
-				log_flag(SELECT_TYPE, "Insufficient CPUs for any GRES: max_gres (%"PRIu64") = max_cpus (%d) / cpus_per_gres (%d)",
-					 max_gres, max_cpus, cpus_per_gres);
-				rc = -1;
-				break;
-			}
-		}
-
-		if (gres_js->mem_per_gres)
-			mem_per_gres = gres_js->mem_per_gres;
-		else
-			mem_per_gres = gres_js->def_mem_per_gres;
-		if (mem_per_gres && (avail_mem != NO_VAL64)) {
-			/* NO_VAL64 is set by caller if CR_MEMORY not in use */
-			if (mem_per_gres <= avail_mem) {
-				sock_gres->max_node_gres = avail_mem /
-					mem_per_gres;
-			} else {
-				log_flag(SELECT_TYPE, "Insufficient memory for any GRES: mem_per_gres (%"PRIu64") > avail_mem (%"PRIu64")",
-					 mem_per_gres, avail_mem);
-				rc = -1;
-				break;
-			}
-		}
-
-		if (sock_gres->cnt_by_sock && !avail_cores_by_sock)
-			avail_cores_by_sock =_build_avail_cores_by_sock(
-				core_bitmap, sockets, cores_per_sock);
-
-		/*
-		 * NOTE: gres_per_socket enforcement is performed by
-		 * _build_sock_gres_by_topo(), called by
-		 * gres_sock_list_create()
-		 */
-		if (sock_gres->cnt_by_sock && enforce_binding) {
-			for (s = 0; s < sockets; s++) {
-				if (!avail_cores_by_sock[s]) {
-					sock_gres->total_cnt -=
-						sock_gres->cnt_by_sock[s];
-					sock_gres->cnt_by_sock[s] = 0;
-				}
-			}
-			near_gres_cnt = sock_gres->total_cnt;
-		} else if (sock_gres->cnt_by_sock) { /* NO enforce_binding */
-			near_gres_cnt = sock_gres->total_cnt;
-			for (s = 0; s < sockets; s++) {
-				if (!avail_cores_by_sock[s]) {
-					near_gres_cnt -=
-						sock_gres->cnt_by_sock[s];
-				}
-			}
-		} else {
-			near_gres_cnt = sock_gres->total_cnt;
-		}
-
-		if (!whole_node) {
-			/* If gres_per_node isn't set, try gres_per_job */
-			if (!_set_max_node_gres(
-				    sock_gres,
-				    gres_js->gres_per_node))
-				(void)_set_max_node_gres(
-					sock_gres,
-					gres_js->gres_per_job);
-		}
-
-		/* Avoid max_node_gres with ntasks_per_gres and whole node */
-		if (cpus_per_gres &&
-		    ((gres_js->ntasks_per_gres == NO_VAL16) ||
-		     !whole_node)) {
-			int cpu_cnt;
-			cpu_cnt = bit_set_count(core_bitmap);
-			cpu_cnt *= cpus_per_core;
-			max_gres = cpu_cnt / cpus_per_gres;
-			if (max_gres == 0) {
-				log_flag(SELECT_TYPE, "max_gres == 0 == cpu_cnt (%d) / cpus_per_gres (%d)",
-					 cpu_cnt, cpus_per_gres);
-				rc = -1;
-				break;
-			} else if ((sock_gres->max_node_gres == 0) ||
-				   (sock_gres->max_node_gres > max_gres)) {
-				sock_gres->max_node_gres = max_gres;
-			}
-		}
-		if (mem_per_gres && (avail_mem != NO_VAL64)) {
-			/* NO_VAL64 is set by caller if CR_MEMORY not in use */
-			max_gres = avail_mem / mem_per_gres;
-			sock_gres->total_cnt = MIN(sock_gres->total_cnt,
-						   max_gres);
-		}
-		if ((sock_gres->total_cnt < min_gres) ||
-		    ((sock_gres->max_node_gres != 0) &&
-		     (sock_gres->max_node_gres < min_gres))) {
-			log_flag(SELECT_TYPE, "min_gres (%"PRIu64") is > max_node_gres (%"PRIu64") or sock_gres->total_cnt (%"PRIu64")",
-				 min_gres, sock_gres->max_node_gres,
-				 sock_gres->total_cnt);
-			rc = -1;
-			break;
-		}
-
-		if (gres_id_sharing(sock_gres->gres_state_job->plugin_id)) {
-			*avail_gpus += sock_gres->total_cnt;
-			if (sock_gres->max_node_gres &&
-			    (sock_gres->max_node_gres < near_gres_cnt))
-				near_gres_cnt = sock_gres->max_node_gres;
-			if (*near_gpus + near_gres_cnt < 0xff)
-				*near_gpus += near_gres_cnt;
-			else /* overflow */
-				*near_gpus = 0xff;
-		}
-	}
-	list_iterator_destroy(sock_gres_iter);
-	xfree(avail_cores_by_sock);
-
+	xfree(args->avail_cores_by_sock);
 	return rc;
 }
 
@@ -312,6 +298,10 @@ static void _init_gres_per_bit_select(gres_job_state_t *gres_js, int node_inx)
 		gres_js->gres_per_bit_select = xcalloc(gres_js->total_node_cnt,
 						       sizeof(bitstr_t *));
 	}
+
+	if (gres_js->gres_per_bit_select[node_inx])
+		xfree(gres_js->gres_per_bit_select[node_inx]);
+
 	gres_js->gres_per_bit_select[node_inx] = xcalloc(
 		bit_size(gres_js->gres_bit_select[node_inx]), sizeof(uint64_t));
 }
@@ -352,8 +342,9 @@ static void _pick_shared_gres_topo(sock_gres_t *sock_gres, bool use_busy_dev,
 		if (use_busy_dev && (gres_ns->topo_gres_cnt_alloc[t] == 0))
 			continue;
 		cnt_avail = gres_ns->topo_gres_cnt_avail[t] -
-			gres_ns->topo_gres_cnt_alloc[t] -
 			gres_js->gres_per_bit_select[node_inx][t];
+		if (!sock_gres->use_total_gres) /* Subtract other jobs */
+			cnt_avail -= gres_ns->topo_gres_cnt_alloc[t];
 		if  (cnt_avail < (use_single_dev ? *gres_needed : 1))
 			continue; /* Insufficient resources */
 		if (!bit_test(sock_bits, t))
@@ -414,31 +405,11 @@ static int *_get_sorted_topo_by_least_loaded(gres_node_state_t *gres_ns)
 static void _pick_shared_gres(uint64_t *gres_needed, uint32_t *used_sock,
 			      sock_gres_t *sock_gres, int node_inx,
 			      bool use_busy_dev, bool use_single_dev,
-			      bool no_repeat, bool enforce_binding,
-			      uint32_t job_id, uint32_t total_res_gres,
-			      uint32_t *res_gres_per_sock,
-			      int sock_with_res_cnt, bool *satisfy_res_gres)
+			      bool no_repeat, bool enforce_binding)
 {
 	int *topo_index = NULL;
-	uint64_t sock_gres_needed;
-	uint64_t extra_gres;
 
-	if (total_res_gres && (total_res_gres > *gres_needed)) {
-		error("%s: Needed less gres then required by allocated restricted cores (%"PRIu64" < %d). Increasing needed gres for job %u on node %d",
-		      __func__, *gres_needed, total_res_gres, job_id, node_inx);
-		*gres_needed = total_res_gres;
-	}
-
-	if (use_single_dev && total_res_gres && (sock_with_res_cnt > 1)) {
-		/*
-		 * Have to allocate gres accross more then one socket.
-		 * This is assuming one socket per gres configueration line.
-		 */
-		*satisfy_res_gres = false;
-		return;
-	}
-
-	if (slurm_conf.select_type_param & LL_SHARED_GRES) {
+	if (slurm_conf.select_type_param & SELECT_LL_SHARED_GRES) {
 		topo_index = _get_sorted_topo_by_least_loaded(
 			sock_gres->gres_state_node->gres_data);
 	}
@@ -455,40 +426,9 @@ static void _pick_shared_gres(uint64_t *gres_needed, uint32_t *used_sock,
 	for (int s = 0; (s < sock_gres->sock_cnt) && *gres_needed; s++) {
 		if (!used_sock[s])
 			continue;
-		if (res_gres_per_sock && !use_single_dev) {
-			sock_gres_needed = res_gres_per_sock[s];
-			if (*gres_needed < total_res_gres)
-				extra_gres = *gres_needed - total_res_gres;
-			else
-				extra_gres = 0;
-			sock_gres_needed += extra_gres;
-
-			_pick_shared_gres_topo(sock_gres, use_busy_dev,
-					       use_single_dev, no_repeat,
-					       node_inx, s, &sock_gres_needed,
-					       topo_index);
-
-			if (sock_gres_needed > extra_gres) {
-				*satisfy_res_gres = false;
-				xfree(topo_index);
-				return;
-			}
-
-			*gres_needed -= sock_gres_needed;
-			total_res_gres -= res_gres_per_sock[s];
-		} else {
-			if (res_gres_per_sock && !res_gres_per_sock[s])
-				continue;
-			_pick_shared_gres_topo(sock_gres, use_busy_dev,
-					       use_single_dev, no_repeat,
-					       node_inx, s, gres_needed,
-					       topo_index);
-			if (res_gres_per_sock && *gres_needed) {
-				*satisfy_res_gres = false;
-				xfree(topo_index);
-				return;
-			}
-		}
+		_pick_shared_gres_topo(sock_gres, use_busy_dev, use_single_dev,
+				       no_repeat, node_inx, s, gres_needed,
+				       topo_index);
 	}
 
 	if (*gres_needed)
@@ -525,42 +465,30 @@ static void _pick_shared_gres(uint64_t *gres_needed, uint32_t *used_sock,
  */
 static int _set_shared_node_bits(int node_inx, int job_node_inx,
 				 sock_gres_t *sock_gres, uint32_t job_id,
-				 bool enforce_binding, uint32_t *used_sock,
-				 uint32_t total_res_gres,
-				 uint32_t *res_gres_per_sock,
-				 int sock_with_res_cnt)
+				 bool enforce_binding, uint32_t *used_sock)
 {
 	int rc = SLURM_SUCCESS;
 	gres_job_state_t *gres_js;
 	uint64_t gres_needed = 0;
 	bool use_busy_dev = gres_use_busy_dev(sock_gres->gres_state_node, 0);
-	bool satisfy_res_gres = true;
 
 	gres_js = sock_gres->gres_state_job->gres_data;
 	gres_needed = gres_js->gres_per_node;
 
 	/* Try to select a single sharing gres with sufficient available gres */
-	_pick_shared_gres(&gres_needed, used_sock, sock_gres,
-			  node_inx, use_busy_dev, true, false, enforce_binding,
-			  job_id, total_res_gres, res_gres_per_sock,
-			  sock_with_res_cnt, &satisfy_res_gres);
+	_pick_shared_gres(&gres_needed, used_sock, sock_gres, node_inx,
+			  use_busy_dev, true, false, enforce_binding);
 
 	if (gres_needed &&
-	    (slurm_conf.select_type_param & MULTIPLE_SHARING_GRES_PJ)) {
+	    (slurm_conf.select_type_param & SELECT_MULTIPLE_SHARING_GRES_PJ)) {
 		/* Select sharing gres with any available shared gres */
-		satisfy_res_gres = true;
 		_pick_shared_gres(&gres_needed, used_sock, sock_gres, node_inx,
-				  use_busy_dev, false, false, enforce_binding,
-				  job_id, total_res_gres, res_gres_per_sock,
-				  sock_with_res_cnt, &satisfy_res_gres);
+				  use_busy_dev, false, false, enforce_binding);
 	}
 
-	if (!satisfy_res_gres) {
-		error("Not enough shared gres on required sockets to satisfy allocated restricted gpu cores for job %u on node %d",
-		      job_id, node_inx);
-		rc = ESLURM_INVALID_GRES;
-	} else if (gres_needed) {
-		error("Not enough shared gres available to satisfy gres per node request");
+	if (gres_needed) {
+		error("Not enough shared gres available to satisfy gres per node request for job %u on node %s (node_inx %d)",
+		      job_id, node_record_table_ptr[node_inx]->name, node_inx);
 		rc = ESLURM_INVALID_GRES;
 	}
 
@@ -581,87 +509,70 @@ static int _set_shared_task_bits(int node_inx,
 				 uint32_t job_id,
 				 bool enforce_binding,
 				 bool no_task_sharing,
-				 uint32_t *tasks_per_socket,
-				 uint32_t total_res_gres,
-				 uint32_t *res_gres_per_sock,
-				 uint32_t sock_with_res_cnt)
+				 uint32_t *tasks_per_socket)
 {
 	gres_job_state_t *gres_js;
 	int rc = SLURM_SUCCESS;
 	bool use_busy_dev = gres_use_busy_dev(sock_gres->gres_state_node, 0);
-	bool satisfy_res_gres = true;
 
 	if (!tasks_per_socket) {
-		error("%s: tasks_per_socket unset for job %u on node %s",
-		      __func__, job_id, node_record_table_ptr[node_inx]->name);
+		error("%s: tasks_per_socket unset for job %u on node %s (node_inx %d)",
+		      __func__, job_id, node_record_table_ptr[node_inx]->name,
+		      node_inx);
 		return SLURM_ERROR;
 	}
 
 	gres_js = sock_gres->gres_state_job->gres_data;
 
-	if (!(slurm_conf.select_type_param & MULTIPLE_SHARING_GRES_PJ)) {
+	if (!(slurm_conf.select_type_param & SELECT_MULTIPLE_SHARING_GRES_PJ)) {
 		/* Allow only one sharing gres for the entire job */
 		uint64_t gres_needed = gres_js->gres_per_task *
 			_get_task_cnt_node(tasks_per_socket,
 					   sock_gres->sock_cnt);
 		if (no_task_sharing)
-			error("one-task-per-sharing requires MULTIPLE_SHARING_GRES_PJ to be set. Ignoring.");
+			error("one-task-per-sharing requires MULTIPLE_SHARING_GRES_PJ to be set. Ignoring flag for job %u on node %s (node_inx %d)",
+			      job_id, node_record_table_ptr[node_inx]->name,
+			      node_inx);
 
 		_pick_shared_gres(&gres_needed, tasks_per_socket, sock_gres,
 				  node_inx, use_busy_dev, true, false,
-				  enforce_binding, job_id, total_res_gres,
-				  res_gres_per_sock, sock_with_res_cnt,
-				  &satisfy_res_gres);
+				  enforce_binding);
 		if (gres_needed) {
-			error("Not enough shared gres available on one sharing gres to satisfy gres per task request");
+			error("Not enough shared gres available on one sharing gres to satisfy gres per task request for job %u on node %s (node_inx %d)",
+			      job_id, node_record_table_ptr[node_inx]->name,
+			      node_inx);
 			rc = ESLURM_INVALID_GRES;
 		}
 	} else {
 		/* Allow only one sharing gres per task */
 		uint32_t *used_sock = xcalloc(sock_gres->sock_cnt, sizeof(int));
-		for (int s = 0; s < sock_gres->sock_cnt; s++) {
+		uint64_t task_cnt = _get_task_cnt_node(tasks_per_socket,
+						       sock_gres->sock_cnt);
+		for (int s = 0; s < sock_gres->sock_cnt && task_cnt; s++) {
 			used_sock[s] = 1;
-			uint32_t sock_res_gres = 0;
-			uint32_t used_res = 0;
-			if (res_gres_per_sock && res_gres_per_sock[s]) {
-				sock_res_gres = res_gres_per_sock[s];
-
-				if ((tasks_per_socket[s] *
-				     gres_js->gres_per_task) < sock_res_gres) {
-					error("Requested too few gres to satisfy allocated restricted cores");
-					rc = ESLURM_INVALID_GRES;
-					break;
-				}
-			}
-
-			for (int i = 0; i < tasks_per_socket[s]; i++) {
+			for (int i = 0; i < tasks_per_socket[s] && task_cnt;
+			     i++) {
 				uint64_t gres_needed = gres_js->gres_per_task;
-				uint32_t this_task_res_gres = 0;
-				if (sock_res_gres)
-					this_task_res_gres =
-						MIN(gres_needed,
-						    (sock_res_gres - used_res));
 				_pick_shared_gres(&gres_needed, used_sock,
 						  sock_gres, node_inx,
 						  use_busy_dev, true,
 						  no_task_sharing,
-						  enforce_binding, job_id,
-						  this_task_res_gres,
-						  res_gres_per_sock, 1,
-						  &satisfy_res_gres);
-				if (sock_res_gres)
-					used_res += this_task_res_gres;
-				if (!satisfy_res_gres) {
-					error("Not enough shared gres on required sockets to satisfy allocated restricted gpu cores for job %u on node %d",
-					      job_id, node_inx);
-					rc = ESLURM_INVALID_GRES;
-				} else if (gres_needed) {
-					error("Not enough shared gres available to satisfy gres per task request");
-					rc = ESLURM_INVALID_GRES;
+						  enforce_binding);
+				if (gres_needed) {
+					/* Move on to next socket */
 					break;
+				} else {
+					/* Success */
+					task_cnt--;
 				}
 			}
 			used_sock[s] = 0;
+		}
+		if (task_cnt) {
+			error("Not enough shared gres available to satisfy gres per task request for job %u on node %s (node_inx %d) (%"PRIu64" tasks unable to select gres)",
+			      job_id, node_record_table_ptr[node_inx]->name,
+			      node_inx, task_cnt);
+			rc = ESLURM_INVALID_GRES;
 		}
 		xfree(used_sock);
 	}
@@ -691,7 +602,7 @@ static void _update_and_sort_by_links(int *sorted_gres, int *links_cnt,
 	sorting_links_cnt = NULL;
 }
 
-static uint64_t _pick_gres_topo(sock_gres_t *sock_gres, int gres_needed,
+static uint64_t _pick_gres_topo(sock_gres_t *sock_gres, uint64_t gres_needed,
 				int node_inx, int socket_index,
 				int *sorted_gres, int *links_cnt)
 {
@@ -720,9 +631,11 @@ static uint64_t _pick_gres_topo(sock_gres_t *sock_gres, int gres_needed,
 		int g = sorted_gres ? sorted_gres[i] : i;
 		if (!bit_test(sock_bits, g))
 			continue; /* GRES not on this socket */
-		if (bit_test(gres_js->gres_bit_select[node_inx], g) ||
+		if (bit_test(gres_js->gres_bit_select[node_inx], g))
+			continue; /* Already selected for this job */
+		if (!sock_gres->use_total_gres &&
 		    bit_test(gres_ns->gres_bit_alloc, g))
-			continue; /* Already allocated GRES */
+			continue; /* Already allocated to other jobs */
 		bit_set(gres_js->gres_bit_select[node_inx], g);
 		gres_js->gres_cnt_node_select[node_inx]++;
 		gres_still_needed--;
@@ -745,12 +658,12 @@ static uint64_t _pick_gres_topo(sock_gres_t *sock_gres, int gres_needed,
  * job_id IN - job ID for logging
  * tres_mc_ptr IN - job's multi-core options
  */
-static void _set_sock_bits(int node_inx, int job_node_inx,
-			   sock_gres_t *sock_gres, uint32_t job_id,
-			   gres_mc_data_t *tres_mc_ptr,
-			   uint32_t *used_cores_on_sock,
-			   uint32_t *res_gres_per_sock, uint32_t total_res_gres,
-			   uint32_t used_sock_cnt, bool enforce_binding)
+static int _set_sock_bits(int node_inx, int job_node_inx,
+			  sock_gres_t *sock_gres, uint32_t job_id,
+			  gres_mc_data_t *tres_mc_ptr,
+			  uint32_t *used_cores_on_sock,
+			  uint32_t *res_gres_per_sock, uint32_t total_res_gres,
+			  uint32_t used_sock_cnt, bool enforce_binding)
 {
 	int gres_cnt;
 	uint16_t sock_cnt = 0;
@@ -776,9 +689,10 @@ static void _set_sock_bits(int node_inx, int job_node_inx,
 		allocated_array_copy = true;
 		if (tres_mc_ptr->sockets_per_node > used_sock_cnt) {
 			/* Somehow we have too few sockets in job allocation */
-			error("%s: Inconsistent requested/allocated socket count (%d > %d) for job %u on node %d",
+			error("%s: Inconsistent requested/allocated socket count (%d > %d) for job %u on node %s (node_inx %d)",
 			      __func__, tres_mc_ptr->sockets_per_node,
-			      used_sock_cnt, job_id, node_inx);
+			      used_sock_cnt, job_id,
+			      node_record_table_ptr[node_inx]->name, node_inx);
 			for (s = 0; s < sock_cnt; s++) {
 				if (used_sock[s] || !sock_gres->bits_by_sock[s])
 					continue;
@@ -798,9 +712,10 @@ static void _set_sock_bits(int node_inx, int job_node_inx,
 			}
 		} else {
 			/* May have needed extra CPUs, exceeding socket count */
-			debug("%s: Inconsistent requested/allocated socket count (%d < %d) for job %u on node %d",
+			debug("%s: Inconsistent requested/allocated socket count (%d < %d) for job %u on node %s (node_inx %d)",
 			      __func__, tres_mc_ptr->sockets_per_node,
-			      used_sock_cnt, job_id, node_inx);
+			      used_sock_cnt, job_id,
+			      node_record_table_ptr[node_inx]->name, node_inx);
 			for (s = 0; s < sock_cnt; s++) {
 				if (!used_sock[s] ||
 				    !sock_gres->bits_by_sock[s])
@@ -892,17 +807,20 @@ static void _set_sock_bits(int node_inx, int job_node_inx,
 		}
 	}
 
-	if (gres_needed) {
-		/* Something bad happened on task layout for this GRES type */
-		error("%s: Insufficient gres/%s allocated for job %u on node_inx %u (gres still needed %"PRIu64")",
-		      __func__, sock_gres->gres_state_job->gres_name, job_id,
-		      node_inx, gres_needed);
-	}
-
 	xfree(links_cnt);
 	xfree(sorted_gres);
 	if (allocated_array_copy)
 		xfree(used_sock);
+
+	if (gres_needed) {
+		error("%s: Insufficient gres/%s allocated for job %u on node %s (node_inx %d) (gres still needed %"PRIu64", total requested: %"PRIu64", gres per socket: %"PRIu64")",
+		      __func__, sock_gres->gres_state_job->gres_name, job_id,
+		      node_record_table_ptr[node_inx]->name, node_inx,
+		      gres_needed, used_sock_cnt * gres_js->gres_per_socket,
+		      gres_js->gres_per_socket);
+		return ESLURM_INVALID_GRES;
+	}
+	return SLURM_SUCCESS;
 }
 
 /*
@@ -922,7 +840,7 @@ static int _set_job_bits1(int node_inx, int job_node_inx, int rem_nodes,
 			  sock_gres_t *sock_gres, uint32_t job_id,
 			  gres_mc_data_t *tres_mc_ptr, uint16_t cpus_per_core,
 			  uint32_t *cores_on_sock, uint32_t total_cores,
-			  uint32_t total_res_gres)
+			  uint32_t total_res_gres, bool enforce_binding)
 {
 	int gres_cnt;
 	uint16_t sock_cnt = 0;
@@ -933,6 +851,7 @@ static int _set_job_bits1(int node_inx, int job_node_inx, int rem_nodes,
 	int max_gres, pick_gres;
 	int fini = 0;
 	uint16_t cpus_per_gres = 0;
+	float gres_needed_per_core;
 
 	gres_js = sock_gres->gres_state_job->gres_data;
 	gres_ns = sock_gres->gres_state_node->gres_data;
@@ -953,6 +872,9 @@ static int _set_job_bits1(int node_inx, int job_node_inx, int rem_nodes,
 			tres_mc_ptr->cpus_per_task;
 	}
 	if (cpus_per_gres) {
+		if (tres_mc_ptr->threads_per_core)
+			cpus_per_core = MIN(cpus_per_core,
+					    tres_mc_ptr->threads_per_core);
 		max_gres = MIN(max_gres,
 			       ((total_cores * cpus_per_core) /
 				cpus_per_gres));
@@ -972,23 +894,28 @@ static int _set_job_bits1(int node_inx, int job_node_inx, int rem_nodes,
 		 * least one gpu on the node anyway.
 		 * For example --gpus=typeA:2,typeB:1 where there is only one
 		 * typeA on each node then two nodes are required. Because this
-		 * is not a heterogenous job a typeB gpu does have to be
+		 * is not a heterogeneous job a typeB gpu does have to be
 		 * allocated on each node even though they only requested one
 		 * for the job.
 		 */
 		pick_gres = MAX(max_gres, 1);
 	}
+
+	gres_needed_per_core = (float)pick_gres / (float)total_cores;
+
 	/*
 	 * Now pick specific GRES for these sockets.
-	 * First select all GRES that we might possibly use, starting with
-	 * those not constrained by socket, then contrained by socket.
+	 * First select all GRES that we might possibly use
 	 * Then remove those which are not required and not "best".
 	 */
 	for (s = 0; ((s < sock_cnt) && (alloc_gres_cnt < pick_gres)); s++) {
 		if (!cores_on_sock[s])
 			continue;
+		int sock_gres_needed = MIN(pick_gres - alloc_gres_cnt,
+					   (int)(cores_on_sock[s] *
+						 gres_needed_per_core));
 		alloc_gres_cnt += _pick_gres_topo(sock_gres,
-						  (pick_gres - alloc_gres_cnt),
+						  sock_gres_needed,
 						  node_inx, s, NULL, NULL);
 	}
 	if (alloc_gres_cnt < pick_gres)
@@ -996,7 +923,15 @@ static int _set_job_bits1(int node_inx, int job_node_inx, int rem_nodes,
 						  (pick_gres - alloc_gres_cnt),
 						  node_inx, ANY_SOCK_TEST, NULL,
 						  NULL);
-	if (alloc_gres_cnt == 0) {
+	for (s = 0; ((s < sock_cnt) && (alloc_gres_cnt < pick_gres)); s++) {
+		if (!cores_on_sock[s])
+			continue;
+		alloc_gres_cnt += _pick_gres_topo(sock_gres,
+						  (pick_gres - alloc_gres_cnt),
+						  node_inx, s, NULL, NULL);
+	}
+
+	if (alloc_gres_cnt == 0 && !enforce_binding) {
 		for (s = 0; ((s < sock_cnt) && (alloc_gres_cnt == 0)); s++) {
 			if (cores_on_sock[s])
 				continue;
@@ -1005,8 +940,9 @@ static int _set_job_bits1(int node_inx, int job_node_inx, int rem_nodes,
 		}
 	}
 	if (alloc_gres_cnt == 0) {
-		error("%s: job %u failed to find any available GRES on node %d",
-		      __func__, job_id, node_inx);
+		error("%s: job %u failed to find any available GRES on node %s (node_inx %d)",
+		      __func__, job_id, node_record_table_ptr[node_inx]->name,
+		      node_inx);
 	}
 	/* Now pick the "best" max_gres GRES with respect to link counts. */
 	if (alloc_gres_cnt > max_gres) {
@@ -1087,8 +1023,9 @@ static int _set_job_bits2(int node_inx, int job_node_inx,
 	}
 	if (!gres_js->gres_bit_select ||
 	    !gres_js->gres_bit_select[node_inx]) {
-		error("%s: gres_bit_select NULL for job %u on node %d",
-		      __func__, job_id, node_inx);
+		error("%s: gres_bit_select NULL for job %u on node %s (node_inx %d)",
+		      __func__, job_id, node_record_table_ptr[node_inx]->name,
+		      node_inx);
 		return SLURM_ERROR;
 	}
 
@@ -1158,19 +1095,19 @@ static int _set_job_bits2(int node_inx, int job_node_inx,
  * job_id IN - job ID for logging
  * tres_mc_ptr IN - job's multi-core options
  */
-static void _set_node_bits(int node_inx, int job_node_inx,
-			   sock_gres_t *sock_gres, uint32_t job_id,
-			   uint32_t *used_cores_on_sock, uint32_t used_core_cnt,
-			   uint32_t total_res_gres, bool enforce_binding)
+static int _set_node_bits(int node_inx, int job_node_inx,
+			  sock_gres_t *sock_gres, uint32_t job_id,
+			  uint32_t *used_cores_on_sock, uint32_t used_core_cnt,
+			  uint32_t total_res_gres, bool enforce_binding)
 {
 	int gres_cnt;
 	uint16_t sock_cnt = 0;
 	int g, s;
 	gres_job_state_t *gres_js;
 	gres_node_state_t *gres_ns;
-	uint32_t gres_needed;
+	uint64_t gres_needed;
 	int *links_cnt = NULL, *sorted_gres = NULL;
-	float gres_needed_per_core;
+	double gres_needed_per_core;
 
 	gres_js = sock_gres->gres_state_job->gres_data;
 	gres_ns = sock_gres->gres_state_node->gres_data;
@@ -1178,10 +1115,10 @@ static void _set_node_bits(int node_inx, int job_node_inx,
 
 	gres_cnt = bit_size(gres_js->gres_bit_select[node_inx]);
 	gres_needed = gres_js->gres_per_node - total_res_gres;
-	gres_needed_per_core = (float)gres_needed / (float)used_core_cnt;
+	gres_needed_per_core = (double)gres_needed / (double)used_core_cnt;
 
 	if (!gres_needed)
-		return;
+		return SLURM_SUCCESS;
 
 	if (gres_ns->link_len == gres_cnt) {
 		links_cnt = xcalloc(gres_cnt, sizeof(int));
@@ -1194,7 +1131,7 @@ static void _set_node_bits(int node_inx, int job_node_inx,
 
 	/*
 	 * Now pick specific GRES for these sockets.
-	 * First: Try to place one GRES per socket in this job's allocation.
+	 * First: Try to place GRES on sockets relative to allocated cores cnts.
 	 * Second: Try to place additional GRES on allocated sockets.
 	 * Third: Use any additional available GRES.
 	 */
@@ -1210,31 +1147,20 @@ static void _set_node_bits(int node_inx, int job_node_inx,
 	}
 
 	if (gres_needed) {
-		gres_needed -= _pick_gres_topo(sock_gres, 1, node_inx,
+		gres_needed -= _pick_gres_topo(sock_gres, gres_needed, node_inx,
 					       ANY_SOCK_TEST, sorted_gres,
 					       links_cnt);
 	}
 
-	/*
-	 * Try to place additional GRES on allocated sockets. Favor use of
-	 * GRES which are best linked to GRES which have already been selected.
-	 */
+	/* Try to place additional GRES on allocated sockets. */
 	for (s = 0; ((s < sock_cnt) && gres_needed); s++) {
 		if (!used_cores_on_sock[s])
 			continue;
 		gres_needed -= _pick_gres_topo(sock_gres, gres_needed, node_inx,
 					       s, sorted_gres, links_cnt);
 	}
-	if (gres_needed) {
-		gres_needed -= _pick_gres_topo(sock_gres, gres_needed,
-					       node_inx, ANY_SOCK_TEST,
-					       sorted_gres, links_cnt);
-	}
 
-	/*
-	 * Use any additional available GRES. Again, favor use of GRES
-	 * which are best linked to GRES which have already been selected.
-	 */
+	/* Use any additional available GRES.  */
 	if (gres_needed && !enforce_binding) {
 		for (s = 0; ((s < sock_cnt) && gres_needed); s++) {
 			/* Sockets we ignored before */
@@ -1247,6 +1173,15 @@ static void _set_node_bits(int node_inx, int job_node_inx,
 	}
 	xfree(links_cnt);
 	xfree(sorted_gres);
+
+	if (gres_needed) {
+		error("%s: Insufficient gres/%s allocated for job %u on node %s (node_inx %d) (gres still needed %"PRIu64", total requested: %"PRIu64")",
+		      __func__, sock_gres->gres_state_job->gres_name, job_id,
+		      node_record_table_ptr[node_inx]->name, node_inx,
+		      gres_needed, gres_js->gres_per_node);
+		return ESLURM_INVALID_GRES;
+	}
+	return SLURM_SUCCESS;
 }
 
 /*
@@ -1259,9 +1194,9 @@ static void _set_node_bits(int node_inx, int job_node_inx,
  * tasks_per_socket IN - Task count for each socket
 
  */
-static void _set_task_bits(int node_inx, sock_gres_t *sock_gres,
-			   uint32_t job_id, uint32_t *tasks_per_socket,
-			   uint32_t total_res_gres, bool enforce_binding)
+static int _set_task_bits(int node_inx, sock_gres_t *sock_gres,
+			  uint32_t job_id, uint32_t *tasks_per_socket,
+			  uint32_t total_res_gres, bool enforce_binding)
 {
 	uint16_t sock_cnt = 0;
 	int gres_cnt, g, s;
@@ -1276,9 +1211,10 @@ static void _set_task_bits(int node_inx, sock_gres_t *sock_gres,
 	gres_cnt = bit_size(gres_js->gres_bit_select[node_inx]);
 
 	if (!tasks_per_socket) {
-		error("%s: tasks_per_socket unset for job %u on node %s",
-		      __func__, job_id, node_record_table_ptr[node_inx]->name);
-		return;
+		error("%s: tasks_per_socket unset for job %u on node %s (node_inx %d)",
+		      __func__, job_id, node_record_table_ptr[node_inx]->name,
+		      node_inx);
+		return ESLURM_INVALID_GRES;
 	}
 
 	if (gres_ns->link_len == gres_cnt) {
@@ -1294,7 +1230,7 @@ static void _set_task_bits(int node_inx, sock_gres_t *sock_gres,
 		gres_js->gres_per_task;
 	gres_needed -= total_res_gres;
 
-	/* First pick GRES for acitve sockets */
+	/* First pick GRES for active sockets */
 	for (s = 0; s < sock_cnt; s++) {
 		if (!tasks_per_socket[s])
 			continue;
@@ -1327,21 +1263,25 @@ static void _set_task_bits(int node_inx, sock_gres_t *sock_gres,
 
 	if (gres_needed) {
 		/* Something bad happened on task layout for this GRES type */
-		error("%s: Insufficient gres/%s allocated for job %u on node_inx %u (gres still needed %"PRIu64", total requested: %"PRIu64")",
+		error("%s: Insufficient gres/%s allocated for job %u on node %s (node_inx %d) (gres still needed %"PRIu64", total requested: %"PRIu64", gres_per_task: %"PRIu64")",
 		      __func__, sock_gres->gres_state_job->gres_name, job_id,
-		      node_inx, gres_needed,
-		      _get_task_cnt_node(tasks_per_socket, sock_cnt) *
-		      gres_js->gres_per_task);
+		      node_record_table_ptr[node_inx]->name, node_inx,
+		      gres_needed,
+		      (_get_task_cnt_node(tasks_per_socket, sock_cnt) *
+		       gres_js->gres_per_task), gres_js->gres_per_task);
+		return ESLURM_INVALID_GRES;
 	}
+	return SLURM_SUCCESS;
 }
 
 /* Build array to identify task count for each node-socket pair */
-static uint32_t **_build_tasks_per_node_sock(struct job_resources *job_res,
-					     uint8_t overcommit,
-					     gres_mc_data_t *tres_mc_ptr)
+static int _build_tasks_per_node_sock(struct job_resources *job_res,
+				      uint8_t overcommit,
+				      gres_mc_data_t *tres_mc_ptr,
+				      uint32_t ***tasks_per_node_socket_ptr)
 {
 	uint32_t **tasks_per_node_socket;
-	int j, node_cnt, job_node_inx = 0;
+	int rc = SLURM_SUCCESS, j, node_cnt, job_node_inx = 0;
 	int c, s, core_offset;
 	int cpus_per_task = 1, cpus_per_node, cpus_per_core;
 	int task_per_node_limit = 0;
@@ -1364,13 +1304,20 @@ static uint32_t **_build_tasks_per_node_sock(struct job_resources *job_res,
 			rem_tasks--;
 			continue;
 		}
-		tasks_per_node_socket[i] = xcalloc(sock_cnt, sizeof(uint32_t));
+		tasks_per_node_socket[i] =
+			xcalloc(sock_cnt + 1, sizeof(uint32_t));
 		if (tres_mc_ptr->ntasks_per_node) {
 			task_per_node_limit = tres_mc_ptr->ntasks_per_node;
+			cpus_per_task = MAX(1, job_res->cpus[job_node_inx] /
+						       job_res->tasks_per_node
+							       [job_node_inx]);
 		} else if (job_res->tasks_per_node &&
 			   job_res->tasks_per_node[job_node_inx]) {
 			task_per_node_limit =
 				job_res->tasks_per_node[job_node_inx];
+			cpus_per_task =
+				MAX(1, job_res->cpus[job_node_inx] /
+				    job_res->tasks_per_node[job_node_inx]);
 		} else {
 			/*
 			 * NOTE: We should never get here.
@@ -1397,7 +1344,12 @@ static uint32_t **_build_tasks_per_node_sock(struct job_resources *job_res,
 		}
 		core_offset = get_job_resources_offset(job_res, job_node_inx++,
 						       0, 0);
-		cpus_per_core = node_ptr->tpc;
+		if (tres_mc_ptr->threads_per_core)
+			cpus_per_core = MIN(node_ptr->tpc,
+					    tres_mc_ptr->threads_per_core);
+		else
+			cpus_per_core = node_ptr->tpc;
+
 		for (s = 0; s < sock_cnt; s++) {
 			int tasks_per_socket = 0, tpc, skip_cores = 0;
 			for (c = 0; c < cores_per_socket_cnt; c++) {
@@ -1416,7 +1368,7 @@ static uint32_t **_build_tasks_per_node_sock(struct job_resources *job_res,
 					if (tpc < 1) {
 						tpc = 1;
 						skip_cores = cpus_per_task /
-							cpus_per_core;
+							     node_ptr->tpc;
 						skip_cores--;	/* This core */
 					}
 					/* Start with 1 task per core */
@@ -1425,21 +1377,6 @@ static uint32_t **_build_tasks_per_node_sock(struct job_resources *job_res,
 				tasks_per_node += tpc;
 				tasks_per_socket += tpc;
 				rem_tasks -= tpc;
-				if (task_per_node_limit) {
-					if (tasks_per_node >
-					    task_per_node_limit) {
-						excess_tasks = tasks_per_node -
-							task_per_node_limit;
-						tasks_per_node_socket[i][s] -=
-							excess_tasks;
-						rem_tasks += excess_tasks;
-					}
-					if (tasks_per_node >=
-					    task_per_node_limit) {
-						s = sock_cnt;
-						break;
-					}
-				}
 				/* NOTE: No support for ntasks_per_board */
 				if (tres_mc_ptr->ntasks_per_socket) {
 					if (tasks_per_socket >
@@ -1459,6 +1396,13 @@ static uint32_t **_build_tasks_per_node_sock(struct job_resources *job_res,
 				}
 			}
 		}
+		/* Count excess tasks from each socket */
+		if (tasks_per_node > task_per_node_limit) {
+			excess_tasks = tasks_per_node - task_per_node_limit;
+			rem_tasks += excess_tasks;
+			/* Use last spot in array as excess_tasks count */
+			tasks_per_node_socket[i][sock_cnt] += excess_tasks;
+		}
 	}
 	while ((rem_tasks > 0) && overcommit) {
 		for (int i = 0;
@@ -1477,10 +1421,13 @@ static uint32_t **_build_tasks_per_node_sock(struct job_resources *job_res,
 			}
 		}
 	}
-	if (rem_tasks > 0)	/* This should never happen */
+	if (rem_tasks > 0) { /* This should never happen */
 		error("%s: rem_tasks not zero (%d > 0)", __func__, rem_tasks);
+		rc = ESLURM_INVALID_GRES;
+	}
 
-	return tasks_per_node_socket;
+	*tasks_per_node_socket_ptr = tasks_per_node_socket;
+	return rc;
 }
 
 static void _free_tasks_per_node_sock(uint32_t **tasks_per_node_socket,
@@ -1506,6 +1453,9 @@ static uint32_t _get_task_cnt_node(uint32_t *tasks_per_socket, int sock_cnt)
 
 	for (int s = 0; s < sock_cnt; s++)
 		task_cnt += tasks_per_socket[s];
+
+	/* last spot in array is set to track excess_tasks */
+	task_cnt -= tasks_per_socket[sock_cnt];
 
 	return task_cnt;
 }
@@ -1621,11 +1571,16 @@ static int _set_res_core_bits(uint32_t **res_gres_per_sock,
 	int *links_cnt = NULL, *sorted_gres = NULL;
 	uint16_t cores_per_socket_cnt = 0;
 	uint16_t sock_cnt = 0;
-	uint32_t gres_needed;
+	uint64_t gres_needed;
 	uint32_t res_cores_per_gpu =
 		node_record_table_ptr[args->node_inx]->res_cores_per_gpu;
 
 	xassert(job_res->core_bitmap);
+
+	if (gres_id_shared(sock_gres->gres_state_job->config_flags)) {
+		/* Jobs with shared gres have access to all reserved cores */
+		return SLURM_SUCCESS;
+	}
 
 	*total_res_gres = 0;
 	*sock_with_res_cnt = 0;
@@ -1662,21 +1617,6 @@ static int _set_res_core_bits(uint32_t **res_gres_per_sock,
 			(*sock_with_res_cnt)++;
 	}
 
-	if (gres_id_shared(sock_gres->gres_state_job->config_flags)) {
-		if (*sock_with_res_cnt > 1 &&
-		    !(slurm_conf.select_type_param & MULTIPLE_SHARING_GRES_PJ)){
-			/*
-			 * Have to allocate gres accross more then one socket.
-			 * This is assuming one socket per gres configueration
-			 * line.
-			 */
-			error("Restricted gpu cores on multiple sockets which requires MULTIPLE_SHARING_GRES_PJ to be set");
-			return ESLURM_INVALID_GRES;
-		}
-		/* Allow shared gres to allocate their own */
-		return SLURM_SUCCESS;
-	}
-
 	if (gres_ns->link_len == gres_cnt) {
 		links_cnt = xcalloc(gres_cnt, sizeof(int));
 		sorted_gres = xcalloc(gres_cnt, sizeof(int));
@@ -1701,8 +1641,10 @@ static int _set_res_core_bits(uint32_t **res_gres_per_sock,
 					       sorted_gres, links_cnt);
 		if (gres_needed) {
 			(*res_gres_per_sock)[socket_inx] -= gres_needed;
-			error("%s: More restricted gpu cores allocated then should be possible for job %u on node %d",
-			      __func__, args->job_ptr->job_id, args->node_inx);
+			error("%s: More restricted gpu cores allocated then should be possible for job %u on node %s (node_inx %d)",
+			      __func__, args->job_ptr->job_id,
+			      node_record_table_ptr[args->node_inx]->name,
+			      args->node_inx);
 		}
 	}
 	xfree(links_cnt);
@@ -1760,8 +1702,12 @@ static int _select_and_set_node(void *x, void *arg)
 	}
 	if (gres_js->gres_per_task && /* Data needed */
 	    !*args->tasks_per_node_socket) { /* Not built yet */
-		*args->tasks_per_node_socket = _build_tasks_per_node_sock(
-			job_res, job_ptr->details->overcommit, tres_mc_ptr);
+		*rc = _build_tasks_per_node_sock(job_res,
+						 job_ptr->details->overcommit,
+						 tres_mc_ptr,
+						 args->tasks_per_node_socket);
+		if (*rc != SLURM_SUCCESS)
+			return -1;
 	}
 
 	tasks_per_node_socket = *args->tasks_per_node_socket;
@@ -1814,7 +1760,8 @@ static int _select_and_set_node(void *x, void *arg)
 	gres_js->gres_bit_select[node_inx] = bit_alloc(gres_cnt);
 	gres_js->gres_cnt_node_select[node_inx] = 0;
 
-	if (gres_js->res_gpu_cores && gres_js->res_gpu_cores[node_inx]) {
+	if (gres_js->res_gpu_cores && gres_js->res_gpu_cores[node_inx] &&
+	    !gres_id_shared(sock_gres->gres_state_job->config_flags)) {
 		*rc = _set_res_core_bits(&res_gres_per_sock, &total_res_gres,
 					 &sock_with_res_cnt, args, sock_gres);
 		if (*rc != SLURM_SUCCESS)
@@ -1826,40 +1773,39 @@ static int _select_and_set_node(void *x, void *arg)
 		if (gres_js->gres_per_node) {
 			*rc = _set_shared_node_bits(
 				node_inx, job_node_inx, sock_gres, job_id,
-				enforce_binding, args->used_cores_on_sock,
-				total_res_gres, res_gres_per_sock,
-				sock_with_res_cnt);
+				enforce_binding, args->used_cores_on_sock);
 		} else if (gres_js->gres_per_task) {
 			*rc = _set_shared_task_bits(
 				node_inx, sock_gres, job_id, enforce_binding,
 				(job_ptr->bit_flags &
 				 GRES_ONE_TASK_PER_SHARING),
-				tasks_per_node_socket[node_inx], total_res_gres,
-				res_gres_per_sock, sock_with_res_cnt);
+				tasks_per_node_socket[node_inx]);
 		} else {
 			error("%s job %u job_spec lacks valid shared GRES counter",
 			      __func__, job_id);
 			*rc = ESLURM_INVALID_GRES;
 		}
 	} else if (gres_js->gres_per_node) {
-		_set_node_bits(node_inx, job_node_inx, sock_gres, job_id,
-			       args->used_cores_on_sock, args->used_core_cnt,
-			       total_res_gres, enforce_binding);
+		*rc = _set_node_bits(node_inx, job_node_inx, sock_gres, job_id,
+				     args->used_cores_on_sock,
+				     args->used_core_cnt, total_res_gres,
+				     enforce_binding);
 	} else if (gres_js->gres_per_socket) {
-		_set_sock_bits(node_inx, job_node_inx, sock_gres, job_id,
-			       tres_mc_ptr, args->used_cores_on_sock,
-			       res_gres_per_sock, total_res_gres,
-			       args->used_sock_cnt, enforce_binding);
+		*rc = _set_sock_bits(node_inx, job_node_inx, sock_gres, job_id,
+				     tres_mc_ptr, args->used_cores_on_sock,
+				     res_gres_per_sock, total_res_gres,
+				     args->used_sock_cnt, enforce_binding);
 	} else if (gres_js->gres_per_task) {
-		_set_task_bits(node_inx, sock_gres, job_id,
-			       tasks_per_node_socket[node_inx], total_res_gres,
-			       enforce_binding);
+		*rc = _set_task_bits(node_inx, sock_gres, job_id,
+				     tasks_per_node_socket[node_inx],
+				     total_res_gres, enforce_binding);
 	} else if (gres_js->gres_per_job) {
 		int tmp = _set_job_bits1(node_inx, job_node_inx, rem_node_cnt,
 					 sock_gres, job_id, tres_mc_ptr,
 					 node_ptr->tpc,
 					 args->used_cores_on_sock,
-					 args->used_core_cnt, total_res_gres);
+					 args->used_core_cnt, total_res_gres,
+					 enforce_binding);
 		if (*job_fini != 0)
 			*job_fini = tmp;
 	} else {
@@ -1884,7 +1830,7 @@ static int _select_and_set_node(void *x, void *arg)
  * tres_mc_ptr IN - job's multi-core options
  * RET SLURM_SUCCESS or error code
  */
-extern int gres_select_filter_select_and_set(List *sock_gres_list,
+extern int gres_select_filter_select_and_set(list_t **sock_gres_list,
 					     job_record_t *job_ptr,
 					     gres_mc_data_t *tres_mc_ptr)
 {

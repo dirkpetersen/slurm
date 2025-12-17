@@ -74,7 +74,7 @@
 #define	MAX_INPUT_FIELDS 128
 
 extern char *command_name;
-extern List clusters;
+extern list_t *clusters;
 extern char *cluster_names;
 extern int all_flag;	/* display even hidden partitions */
 extern int detail_flag;	/* display additional details */
@@ -82,17 +82,14 @@ extern int future_flag;	/* display future nodes */
 extern int exit_code;	/* scontrol's exit code, =1 on any error at any time */
 extern int exit_flag;	/* program to terminate if =1 */
 extern int federation_flag; /* show federated jobs */
-extern int input_words;	/* number of words of input permitted */
 extern int local_flag;	/* show only local jobs -- not remote remote sib jobs */
 extern int one_liner;	/* one record per line if =1 */
 extern int quiet_flag;	/* quiet=1, verbose=-1, normal=0 */
 extern int sibling_flag; /* show sibling jobs (if any fed job). */
-extern uint32_t cluster_flags; /* what type of cluster are we talking to */
 extern uint32_t euid; /* send request to the slurmctld in behave of this user */
 extern const char *mime_type; /* user requested JSON or YAML */
 extern const char *data_parser; /* data_parser args */
 
-extern front_end_info_msg_t *old_front_end_info_ptr;
 extern job_info_msg_t *old_job_info_ptr;
 extern node_info_msg_t *old_node_info_ptr;
 extern partition_info_msg_t *old_part_info_ptr;
@@ -110,14 +107,12 @@ extern void	scontrol_gethost(const char *stepd_node, const char *node_name);
 extern int	scontrol_hold(char *op, char *job_id_str);
 extern int	scontrol_job_notify(int argc, char **argv);
 extern int	scontrol_job_ready(char *job_id_str);
-extern void	scontrol_list_pids(const char *jobid_str,
-				   const char *node_name);
+extern void scontrol_list_jobs(int argc, char **argv);
+extern void scontrol_list_pids(int argc, char **argv);
+extern void scontrol_list_steps(int argc, char **argv);
 extern void	scontrol_getent(const char *node_name);
-extern int	scontrol_load_front_end(front_end_info_msg_t **
-					front_end_buffer_pptr);
-extern int	scontrol_load_job(job_info_msg_t ** job_buffer_pptr,
-				  uint32_t job_id);
-extern int 	scontrol_load_jobs (job_info_msg_t ** job_buffer_pptr);
+extern int scontrol_load_job(job_info_msg_t **job_buffer_pptr, sluid_t sluid,
+			     uint32_t job_id);
 extern int 	scontrol_load_nodes (node_info_msg_t ** node_buffer_pptr,
 				     uint16_t show_flags);
 extern int 	scontrol_load_partitions (partition_info_msg_t **
@@ -130,10 +125,6 @@ extern void	scontrol_print_completing (void);
 extern void	scontrol_print_completing_job(job_info_t *job_ptr,
 					      node_info_msg_t *node_info_msg);
 extern void	scontrol_print_federation(void);
-extern void	scontrol_print_front_end_list(char *node_list);
-extern void	scontrol_print_front_end(char *node_name,
-					 front_end_info_msg_t  *
-					 front_end_buffer_ptr);
 extern void scontrol_print_job(char *job_id_str, int argc, char **argv);
 extern void	scontrol_print_hosts (char * node_list);
 extern void scontrol_print_licenses(const char *name, int argc, char **argv);
@@ -142,15 +133,16 @@ extern void	scontrol_print_node (char *node_name,
 extern void scontrol_print_node_list(char *node_list, int argc, char **argv);
 extern void scontrol_print_part(char *partition_name, int argc, char **argv);
 extern void scontrol_print_res(char *reservation_name, int argc, char **argv);
+extern void scontrol_print_resources(int argc, char **argv);
 extern void scontrol_print_step(char *job_step_id_str, int argc, char **argv);
-extern void	scontrol_print_topo (char *node_list);
+extern void scontrol_print_topo(int argc, char **argv);
+extern void scontrol_print_topo_conf(void);
 extern char *scontrol_process_plus_minus(char plus_or_minus, char *src,
 					 bool nodestr);
 extern void	scontrol_requeue(uint32_t flags, char *job_str);
 extern void	scontrol_requeue_hold(uint32_t flags, char *job_str);
 extern void	scontrol_suspend(char *op, char *job_id_str);
 extern void	scontrol_top_job(char *job_str);
-extern int	scontrol_update_front_end (int argc, char **argv);
 extern int	scontrol_update_job (int argc, char **argv);
 extern int 	scontrol_create_node(int argc, char **argv);
 extern int	scontrol_update_node (int argc, char **argv);
@@ -160,7 +152,7 @@ extern int	scontrol_update_step (int argc, char **argv);
 
 /* power_node.c */
 extern int scontrol_power_nodes(char *node_list, bool power_up, bool asap,
-				bool force);
+				bool force, char *reason);
 
 /* reboot_node.c */
 extern int      scontrol_cancel_reboot(char *nodes);

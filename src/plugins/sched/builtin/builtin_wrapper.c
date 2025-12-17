@@ -41,12 +41,16 @@
 
 #include "slurm/slurm_errno.h"
 
-#include "src/common/plugin.h"
 #include "src/common/log.h"
+#include "src/common/plugin.h"
+#include "src/common/threadpool.h"
+
 #include "src/interfaces/select.h"
+
 #include "src/slurmctld/job_scheduler.h"
 #include "src/slurmctld/reservation.h"
 #include "src/slurmctld/slurmctld.h"
+
 #include "src/plugins/sched/builtin/builtin.h"
 
 const char		plugin_name[]	= "Slurm Built-in Scheduler plugin";
@@ -56,7 +60,7 @@ const uint32_t		plugin_version	= SLURM_VERSION_NUMBER;
 static pthread_t builtin_thread = 0;
 static pthread_mutex_t thread_flag_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-int init(void)
+extern int init(void)
 {
 	sched_verbose("Built-in scheduler plugin loaded");
 
@@ -76,7 +80,7 @@ int init(void)
 	return SLURM_SUCCESS;
 }
 
-void fini(void)
+extern void fini(void)
 {
 	slurm_mutex_lock( &thread_flag_mutex );
 	if ( builtin_thread ) {

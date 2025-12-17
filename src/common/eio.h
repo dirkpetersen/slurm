@@ -59,14 +59,18 @@ struct io_operations {
 	int  (*handle_write)(eio_obj_t *, list_t *);
 	int  (*handle_error)(eio_obj_t *, list_t *);
 	int  (*handle_close)(eio_obj_t *, list_t *);
+	int  (*handle_cleanup)(eio_obj_t *, list_t *, list_t *);
 	int  timeout;
 };
 
 struct eio_obj {
 	int fd;                           /* fd to operate on                */
+	void *conn;
+	uint32_t data_on_conn;
 	void *arg;                        /* application-specific data       */
 	struct io_operations *ops;        /* pointer to ops struct for obj   */
 	bool shutdown;
+	time_t close_time; /* time we marked this to be closed */
 };
 
 eio_handle_t *eio_handle_create(uint16_t);

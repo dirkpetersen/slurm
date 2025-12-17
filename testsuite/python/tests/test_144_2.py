@@ -13,13 +13,16 @@ def setup():
     atf.require_config_parameter("SelectType", "select/cons_tres")
     atf.require_config_parameter("SelectTypeParameters", "CR_CPU")
     atf.require_config_parameter("GresTypes", "gpu")
-    atf.require_nodes(1, [("Gres", "gpu:2 Sockets=2 CoresPerSocket=1")])
+    atf.require_nodes(1, [("Gres", "gpu:2 Sockets=4 CoresPerSocket=1")])
     # GPU's need to point to existing files
     gpu_file = f"{str(atf.module_tmp_path)}/gpu"
     atf.run_command(f"touch {gpu_file + '1'}")
     atf.run_command(f"touch {gpu_file + '2'}")
     atf.require_config_parameter(
-        "NodeName", f"node1 Name=gpu Cores=0-1 File={gpu_file}[1-2]", source="gres"
+        "NodeName",
+        f"""node1 Name=gpu Cores=0 File={gpu_file}1
+        NodeName=node1 Name=gpu Cores=1 File={gpu_file}2""",
+        source="gres",
     )
     atf.require_slurm_running()
 
@@ -31,12 +34,11 @@ def test_gpu_socket_sharing():
         "srun --gres-flags=enforce-binding --ntasks-per-socket=1 \
                     --cpus-per-task=1 --ntasks-per-node=2 -N1 \
                     --gpus-per-task=1 scontrol show nodes node1 -d",
-        timeout=2,
         fatal=True,
     )
     assert (
         re.search(r"GresUsed=gpu.*:2", output) is not None
-    ), "Expect 2 gpus used for job"
+    ), "Verify that job allocated 2 gpus"
 
 
 def test_gpu_socket_sharing_no_alloc():
@@ -46,13 +48,15 @@ def test_gpu_socket_sharing_no_alloc():
         "srun --gres-flags=enforce-binding --ntasks-per-socket=1 \
                     --cpus-per-task=2 --ntasks-per-node=2 -N1 \
                     --gpus-per-task=1 scontrol show nodes node1 -d",
-        timeout=1,
         fatal=False,
     )
-    assert output["exit_code"] != 0, "Expect command to timeout"
+    assert output["exit_code"] != 0, "Verify that srun command failed"
+
+    expected_msg = r"srun: error: .+ Requested node configuration is not available"
     assert (
         re.search(
-            r"srun: job [0-9]+ queued and waiting for resources", str(output["stderr"])
+            expected_msg,
+            str(output["stderr"]),
         )
         is not None
-    ), "Expect command to wait on resources"
+    ), "Verify that job is rejected with the right reason."

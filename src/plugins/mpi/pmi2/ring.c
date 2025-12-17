@@ -139,7 +139,7 @@ static pmix_ring_msg* pmix_ring_msgs = NULL;
  * pmix_ring_children */
 static int pmix_ring_count = 0;
 
-/* tracks number of chilren we have for pmix_ring operation
+/* tracks number of children we have for pmix_ring operation
  * (sum of application children and stepd children) */
 static int pmix_ring_children = 0;
 
@@ -230,9 +230,7 @@ static int pmix_stepd_send(const char* buf, uint32_t size, int rank)
 		retries++;
 		if (retries >= MAX_RETRIES) {
 			/* cancel the step to avoid tasks hang */
-			slurm_kill_job_step(job_info.step_id.job_id,
-					    job_info.step_id.step_id,
-					    SIGKILL, 0);
+			slurm_kill_job_step(&job_info.step_id, SIGKILL, 0);
 		}
 
 		/* didn't succeeded, but we'll retry again,
@@ -296,7 +294,7 @@ int pmix_ring_init(const pmi2_job_info_t* job, char*** env)
 	pmix_ring_children = pmix_app_children + pmix_stepd_children;
 
 	/* allocate a structure to record ring_in message from each child */
-	pmix_ring_msgs = (pmix_ring_msg*) xmalloc(pmix_ring_children * sizeof(pmix_ring_msg));
+	pmix_ring_msgs = xcalloc(pmix_ring_children, sizeof(pmix_ring_msg));
 
 	/* initialize messages */
 	for (i = 0; i < pmix_ring_children; i++) {
@@ -363,7 +361,7 @@ int pmix_ring_out(int count, char* left, char* right)
 	 * right value for the last process in our subtree */
 
 	/* allocate a structure to compute values to send to each child */
-	pmix_ring_msg* outmsgs = (pmix_ring_msg*) xmalloc(pmix_ring_children * sizeof(pmix_ring_msg));
+	pmix_ring_msg *outmsgs = xcalloc(pmix_ring_children, sizeof(pmix_ring_msg));
 
         /* initialize messages to all children */
 	int i;

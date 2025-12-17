@@ -85,34 +85,10 @@ typedef struct rsmiPciInfo_st {
 	};
 } rsmiPciInfo_t;
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - A string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - A string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "GPU RSMI plugin";
-const char	plugin_type[]		= "gpu/rsmi";
-const uint32_t	plugin_version		= SLURM_VERSION_NUMBER;
+const char plugin_type[] = "gpu/rsmi";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
 static int gpumem_pos = -1;
 static int gpuutil_pos = -1;
@@ -120,22 +96,47 @@ static int gpuutil_pos = -1;
 static bool get_usage = true;
 
 static void _rsmi_get_version(char *version, unsigned int len);
+static void _rsmi_get_driver(char *driver, unsigned int len);
+
+/*
+ * Initialize the rsmi library.
+ */
+static void _rsmi_init()
+{
+	static pid_t init_pid = 0;
+	pid_t my_pid = conf->pid ? conf->pid : getpid();
+	rsmi_status_t rsmi_rc;
+	const char *status_string;
+	char version[RSMI_STRING_BUFFER_SIZE];
+	char driver[RSMI_STRING_BUFFER_SIZE];
+
+	if (init_pid == my_pid) /* Already inited */
+		return;
+
+	init_pid = my_pid;
+
+	DEF_TIMERS;
+	START_TIMER;
+	rsmi_rc = rsmi_init(0);
+	END_TIMER;
+	debug3("rsmi_init() took %s", TIMER_STR());
+	if (rsmi_rc != RSMI_STATUS_SUCCESS) {
+		rsmi_status_string(rsmi_rc, &status_string);
+		error("Failed to initialize rsmi: %s",
+		      status_string);
+	} else
+		debug2("Successfully initialized rsmi");
+
+	_rsmi_get_driver(driver, RSMI_STRING_BUFFER_SIZE);
+	_rsmi_get_version(version, RSMI_STRING_BUFFER_SIZE);
+	debug("AMD Graphics Driver Version: %s", driver);
+	debug("RSMI Library Version: %s", version);
+}
 
 extern int init(void)
 {
-	rsmi_init(0);
-
 	if (running_in_slurmstepd()) {
-		char version[RSMI_STRING_BUFFER_SIZE];
-
-		_rsmi_get_version(version, RSMI_STRING_BUFFER_SIZE);
-		/*
-		 * If version < RSMI_REQ_VERSION_USAGE get_usage will be set to
-		 * false, so we won't set gpumem_pos and gpuutil_pos which
-		 * effectively disables gpu accounting.
-		 */
-		if (get_usage)
-			gpu_get_tres_pos(&gpumem_pos, &gpuutil_pos);
+		gpu_get_tres_pos(&gpumem_pos, &gpuutil_pos);
 	}
 
 	debug("%s: %s loaded", __func__, plugin_name);
@@ -143,13 +144,11 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	debug("%s: unloading %s", __func__, plugin_name);
 
 	rsmi_shut_down();
-
-	return SLURM_SUCCESS;
 }
 
 /*
@@ -162,9 +161,8 @@ extern int fini(void)
  *
  * Return true if successful, false if not.
  */
-static bool _rsmi_get_mem_freqs(uint32_t dv_ind,
-				unsigned int *mem_freqs_size,
-				unsigned int *mem_freqs)
+static bool _rsmi_get_mem_freqs(uint32_t dv_ind, uint32_t *mem_freqs_size,
+				uint32_t *mem_freqs)
 {
 	const char *status_string;
 	rsmi_status_t rsmi_rc;
@@ -175,8 +173,8 @@ static bool _rsmi_get_mem_freqs(uint32_t dv_ind,
 	rsmi_rc = rsmi_dev_gpu_clk_freq_get(
 		dv_ind, RSMI_CLK_TYPE_MEM, &rsmi_freqs);
 	END_TIMER;
-	debug3("rsmi_dev_gpu_clk_freq_get() took %ld microseconds",
-	       DELTA_TIMER);
+	debug3("rsmi_dev_gpu_clk_freq_get() took %s",
+	       TIMER_STR());
 
 	if (rsmi_rc != RSMI_STATUS_SUCCESS) {
 		rsmi_rc = rsmi_status_string(rsmi_rc, &status_string);
@@ -202,9 +200,8 @@ static bool _rsmi_get_mem_freqs(uint32_t dv_ind,
  *
  * Return true if successful, false if not.
  */
-static bool _rsmi_get_gfx_freqs(uint32_t dv_ind,
-				unsigned int *gfx_freqs_size,
-				unsigned int *gfx_freqs)
+static bool _rsmi_get_gfx_freqs(uint32_t dv_ind, uint32_t *gfx_freqs_size,
+				uint32_t *gfx_freqs)
 {
 	const char *status_string;
 	rsmi_status_t rsmi_rc;
@@ -215,8 +212,7 @@ static bool _rsmi_get_gfx_freqs(uint32_t dv_ind,
 	rsmi_rc = rsmi_dev_gpu_clk_freq_get(
 		dv_ind, RSMI_CLK_TYPE_SYS, &rsmi_freqs);
 	END_TIMER;
-	debug3("rsmi_dev_gpu_clk_freq_get() took %ld microseconds",
-	       DELTA_TIMER);
+	debug3("rsmi_dev_gpu_clk_freq_get() took %s", TIMER_STR());
 
 	if (rsmi_rc != RSMI_STATUS_SUCCESS) {
 		rsmi_rc = rsmi_status_string(rsmi_rc, &status_string);
@@ -241,15 +237,15 @@ static bool _rsmi_get_gfx_freqs(uint32_t dv_ind,
  */
 static void _rsmi_print_freqs(uint32_t dv_ind, log_level_t l)
 {
-	unsigned int mem_freqs[RSMI_MAX_NUM_FREQUENCIES] = {0};
-	unsigned int gfx_freqs[RSMI_MAX_NUM_FREQUENCIES] = {0};
-	unsigned int size = RSMI_MAX_NUM_FREQUENCIES;
+	uint32_t mem_freqs[RSMI_MAX_NUM_FREQUENCIES] = {0};
+	uint32_t gfx_freqs[RSMI_MAX_NUM_FREQUENCIES] = {0};
+	uint32_t size = RSMI_MAX_NUM_FREQUENCIES;
 
 	if (!_rsmi_get_mem_freqs(dv_ind, &size, mem_freqs))
 		return;
 
-	qsort(mem_freqs, size, sizeof(unsigned int),
-	      slurm_sort_uint_list_desc);
+	qsort(mem_freqs, size, sizeof(uint32_t),
+	      slurm_sort_uint32_list_desc);
 	if ((size > 1) && (mem_freqs[0] <= mem_freqs[(size)-1])) {
 		error("%s: memory frequencies are not stored in descending order!",
 		      __func__);
@@ -262,8 +258,8 @@ static void _rsmi_print_freqs(uint32_t dv_ind, log_level_t l)
 	if (!_rsmi_get_gfx_freqs(dv_ind, &size, gfx_freqs))
 		return;
 
-	qsort(gfx_freqs, size, sizeof(unsigned int),
-	      slurm_sort_uint_list_desc);
+	qsort(gfx_freqs, size, sizeof(uint32_t),
+	      slurm_sort_uint32_list_desc);
 	if ((size > 1) && (gfx_freqs[0] <= gfx_freqs[(size)-1])) {
 		error("%s: Graphics frequencies are not stored in descending order!",
 		      __func__);
@@ -284,26 +280,25 @@ static void _rsmi_print_freqs(uint32_t dv_ind, log_level_t l)
  * gfx_freq    (IN/OUT) requested/nearest valid graphics frequency
  * gfx_bitmask (OUT) bit mask for the nearest valid graphics frequency
  */
-static void _rsmi_get_nearest_freqs(uint32_t dv_ind,
-				    unsigned int *mem_freq,
-				    uint64_t *mem_bitmask,
-				    unsigned int *gfx_freq,
+static void _rsmi_get_nearest_freqs(uint32_t dv_ind, uint32_t *mem_freq,
+				    uint64_t *mem_bitmask, uint32_t *gfx_freq,
 				    uint64_t *gfx_bitmask)
 {
-	unsigned int mem_freqs[RSMI_MAX_NUM_FREQUENCIES] = {0};
-	unsigned int mem_freqs_sort[RSMI_MAX_NUM_FREQUENCIES] = {0};
-	unsigned int mem_freqs_size = RSMI_MAX_NUM_FREQUENCIES;
-	unsigned int gfx_freqs[RSMI_MAX_NUM_FREQUENCIES] = {0};
-	unsigned int gfx_freqs_sort[RSMI_MAX_NUM_FREQUENCIES] = {0};
-	unsigned int gfx_freqs_size = RSMI_MAX_NUM_FREQUENCIES;
+	uint32_t mem_freqs[RSMI_MAX_NUM_FREQUENCIES] = {0};
+	uint32_t mem_freqs_sort[RSMI_MAX_NUM_FREQUENCIES] = {0};
+	uint32_t mem_freqs_size = RSMI_MAX_NUM_FREQUENCIES;
+
+	uint32_t gfx_freqs[RSMI_MAX_NUM_FREQUENCIES] = {0};
+	uint32_t gfx_freqs_sort[RSMI_MAX_NUM_FREQUENCIES] = {0};
+	uint32_t gfx_freqs_size = RSMI_MAX_NUM_FREQUENCIES;
 
 	// Get the memory frequencies
 	if (!_rsmi_get_mem_freqs(dv_ind, &mem_freqs_size, mem_freqs))
 		return;
 
-	memcpy(mem_freqs_sort, mem_freqs, mem_freqs_size*sizeof(unsigned int));
-	qsort(mem_freqs_sort, mem_freqs_size, sizeof(unsigned int),
-	      slurm_sort_uint_list_desc);
+	memcpy(mem_freqs_sort, mem_freqs, mem_freqs_size*sizeof(uint32_t));
+	qsort(mem_freqs_sort, mem_freqs_size, sizeof(uint32_t),
+	      slurm_sort_uint32_list_desc);
 	if ((mem_freqs_size > 1) &&
 	    (mem_freqs_sort[0] <= mem_freqs_sort[(mem_freqs_size)-1])) {
 		error("%s: memory frequencies are not stored in descending order!",
@@ -325,9 +320,9 @@ static void _rsmi_get_nearest_freqs(uint32_t dv_ind,
 	if (!_rsmi_get_gfx_freqs(dv_ind, &gfx_freqs_size, gfx_freqs))
 		return;
 
-	memcpy(gfx_freqs_sort, gfx_freqs, gfx_freqs_size*sizeof(unsigned int));
-	qsort(gfx_freqs_sort, gfx_freqs_size, sizeof(unsigned int),
-	      slurm_sort_uint_list_desc);
+	memcpy(gfx_freqs_sort, gfx_freqs, gfx_freqs_size*sizeof(uint32_t));
+	qsort(gfx_freqs_sort, gfx_freqs_size, sizeof(uint32_t),
+	      slurm_sort_uint32_list_desc);
 	if ((gfx_freqs_size > 1) &&
 	    (gfx_freqs_sort[0] <= gfx_freqs_sort[(gfx_freqs_size)-1])) {
 		error("%s: graphics frequencies are not stored in descending order!",
@@ -366,8 +361,8 @@ static bool _rsmi_set_freqs(uint32_t dv_ind, uint64_t mem_bitmask,
 	rsmi_rc = rsmi_dev_gpu_clk_freq_set(
 		dv_ind, RSMI_CLK_TYPE_MEM, mem_bitmask);
 	END_TIMER;
-	debug3("rsmi_dev_gpu_clk_freq_set(0x%lx) for memory took %ld microseconds",
-	       mem_bitmask, DELTA_TIMER);
+	debug3("rsmi_dev_gpu_clk_freq_set(0x%lx) for memory took %s",
+	       mem_bitmask, TIMER_STR());
 	if (rsmi_rc != RSMI_STATUS_SUCCESS) {
 		rsmi_rc = rsmi_status_string(rsmi_rc, &status_string);
 		error("RSMI: Failed to set memory frequency GPU %u error: %s",
@@ -378,8 +373,8 @@ static bool _rsmi_set_freqs(uint32_t dv_ind, uint64_t mem_bitmask,
 	START_TIMER;
 	rsmi_rc = rsmi_dev_gpu_clk_freq_set(dv_ind,
 					    RSMI_CLK_TYPE_SYS, gfx_bitmask);
-	debug3("rsmi_dev_gpu_clk_freq_set(0x%lx) for graphics took %ld microseconds",
-	       gfx_bitmask, DELTA_TIMER);
+	debug3("rsmi_dev_gpu_clk_freq_set(0x%lx) for graphics took %s",
+	       gfx_bitmask, TIMER_STR());
 	END_TIMER;
 	if (rsmi_rc != RSMI_STATUS_SUCCESS) {
 		rsmi_rc = rsmi_status_string(rsmi_rc, &status_string);
@@ -409,8 +404,7 @@ static bool _rsmi_reset_freqs(uint32_t dv_ind)
 	START_TIMER;
 	rsmi_rc = rsmi_dev_perf_level_set(dv_ind, RSMI_DEV_PERF_LEVEL_AUTO);
 	END_TIMER;
-	debug3("rsmi_dev_perf_level_set() took %ld microseconds",
-	       DELTA_TIMER);
+	debug3("rsmi_dev_perf_level_set() took %s", TIMER_STR());
 	if (rsmi_rc != RSMI_STATUS_SUCCESS) {
 		rsmi_rc = rsmi_status_string(rsmi_rc, &status_string);
 		error("RSMI: Failed to reset frequencies error: %s",
@@ -430,7 +424,7 @@ static bool _rsmi_reset_freqs(uint32_t dv_ind)
  *
  * Returns the clock frequency in MHz if successful, or 0 if not
  */
-static unsigned int _rsmi_get_freq(uint32_t dv_ind, rsmi_clk_type_t type)
+static uint32_t _rsmi_get_freq(uint32_t dv_ind, rsmi_clk_type_t type)
 {
 	const char *status_string;
 	rsmi_status_t rsmi_rc;
@@ -454,8 +448,7 @@ static unsigned int _rsmi_get_freq(uint32_t dv_ind, rsmi_clk_type_t type)
 	START_TIMER;
 	rsmi_rc = rsmi_dev_gpu_clk_freq_get(dv_ind, type, &rsmi_freqs);
 	END_TIMER;
-	debug3("rsmi_dev_gpu_clk_freq_get(%s) took %ld microseconds",
-	       type_str, DELTA_TIMER);
+	debug3("rsmi_dev_gpu_clk_freq_get(%s) took %s", type_str, TIMER_STR());
 	if (rsmi_rc != RSMI_STATUS_SUCCESS) {
 		rsmi_rc = rsmi_status_string(rsmi_rc, &status_string);
 		error("RSMI: Failed to get the GPU frequency type %s, error: %s",
@@ -465,12 +458,12 @@ static unsigned int _rsmi_get_freq(uint32_t dv_ind, rsmi_clk_type_t type)
 	return (rsmi_freqs.frequency[rsmi_freqs.current]/1000000);
 }
 
-static unsigned int _rsmi_get_gfx_freq(uint32_t dv_ind)
+static uint32_t _rsmi_get_gfx_freq(uint32_t dv_ind)
 {
 	return _rsmi_get_freq(dv_ind, RSMI_CLK_TYPE_SYS);
 }
 
-static unsigned int _rsmi_get_mem_freq(uint32_t dv_ind)
+static uint32_t _rsmi_get_mem_freq(uint32_t dv_ind)
 {
 	return _rsmi_get_freq(dv_ind, RSMI_CLK_TYPE_MEM);
 }
@@ -681,7 +674,7 @@ static void _rsmi_get_version(char *version, unsigned int len)
  *
  * device_count	(OUT) Number of available GPU devices
  */
-extern void gpu_p_get_device_count(unsigned int *device_count)
+extern void gpu_p_get_device_count(uint32_t *device_count)
 {
 	const char *status_string;
 	rsmi_status_t rsmi_rc = rsmi_num_monitor_devices(device_count);
@@ -731,6 +724,7 @@ static void _rsmi_get_device_brand(uint32_t dv_ind, char *device_brand,
 		error("RSMI: Failed to get brand of the GPU: %s",
 		      status_string);
 	}
+	gpu_common_underscorify_tolower(device_brand);
 }
 
 /*
@@ -849,18 +843,12 @@ static bitstr_t *_rsmi_get_device_cpu_mask(uint32_t dv_ind)
  *
  * node_config (IN/OUT) pointer of node_config_load_t passed down
  */
-static List _get_system_gpu_list_rsmi(node_config_load_t *node_config)
+static list_t *_get_system_gpu_list_rsmi(node_config_load_t *node_config)
 {
-	unsigned int i;
-	unsigned int device_count = 0;
-	List gres_list_system = list_create(destroy_gres_slurmd_conf);
-	char driver[RSMI_STRING_BUFFER_SIZE];
-	char version[RSMI_STRING_BUFFER_SIZE];
+	uint32_t i, device_count = 0;
+	list_t *gres_list_system = list_create(destroy_gres_slurmd_conf);
 
-	_rsmi_get_driver(driver, RSMI_STRING_BUFFER_SIZE);
-	_rsmi_get_version(version, RSMI_STRING_BUFFER_SIZE);
-	debug("AMD Graphics Driver Version: %s", driver);
-	debug("RSMI Library Version: %s", version);
+	_rsmi_init();
 
 	gpu_p_get_device_count(&device_count);
 	debug2("Device count: %d", device_count);
@@ -874,7 +862,8 @@ static List _get_system_gpu_list_rsmi(node_config_load_t *node_config)
 		uint64_t uuid = 0;
 		char *cpu_aff_mac_range = NULL;
 		gres_slurmd_conf_t gres_slurmd_conf = {
-			.config_flags = GRES_CONF_ENV_RSMI,
+			.config_flags =
+				GRES_CONF_ENV_RSMI | GRES_CONF_AUTODETECT,
 			.count = 1,
 			.cpu_cnt = node_config->cpu_cnt,
 			.cpus_bitmap = _rsmi_get_device_cpu_mask(i),
@@ -935,7 +924,11 @@ static List _get_system_gpu_list_rsmi(node_config_load_t *node_config)
 		// Print out possible memory frequencies for this device
 		_rsmi_print_freqs(i, LOG_LEVEL_DEBUG2);
 
-		gres_slurmd_conf.type_name = device_brand;
+		/* If no brand found use device_name as type name */
+		if (device_brand[0])
+			gres_slurmd_conf.type_name = device_brand;
+		else
+			gres_slurmd_conf.type_name = device_name;
 
 		add_gres_to_list(gres_list_system, &gres_slurmd_conf);
 
@@ -950,9 +943,9 @@ static List _get_system_gpu_list_rsmi(node_config_load_t *node_config)
 	return gres_list_system;
 }
 
-extern List gpu_p_get_system_gpu_list(node_config_load_t *node_config)
+extern list_t *gpu_p_get_system_gpu_list(node_config_load_t *node_config)
 {
-	List gres_list_system = _get_system_gpu_list_rsmi(node_config);
+	list_t *gres_list_system = _get_system_gpu_list_rsmi(node_config);
 
 	if (!gres_list_system)
 		error("System GPU detection failed");
@@ -986,6 +979,7 @@ extern void gpu_p_step_hardware_init(bitstr_t *usable_gpus, char *tres_freq)
 	FREE_NULL_BITMAP(saved_gpus);
 	saved_gpus = bit_copy(usable_gpus);
 
+	_rsmi_init();
 	// Set the frequency of each GPU index specified in the bitstr
 	_set_freq(usable_gpus, freq);
 	xfree(freq);
@@ -1047,6 +1041,18 @@ extern int gpu_p_usage_read(pid_t pid, acct_gather_data_t *data)
 
 	if (!track_gpuutil && !track_gpumem) {
 		debug2("%s: We are not tracking TRES gpuutil/gpumem", __func__);
+		return SLURM_SUCCESS;
+	}
+
+	_rsmi_init();
+
+	/*
+	 * If version < RSMI_REQ_VERSION_USAGE get_usage will be set to
+	 * false, so we won't set gpumem_pos and gpuutil_pos which
+	 * effectively disables gpu accounting.
+	 */
+	if (!get_usage) {
+		debug2("%s: ROCM release version is < 6.0.0 which is required for gathering usage. Not gathering usage.", __func__);
 		return SLURM_SUCCESS;
 	}
 

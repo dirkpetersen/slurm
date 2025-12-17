@@ -186,12 +186,18 @@ int _measure_api(char* measure_case)
 	nodes = measure_case;
 	hl = hostlist_create(nodes);
 	START_TIMER;
-	if (topology_g_split_hostlist(hl, &sp_hl, &hl_count, 0)) {
+	if (topology_g_split_hostlist(hl, &sp_hl, &hl_count, 0) ==
+	    SLURM_ERROR) {
 		hostlist_destroy(hl);
 		fatal("unable to split forward hostlist");
 	}
 	END_TIMER;
+#if SLURM_VERSION_NUMBER >= SLURM_VERSION_NUM(26, 5, 0)
+	/* In #50113 we converted to timespec_t logic with new macros */
+	et = TIMER_DURATION_USEC();
+#else
 	et = DELTA_TIMER;
+#endif
 	for (j = 0; j < hl_count; j++) {
 		hostlist_destroy(sp_hl[j]);
 	}
@@ -231,7 +237,7 @@ int _run_test(char** testcase, int lines)
 	char *nodes;
 	nodes = testcase[0];
 	hostlist_t *hl = hostlist_create(nodes);
-	if (topology_g_split_hostlist(hl, &hll, &hl_count, 0)) {
+	if (topology_g_split_hostlist(hl, &hll, &hl_count, 0) == SLURM_ERROR) {
 		info("Unable to split forward hostlist");
 		_print_test(testcase,lines);
 		rc = SLURM_ERROR;
@@ -293,8 +299,16 @@ int main(int argc, char *argv[])
 
 	slurm_init(NULL);
 
+	init_node_conf();
+	build_all_nodeline_info(true, 0);
+
 	if (topology_g_init() != SLURM_SUCCESS) {
 		error("failed to initialize topology plugins");
+		exit(1);
+	}
+
+	if (topology_g_build_config() != SLURM_SUCCESS) {
+		error("failed to build topology config");
 		exit(1);
 	}
 

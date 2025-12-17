@@ -40,9 +40,6 @@ set job_id          0
 if {![is_super_user]} {
 	skip "This test must be run as SlurmUser"
 }
-if {[get_config_param "FrontendName"] ne "MISSING"} {
-	skip "This test is incompatible with front-end systems"
-}
 
 set config_dir [get_conf_path]
 set spank_conf_file ${config_dir}/plugstack.conf
@@ -221,15 +218,9 @@ expect {
 }
 
 sleep 30
-if {![param_contains [get_config_param "SlurmctldParameters"] "enable_configless"]} {
-	make_bash_script $file_in "
-	$srun --test_suite_srun=5 $bin_sum $spank_conf_file
-	"
-} else {
-	make_bash_script $file_in "
-	$srun --test_suite_srun=5 $bin_sum /run/slurm/conf/plugstack.conf
-	"
-}
+make_bash_script $file_in "
+$srun --test_suite_srun=5 $bin_sum $spank_conf_file
+"
 
 set matches 0
 spawn $sbatch --test_suite_sbatch=4 -N1 -t1 -o $file_out $file_in

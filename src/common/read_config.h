@@ -54,10 +54,6 @@ extern slurm_conf_t slurm_conf;
 extern char *default_slurm_config_file;
 extern char *default_plugin_path;
 
-#ifndef NDEBUG
-extern uint16_t drop_priv_flag;
-#endif
-
 /*
  * We can't include node_conf.h to get node_record_t because node_conf.h
  * includes read_config.h and creates a circular dependency. We create the
@@ -82,12 +78,15 @@ typedef struct node_record node_record_t;
 #define DEFAULT_AUTH_TYPE          "auth/munge"
 #define DEFAULT_AUTH_TOKEN_LIFESPAN 1800
 #define DEFAULT_BATCH_START_TIMEOUT 10
+#define DEFAULT_BATCH_STDOUT_PATH "slurm-%j.out"
+#define DEFAULT_BATCH_ARRAY_STDOUT_PATH "slurm-%A_%a.out"
 #define DEFAULT_BCAST_EXCLUDE       "/lib,/usr/lib,/lib64,/usr/lib64"
 #define DEFAULT_COMPLETE_WAIT       0
+#define DEFAULT_CERTGEN_TYPE "certgen/script"
 #define DEFAULT_CRED_TYPE           "cred/munge"
 #define DEFAULT_EPILOG_MSG_TIME     2000
 #define DEFAULT_FIRST_JOB_ID        1
-#define DEFAULT_GET_ENV_TIMEOUT     2
+#define DEFAULT_GET_ENV_TIMEOUT     120
 #define DEFAULT_GETNAMEINFO_CACHE_TIMEOUT 60
 #define DEFAULT_GROUP_TIME          600
 #define DEFAULT_GROUP_FORCE         1	/* if set, update group membership
@@ -100,6 +99,8 @@ typedef struct node_record node_record_t;
 #define DEFAULT_ENFORCE_PART_LIMITS 0
 #define DEFAULT_ALLOW_SPEC_RESOURCE_USAGE 0
 #define DEFAULT_HASH_PLUGIN "hash/k12"
+#define DEFAULT_HTTP_PARSER_TYPE "http_parser/libhttp_parser"
+#define DEFAULT_HOST_UNREACH_RETRY_COUNT 0
 #define DEFAULT_KEEPALIVE_TIME (NO_VAL)
 #define DEFAULT_KEEPALIVE_INTERVAL (NO_VAL)
 #define DEFAULT_KEEPALIVE_PROBES (NO_VAL)
@@ -155,14 +156,11 @@ typedef struct node_record node_record_t;
 #define DEFAULT_TCP_TIMEOUT         2
 #define DEFAULT_TLS_TYPE "tls/none"
 #define DEFAULT_TMP_FS              "/tmp"
-#if defined HAVE_3D
-#  define DEFAULT_TOPOLOGY_PLUGIN     "topology/3d_torus"
-#else
-#  define DEFAULT_TOPOLOGY_PLUGIN     "topology/none"
-#endif
+#define DEFAULT_TOPOLOGY_PLUGIN "topology/flat"
 #define DEFAULT_WAIT_TIME           0
 #define DEFAULT_TREE_WIDTH	    16
 #define DEFAULT_UNKILLABLE_TIMEOUT  60 /* seconds */
+#define DEFAULT_URL_PARSER_TYPE "url_parser/libhttp_parser"
 #define DEFAULT_BATCH_SCRIPT_LIMIT (4 * 1024 * 1024) /* 4MB */
 #define MAX_BATCH_SCRIPT_SIZE (512 * 1024 * 1024) /* 512MB */
 #define DEFAULT_MAX_SUBMIT_LINE_SIZE (1024 * 1024) /* 1MB */
@@ -172,26 +170,14 @@ typedef struct node_record node_record_t;
  */
 #define DEFAULT_MAX_TASKS_PER_NODE  MAX_TASKS_PER_NODE
 
-typedef struct slurm_conf_frontend {
-	char *allow_groups;		/* allowed group string */
-	char *allow_users;		/* allowed user string */
-	char *deny_groups;		/* denied group string */
-	char *deny_users;		/* denied user string */
-	char *frontends;		/* frontend node name */
-	char *addresses;		/* frontend node address */
-	uint16_t port;			/* frontend specific port */
-	char *reason;			/* reason for down frontend node */
-	uint16_t node_state;		/* enum node_states, ORed with
-					 * NODE_STATE_NO_RESPOND if not
-					 * responding */
-} slurm_conf_frontend_t;
-
 typedef struct slurm_conf_node {
 	char *nodenames;
 	char *hostnames;
 	char *addresses;
 	char *bcast_addresses;
 	char *gres;		/* arbitrary list of node's generic resources */
+	char *gres_conf; /* '+' delimited gres_slurmd_conf_t's as
+			  * comma-separated key=value pairs. */
 	char *feature;		/* arbitrary list of node's features */
 	char *port_str;
 	uint32_t cpu_bind;	/* default CPU bind type */
@@ -204,11 +190,13 @@ typedef struct slurm_conf_node {
 	uint16_t threads;       /* number of threads per core */
 	uint64_t real_memory;	/* MB real memory on the node */
 	uint64_t mem_spec_limit; /* MB real memory for memory specialization */
+	char *parameters; /* node-specific additions to SlurmdParameters */
 	char *reason;
 	uint16_t res_cores_per_gpu; /* number of cores per GPU to allow
 				     * to only GPU jobs */
 	char *state;
 	uint32_t tmp_disk;	/* MB total storage in TMP_FS file system */
+	char *topology_str; /* topology address string */
 	char *tres_weights_str;	/* per TRES billing weight string */
 	uint32_t weight;	/* arbitrary priority of node for
 				 * scheduling work on */
@@ -242,7 +230,7 @@ typedef struct slurm_conf_partition {
 	bool exclusive_topo; /* true if exclusive topology*/
 	uint32_t grace_time;	/* default grace time for partition */
 	bool     hidden_flag;	/* 1 if hidden by default */
-	List job_defaults_list;	/* List of job_defaults_t elements */
+	list_t *job_defaults_list; /* List of job_defaults_t elements */
 	bool     lln_flag;	/* 1 if nodes are selected in LLN order */
 	uint32_t max_cpus_per_node; /* maximum allocated CPUs per node */
 	uint32_t max_cpus_per_socket; /* maximum allocated CPUs per socket */
@@ -272,6 +260,7 @@ typedef struct slurm_conf_partition {
 				 * mode */
 	uint16_t suspend_timeout; /* time required in order to perform a node
 				   * suspend operation */
+	char *topology_name;
 	uint32_t total_nodes;	/* total number of nodes in the partition */
 	uint32_t total_cpus;	/* total number of cpus in the partition */
 } slurm_conf_partition_t;
@@ -295,14 +284,11 @@ typedef struct {
 
 typedef struct {
 	char *name;
-	List key_pairs;
+	list_t *key_pairs;
 } config_plugin_params_t;
 
-/* Destroy a front_end record built by slurm_conf_frontend_array() */
-extern void destroy_frontend(void *ptr);
-
 /* Copy list of job_defaults_t elements */
-extern List job_defaults_copy(List in_list);
+extern list_t *job_defaults_copy(list_t *in_list);
 
 /* Destroy list of job_defaults_t elements */
 extern void job_defaults_free(void *x);
@@ -313,13 +299,13 @@ extern void job_defaults_free(void *x);
  * out_list OUT - equivalent list of key=value pairs
  * Returns SLURM_SUCCESS or an error code
  */
-extern int job_defaults_list(char *in_str, List *out_list);
+extern int job_defaults_list(char *in_str, list_t **out_list);
 
 /*
  * Translate list of job_defaults_t elements into a string.
  * Return value must be released using xfree()
  */
-extern char *job_defaults_str(List in_list);
+extern char *job_defaults_str(list_t *in_list);
 
 /* Pack a job_defaults_t element. Used by slurm_pack_list() */
 extern void job_defaults_pack(void *in, uint16_t protocol_version,
@@ -330,7 +316,7 @@ extern int job_defaults_unpack(void **out, uint16_t protocol_version,
 			       buf_t *buffer);
 
 /*
- * slurm_reset_alias() for each node in alias_list
+ * set_nodes_alias() for each node in alias_list
  *
  * IN alias_list - string with sets of node name, communication address in []
  * 	and hostname. Each element in the set if colon separated and
@@ -389,7 +375,7 @@ extern void slurm_conf_init_stepd(void);
  *	slurm_conf_init, any subsequent calls will do nothing until
  *	slurm_conf_destroy is called.
  * RET SLURM_SUCCESS if conf file is initialized.  If the slurm conf
- *       was already initialied, return SLURM_ERROR.
+ *       was already initialized, return SLURM_ERROR.
  * NOTE: Caller must NOT be holding slurm_conf_lock().
  */
 extern int slurm_conf_init(const char *file_name);
@@ -428,13 +414,6 @@ extern void slurm_conf_unlock(void);
 
 
 extern int slurm_conf_check_addr(const char *node_name, bool *dynamic);
-/*
- * Set "ptr_array" with the pointer to an array of pointers to
- * slurm_conf_frontend_t structures.
- *
- * Return value is the length of the array.
- */
-extern int slurm_conf_frontend_array(slurm_conf_frontend_t **ptr_array[]);
 
 /*
  * Set "ptr_array" with the pointer to an array of pointers to
@@ -636,6 +615,11 @@ extern char *reconfig_flags2str(uint16_t reconfig_flags);
  */
 extern uint16_t reconfig_str2flags(char *reconfig_flags);
 
+/*
+ * Parse flags from provided string, will alter slurm_conf.conf_flags.
+ */
+extern void parse_slurmd_params(const char *slurmd_params);
+
 extern void destroy_config_plugin_params(void *object);
 extern void pack_config_plugin_params(void *in, uint16_t protocol_version,
 				      buf_t *buff);
@@ -689,13 +673,6 @@ extern void slurm_conf_add_node(node_record_t *node_ptr);
  * Remove node from node conf hash tables.
  */
 extern void slurm_conf_remove_node(char *node_name);
-
-#ifdef HAVE_FRONT_END
-/*
- * Return the frontend port for the given hostname.
- */
-extern uint16_t slurm_conf_get_frontend_port(char *node_hostname);
-#endif
 
 /*
  * Get substring from a csv-style string.

@@ -100,12 +100,22 @@ typedef enum {
 	CG_MEMORY,
 	CG_DEVICES,
 	CG_CPUACCT,
+	/* Below are extra controllers not explicitly tracked by Slurm. */
+	CG_IO,
+	CG_HUGETLB,
+	CG_PIDS,
+	CG_RDMA,
+	CG_MISC,
 	CG_CTL_CNT
 } cgroup_ctl_type_t;
 
 /* Current supported cgroup controller features */
 typedef enum {
-	CG_MEMCG_SWAP
+	CG_FALSE_ROOT,
+	CG_MEMCG_OOMGROUP,
+	CG_MEMCG_PEAK,
+	CG_MEMCG_SWAP,
+	CG_KILL_BUTTON
 } cgroup_ctl_feature_t;
 
 typedef enum {
@@ -120,6 +130,11 @@ typedef enum {
 	CG_LEVEL_SYSTEM,
 	CG_LEVEL_CNT
 } cgroup_level_t;
+
+typedef enum {
+	CGROUP_EMPTY,
+	CGROUP_POPULATED,
+} cgroup_empty_t;
 
 /* This data type is used to get/set various parameters in cgroup hierarchy */
 typedef struct {
@@ -150,6 +165,7 @@ typedef struct {
 } cgroup_oom_t;
 
 typedef struct {
+	uint64_t memory_peak;
 	uint64_t usec;
 	uint64_t ssec;
 	uint64_t total_rss;
@@ -159,30 +175,24 @@ typedef struct {
 
 /* Slurm cgroup plugins configuration parameters */
 typedef struct {
-	char *cgroup_mountpoint;
-
-	char *cgroup_prepend;
-
-	bool constrain_cores;
-
-	bool constrain_ram_space;
 	float allowed_ram_space;
-	float max_ram_percent;		/* Upper bound on memory as % of RAM */
-
-	uint64_t min_ram_space;		/* Lower bound on memory limit (MB) */
-
-	bool constrain_swap_space;
 	float allowed_swap_space;
-	float max_swap_percent;		/* Upper bound on swap as % of RAM  */
-	uint64_t memory_swappiness;
-
-	bool constrain_devices;
+	char *cgroup_mountpoint;
 	char *cgroup_plugin;
-
+	char *cgroup_prepend;
+	char *cgroup_slice;
+	bool constrain_cores;
+	bool constrain_devices;
+	bool constrain_ram_space;
+	bool constrain_swap_space;
+	bool enable_controllers;
+	char *enable_extra_controllers;
 	bool ignore_systemd;
 	bool ignore_systemd_on_failure;
-
-	bool enable_controllers;
+	float max_ram_percent; /* Upper bound on memory as % of RAM */
+	float max_swap_percent; /* Upper bound on swap as % of RAM  */
+	uint64_t memory_swappiness;
+	uint64_t min_ram_space; /* Lower bound on memory limit (MB) */
 	bool signal_children_processes;
 	uint64_t systemd_timeout; /* How much time to wait on systemd operations (msec)*/
 } cgroup_conf_t;
@@ -195,9 +205,12 @@ extern int cgroup_conf_init(void);
 extern void cgroup_conf_destroy(void);
 extern void cgroup_free_limits(cgroup_limits_t *limits);
 extern void cgroup_init_limits(cgroup_limits_t *limits);
-extern List cgroup_get_conf_list(void);
+extern list_t *cgroup_get_conf_list(void);
 extern int cgroup_write_conf(int fd);
 extern int cgroup_read_conf(int fd);
+extern int cgroup_write_state(int fd);
+extern int cgroup_read_state(int fd);
+
 extern bool cgroup_memcg_job_confinement(void);
 extern char *autodetect_cgroup_version(void);
 
@@ -330,7 +343,7 @@ extern cgroup_limits_t *cgroup_g_constrain_get(cgroup_ctl_type_t sub,
  * IN sub - To which controller we want the limits be applied to.
  * IN level - Directory level to apply the limits to.
  * IN limits - Struct containing the the limits to be applied.
- * RET SLURM_SUCCESS if limits were applied successfuly, SLURM_ERROR otherwise.
+ * RET SLURM_SUCCESS if limits were applied successfully, SLURM_ERROR otherwise.
  */
 extern int cgroup_g_constrain_set(cgroup_ctl_type_t sub, cgroup_level_t level,
 				  cgroup_limits_t *limits);
@@ -355,9 +368,10 @@ extern int cgroup_g_constrain_apply(cgroup_ctl_type_t sub, cgroup_level_t level,
  * reliable method since events can be triggered with more than just OOMs, e.g.
  * rmdirs.
  *
+ * IN job - Step record.
  * RET SLURM_SUCCESS if monitoring thread is started, SLURM_ERROR otherwise.
  */
-extern int cgroup_g_step_start_oom_mgr(void);
+extern int cgroup_g_step_start_oom_mgr(stepd_step_rec_t *step);
 
 /*
  * Signal the monitoring thread with a stop message and get the results.
@@ -376,7 +390,7 @@ extern cgroup_oom_t *cgroup_g_step_stop_oom_mgr(stepd_step_rec_t *step);
  * IN task_id - task number to form the path and create the task_x directory.
  * IN pid - pid to add to. Note, the task_id may not coincide with job->task[i]
  *          so we may not know where the pid is stored in the job struct.
- * RET SLURM_SUCCESS if the task was succesfully created and the pid added to
+ * RET SLURM_SUCCESS if the task was successfully created and the pid added to
  *     all accounting controllers.
  */
 extern int cgroup_g_task_addto(cgroup_ctl_type_t sub, stepd_step_rec_t *step,
@@ -406,4 +420,25 @@ extern long int cgroup_g_get_acct_units(void);
  * directly from the root.
  */
 extern bool cgroup_g_has_feature(cgroup_ctl_feature_t f);
+
+/*
+ * Send KILL signal to the user processes cgroup of this step atomically.
+ *
+ * IN signal - Signal to send. Actually only SIGKILL is supported.
+ * OUT - SLURM_ERROR if signal could not be sent, SLURM_SUCCESS otherwise.
+ */
+extern int cgroup_g_signal(int signal);
+
+extern char *cgroup_g_get_task_empty_event_path(uint32_t taskid,
+						bool *on_modify);
+
+extern int cgroup_g_is_task_empty(uint32_t taskid);
+
+/* BPF token functions */
+extern int cgroup_g_bpf_fsopen();
+extern int cgroup_g_bpf_fsconfig(int fd);
+extern int cgroup_g_bpf_create_token(int fd);
+extern int cgroup_g_bpf_get_token();
+extern void cgroup_g_bpf_set_token(int fd);
+
 #endif

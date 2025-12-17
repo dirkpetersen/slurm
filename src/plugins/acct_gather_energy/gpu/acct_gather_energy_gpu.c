@@ -40,9 +40,11 @@
 #include <dlfcn.h>
 
 #include "src/common/slurm_xlator.h"
-#include "src/interfaces/cgroup.h"
+#include "src/common/threadpool.h"
+
 #include "src/interfaces/acct_gather_energy.h"
 #include "src/interfaces/acct_gather_profile.h"
+#include "src/interfaces/cgroup.h"
 #include "src/interfaces/gpu.h"
 #include "src/interfaces/gres.h"
 
@@ -60,31 +62,7 @@ extern slurmd_conf_t *conf __attribute__((weak_import));
 slurmd_conf_t *conf = NULL;
 #endif
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobacct" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobacct/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "AcctGatherEnergy gpu plugin";
 const char plugin_type[] = "acct_gather_energy/gpu";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -103,15 +81,9 @@ static uint64_t *start_current_energies = NULL;
 static int dataset_id = -1; // id of the dataset for profile data
 
 static bool flag_energy_accounting_shutdown = false;
-static bool flag_thread_started = false;
 static pthread_mutex_t gpu_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gpu_cond = PTHREAD_COND_INITIALIZER;
-static pthread_mutex_t launch_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t launch_cond = PTHREAD_COND_INITIALIZER;
-
 static stepd_step_rec_t *step = NULL;
-
-pthread_t thread_gpu_id_launcher = 0;
 pthread_t thread_gpu_id_run = 0;
 
 /*
@@ -260,21 +232,6 @@ static int _thread_update_node_energy(void)
 }
 
 /*
- * _thread_init initializes values and conf for the gpu thread
- */
-static int _thread_init(void)
-{
-
-	if (gpus_len && gpus) {
-		log_flag(ENERGY, "%s thread init", plugin_name);
-		return SLURM_SUCCESS;
-	} else {
-		error("%s thread init failed, no GPU available", plugin_name);
-		return SLURM_ERROR;
-	}
-}
-
-/*
  * _thread_gpu_run is the thread calling gpu periodically
  * and read the energy values from the AMD GPUs
  */
@@ -284,90 +241,38 @@ static void *_thread_gpu_run(void *no_data)
 	struct timespec abs;
 
 	flag_energy_accounting_shutdown = false;
-	log_flag(ENERGY, "gpu-thread: launched");
-
-	(void) pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-	(void) pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 
 	slurm_mutex_lock(&gpu_mutex);
-	if (_thread_init() != SLURM_SUCCESS) {
+	if (gpus_len && gpus) {
+		log_flag(ENERGY, "%s thread init", plugin_name);
+	} else {
+		error("%s thread init failed, no GPU available", plugin_name);
 		log_flag(ENERGY, "gpu-thread: aborted");
 		slurm_mutex_unlock(&gpu_mutex);
-
-		slurm_mutex_lock(&launch_mutex);
-		slurm_cond_signal(&launch_cond);
-		slurm_mutex_unlock(&launch_mutex);
-
 		return NULL;
 	}
-
-	(void) pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
-
 	slurm_mutex_unlock(&gpu_mutex);
-	flag_thread_started = true;
 
-	slurm_mutex_lock(&launch_mutex);
-	slurm_cond_signal(&launch_cond);
-	slurm_mutex_unlock(&launch_mutex);
-
-	/* setup timer */
+	/*
+	 * Setup timer - We will update energy every DEFAULT_GPU_FREQ from this
+	 * moment, always after _thread_update_node_energy lets us continue.
+	 */
 	gettimeofday(&tvnow, NULL);
 	abs.tv_sec = tvnow.tv_sec;
 	abs.tv_nsec = tvnow.tv_usec * 1000;
 
-	//loop until slurm stop
+	/* Loop until this plugin exits with fini(). */
 	slurm_mutex_lock(&gpu_mutex);
 	while (!flag_energy_accounting_shutdown) {
 		_thread_update_node_energy();
-
-		/* Sleep until the next time. */
-		abs.tv_sec += DEFAULT_GPU_FREQ;
-		slurm_cond_timedwait(&gpu_cond, &gpu_mutex, &abs);
+		if (!flag_energy_accounting_shutdown) {
+			abs.tv_sec += DEFAULT_GPU_FREQ;
+			slurm_cond_timedwait(&gpu_cond, &gpu_mutex, &abs);
+		}
 	}
 	slurm_mutex_unlock(&gpu_mutex);
 
 	log_flag(ENERGY, "gpu-thread: ended");
-
-	return NULL;
-}
-
-/*
- * _thread_launcher is the thread that launches gpu thread
- */
-static void *_thread_launcher(void *no_data)
-{
-	struct timeval tvnow;
-	struct timespec abs;
-
-	slurm_thread_create(&thread_gpu_id_run, _thread_gpu_run, NULL);
-
-	/* setup timer */
-	gettimeofday(&tvnow, NULL);
-	abs.tv_sec = tvnow.tv_sec + DEFAULT_GPU_TIMEOUT;
-	abs.tv_nsec = tvnow.tv_usec * 1000;
-
-	slurm_mutex_lock(&launch_mutex);
-	slurm_cond_timedwait(&launch_cond, &launch_mutex, &abs);
-	slurm_mutex_unlock(&launch_mutex);
-
-	if (!flag_thread_started) {
-		error("%s threads failed to start in a timely manner",
-		      plugin_name);
-
-		flag_energy_accounting_shutdown = true;
-
-		/*
-		 * It is a known thing we can hang up on GPU calls cancel if
-		 * we must.
-		 */
-		pthread_cancel(thread_gpu_id_run);
-
-		/*
-		 * Unlock just to make sure since we could have canceled the
-		 * thread while in the lock.
-		 */
-		slurm_mutex_unlock(&gpu_mutex);
-	}
 
 	return NULL;
 }
@@ -468,7 +373,6 @@ static void _get_node_energy(acct_gather_energy_t *energy)
  */
 static int _get_joules_task(uint16_t delta)
 {
-	time_t now = time(NULL);
 	static bool stepd_first = true;
 	uint64_t adjustment = 0;
 	uint16_t i;
@@ -516,7 +420,7 @@ static int _get_joules_task(uint16_t delta)
 		new->previous_consumed_energy = old->consumed_energy;
 
 		adjustment = _get_additional_consumption(
-			new->poll_time, now,
+			new->poll_time, time(NULL),
 			new->current_watts,
 			new->current_watts);
 
@@ -535,7 +439,7 @@ static int _get_joules_task(uint16_t delta)
 			}
 		} else {
 			/*
-			 * This is just for the step, so take all the pervious
+			 * This is just for the step, so take all the previous
 			 * consumption out of the mix.
 			 */
 			start_current_energies[i] =
@@ -559,10 +463,6 @@ static int _get_joules_task(uint16_t delta)
 	return SLURM_SUCCESS;
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	/* put anything that requires the .conf being read in
@@ -572,22 +472,12 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-/*
- * fini() is called when the plugin exits.
- */
-extern int fini(void)
+extern void fini(void)
 {
 	if (!running_in_slurmd_stepd())
-		return SLURM_SUCCESS;
+		return;
 
 	flag_energy_accounting_shutdown = true;
-
-	slurm_mutex_lock(&launch_mutex);
-	/* clean up the launch thread */
-	slurm_cond_signal(&launch_cond);
-	slurm_mutex_unlock(&launch_mutex);
-
-	slurm_thread_join(thread_gpu_id_launcher);
 
 	slurm_mutex_lock(&gpu_mutex);
 	/* clean up the run thread */
@@ -596,17 +486,9 @@ extern int fini(void)
 
 	slurm_thread_join(thread_gpu_id_run);
 
-	/*
-	 * We don't really want to destroy the the state, so those values
-	 * persist a reconfig. And if the process dies, this will be lost
-	 * anyway. So not freeing these variables is not really a leak.
-	 *
-	 * xfree(gpus);
-	 * xfree(start_current_energies);
-	 * saved_usable_gpus = NULL;
-	 */
-
-	return SLURM_SUCCESS;
+	xfree(gpus);
+	xfree(start_current_energies);
+	saved_usable_gpus = NULL;
 }
 
 extern int acct_gather_energy_p_update_node_energy(void)
@@ -627,58 +509,45 @@ extern int acct_gather_energy_p_get_data(enum acct_energy_type data_type,
 	uint16_t *gpu_cnt = (uint16_t *)data;
 
 	xassert(running_in_slurmd_stepd());
+	slurm_mutex_lock(&gpu_mutex);
 	switch (data_type) {
 	case ENERGY_DATA_NODE_ENERGY_UP:
 		if (running_in_slurmd()) {
 			/* Signal the thread to update node energy */
 			slurm_cond_signal(&gpu_cond);
-			slurm_mutex_lock(&gpu_mutex);
 			_get_node_energy(energy);
 		} else {
-			slurm_mutex_lock(&gpu_mutex);
 			_get_joules_task(10);
 			_get_node_energy_up(energy);
 		}
-		slurm_mutex_unlock(&gpu_mutex);
 		break;
 	case ENERGY_DATA_NODE_ENERGY:
-		slurm_mutex_lock(&gpu_mutex);
 		_get_node_energy(energy);
-		slurm_mutex_unlock(&gpu_mutex);
 		break;
 	case ENERGY_DATA_LAST_POLL:
-		slurm_mutex_lock(&gpu_mutex);
 		if (gpus)
 			*last_poll = gpus[gpus_len-1].last_update_time;
 		else
 			*last_poll = 0;
-		slurm_mutex_unlock(&gpu_mutex);
 		break;
 	case ENERGY_DATA_SENSOR_CNT:
-		slurm_mutex_lock(&gpu_mutex);
 		*gpu_cnt = gpus_len;
-		slurm_mutex_unlock(&gpu_mutex);
 		break;
 	case ENERGY_DATA_STRUCT:
-		slurm_mutex_lock(&gpu_mutex);
 		for (i = 0; i < gpus_len; i++)
 			memcpy(&energy[i], &gpus[i].energy,
 			       sizeof(acct_gather_energy_t));
-		slurm_mutex_unlock(&gpu_mutex);
 		break;
 	case ENERGY_DATA_JOULES_TASK:
 		if (running_in_slurmd()) {
 			/* Signal the thread to update node energy */
 			slurm_cond_signal(&gpu_cond);
-			slurm_mutex_lock(&gpu_mutex);
 		} else {
-			slurm_mutex_lock(&gpu_mutex);
 			_get_joules_task(10);
 		}
 		for (i = 0; i < gpus_len; ++i)
 			memcpy(&energy[i], &gpus[i].energy,
 			       sizeof(acct_gather_energy_t));
-		slurm_mutex_unlock(&gpu_mutex);
 		break;
 	default:
 		error("%s: unknown enum %d",
@@ -686,6 +555,7 @@ extern int acct_gather_energy_p_get_data(enum acct_energy_type data_type,
 		rc = SLURM_ERROR;
 		break;
 	}
+	slurm_mutex_unlock(&gpu_mutex);
 	return rc;
 }
 
@@ -766,8 +636,8 @@ extern void acct_gather_energy_p_conf_set(int context_id_in,
 					(unsigned int *) &gpus_len);
 			if (gpus_len) {
 				gpus = xcalloc(sizeof(gpu_status_t), gpus_len);
-				slurm_thread_create(&thread_gpu_id_launcher,
-						    _thread_launcher, NULL);
+				slurm_thread_create(&thread_gpu_id_run,
+						    _thread_gpu_run, NULL);
 				log_flag(ENERGY, "%s thread launched",
 					 plugin_name);
 			}
@@ -781,7 +651,7 @@ extern void acct_gather_energy_p_conf_set(int context_id_in,
 	return;
 }
 
-extern void acct_gather_energy_p_conf_values(List *data)
+extern void acct_gather_energy_p_conf_values(list_t **data)
 {
 	return;
 }

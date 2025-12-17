@@ -1,6 +1,5 @@
 /*****************************************************************************\
- *  slurm_acct_gather_filesystem.c - implementation-independent job filesystem
- *  accounting plugin definitions
+ *  acct_gather_filesystem.c - job filesystem accounting plugin definitions
  *****************************************************************************
  *  Copyright (C) 2013 Bull.
  *  Written by Yiannis Georgiou <yiannis.georgiou@bull.net>
@@ -51,6 +50,7 @@
 #include "src/common/plugin.h"
 #include "src/common/plugrack.h"
 #include "src/common/slurm_protocol_api.h"
+#include "src/common/threadpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 #include "src/interfaces/acct_gather_filesystem.h"
@@ -61,7 +61,7 @@ typedef struct slurm_acct_gather_filesystem_ops {
 	void (*conf_options)	(s_p_options_t **full_options,
 				 int *full_options_cnt);
 	void (*conf_set)	(s_p_hashtbl_t *tbl);
-	void (*conf_values)        (List *data);
+	void (*conf_values)     (list_t **data);
 	int (*get_data)		(acct_gather_data_t *data);
 } slurm_acct_gather_filesystem_ops_t;
 /*
@@ -148,8 +148,16 @@ done:
 extern int acct_gather_filesystem_fini(void)
 {
 	int rc = SLURM_SUCCESS;
+	static bool fini_ran = false;
 
 	slurm_mutex_lock(&g_context_lock);
+	if (fini_ran) {
+		slurm_mutex_unlock(&g_context_lock);
+		return SLURM_SUCCESS;
+	}
+
+	fini_ran = true;
+
 	if (g_context) {
 		if (watch_node_thread_id) {
 			slurm_mutex_unlock(&g_context_lock);
@@ -157,6 +165,7 @@ extern int acct_gather_filesystem_fini(void)
 			slurm_cond_signal(&profile_timer->notify);
 			slurm_mutex_unlock(&profile_timer->notify_mutex);
 			slurm_thread_join(watch_node_thread_id);
+			watch_node_thread_id = 0;
 			slurm_mutex_lock(&g_context_lock);
 		}
 

@@ -1,4 +1,4 @@
-.TH sshare "1" "Slurm Commands" "August 2022" "Slurm Commands"
+.TH sshare "1" "Slurm Commands" "Slurm 26.05" "Slurm Commands"
 
 .SH "NAME"
 sshare \- Tool for listing the shares of associations to a cluster.
@@ -241,6 +241,36 @@ The location of the Slurm configuration file.
 Specify debug flags for sshare to use. See DebugFlags in the
 \fBslurm.conf\fR(5) man page for a full list of flags. The environment
 variable takes precedence over the setting in the slurm.conf.
+.IP
+
+.TP
+\fBSLURM_JSON\fR
+Control JSON serialization:
+.IP
+.RS
+.TP
+\fBcompact\fR
+Output JSON as compact as possible.
+.IP
+
+.TP
+\fBpretty\fR
+Output JSON in pretty format to make it more readable.
+.IP
+.RE
+
+.TP
+\fBSLURM_YAML\fR
+Control YAML serialization:
+.IP
+.RS
+.TP
+\fBcompact\fR Output YAML as compact as possible.
+.IP
+
+.TP
+\fBpretty\fR Output YAML in pretty format to make it more readable.
+.RE
 .IP
 
 .SH "EXAMPLES"

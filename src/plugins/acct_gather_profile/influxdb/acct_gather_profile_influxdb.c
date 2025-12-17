@@ -55,7 +55,6 @@
 #include <inttypes.h>
 #include <unistd.h>
 #include <math.h>
-#include <curl/curl.h>
 
 #include "src/common/slurm_xlator.h"
 #include "src/common/fd.h"
@@ -66,35 +65,13 @@
 #include "src/common/slurm_time.h"
 #include "src/common/timers.h"
 #include "src/common/xstring.h"
+#include "src/curl/slurm_curl.h"
 #include "src/interfaces/proctrack.h"
 
+#define DEFAULT_INFLUXDB_FREQUENCY 30
 #define DEFAULT_INFLUXDB_TIMEOUT 10
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobacct" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobacct/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "AcctGatherProfile influxdb plugin";
 const char plugin_type[] = "acct_gather_profile/influxdb";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -105,6 +82,7 @@ typedef struct {
 	uint32_t def;
 	char *password;
 	char *rt_policy;
+	uint32_t frequency;
 	uint32_t timeout;
 	char *username;
 } slurm_influxdb_conf_t;
@@ -115,12 +93,6 @@ typedef struct {
 	size_t size;
 	char * name;
 } table_t;
-
-/* Type for handling HTTP responses */
-struct http_response {
-	char *message;
-	size_t size;
-};
 
 union data_t{
 	uint64_t u;
@@ -137,6 +109,8 @@ static int datastrlen = 0;
 static table_t *tables = NULL;
 static size_t tables_max_len = 0;
 static size_t tables_cur_len = 0;
+
+static time_t last_send = 0;
 
 static void _free_tables(void)
 {
@@ -175,37 +149,26 @@ static uint32_t _determine_profile(void)
 	return profile;
 }
 
-/* Callback to handle the HTTP response */
-static size_t _write_callback(void *contents, size_t size, size_t nmemb,
-			      void *userp)
-{
-	size_t realsize = size * nmemb;
-	struct http_response *mem = (struct http_response *) userp;
-
-	debug3("%s %s called", plugin_type, __func__);
-
-	mem->message = xrealloc(mem->message, mem->size + realsize + 1);
-
-	memcpy(&(mem->message[mem->size]), contents, realsize);
-	mem->size += realsize;
-	mem->message[mem->size] = 0;
-
-	return realsize;
-}
-
 /* Try to send data to influxdb */
 static int _send_data(const char *data)
 {
-	CURL *curl_handle = NULL;
-	CURLcode res;
-	struct http_response chunk;
 	int rc = SLURM_SUCCESS;
-	long response_code;
-	static int error_cnt = 0;
-	char *url = NULL;
+	long response_code = 0;
+	char *url = NULL, *response_str = NULL;
 	size_t length;
+	time_t now = time(NULL);
+	bool send_now = false;
 
 	debug3("%s %s called", plugin_type, __func__);
+
+	/*
+	 * Send data to InfluxDB immediately if buffering is disabled, the send
+	 * interval has elapsed, or a job step has ended (indicated by data ==
+	 * NULL).
+	 */
+	if ((!influxdb_conf.frequency) ||
+	    ((now - last_send) >= (time_t) influxdb_conf.frequency) || (!data))
+		send_now = true;
 
 	/*
 	 * Every compute node which is sampling data will try to establish a
@@ -215,7 +178,7 @@ static int _send_data(const char *data)
 	 * try to open the connection and send this buffer, instead of opening
 	 * one per sample.
 	 */
-	if (data && ((datastrlen + strlen(data)) <= BUF_SIZE)) {
+	if ((!send_now) && ((datastrlen + strlen(data)) <= BUF_SIZE)) {
 		xstrcat(datastr, data);
 		length = strlen(data);
 		datastrlen += length;
@@ -224,50 +187,13 @@ static int _send_data(const char *data)
 		return rc;
 	}
 
-	DEF_TIMERS;
-	START_TIMER;
-
-	if ((curl_handle = curl_easy_init()) == NULL) {
-		error("%s %s: curl_easy_init: %m", plugin_type, __func__);
-		rc = SLURM_ERROR;
-		goto cleanup_easy_init;
-	}
-
 	xstrfmtcat(url, "%s/write?db=%s&rp=%s&precision=s", influxdb_conf.host,
 		   influxdb_conf.database, influxdb_conf.rt_policy);
-
-	chunk.message = xmalloc(1);
-	chunk.size = 0;
-
-	curl_easy_setopt(curl_handle, CURLOPT_URL, url);
-	if (influxdb_conf.password)
-		curl_easy_setopt(curl_handle, CURLOPT_PASSWORD,
-				 influxdb_conf.password);
-	curl_easy_setopt(curl_handle, CURLOPT_POST, 1);
-	curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, datastr);
-	curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, strlen(datastr));
-	if (influxdb_conf.username)
-		curl_easy_setopt(curl_handle, CURLOPT_USERNAME,
-				 influxdb_conf.username);
-	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, _write_callback);
-	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *) &chunk);
-	curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, influxdb_conf.timeout);
-
-	if ((res = curl_easy_perform(curl_handle)) != CURLE_OK) {
-		if ((error_cnt++ % 100) == 0)
-			error("%s %s: curl_easy_perform failed to send data (discarded). Reason: %s",
-			      plugin_type, __func__, curl_easy_strerror(res));
-		rc = SLURM_ERROR;
-		goto cleanup;
-	}
-
-	if ((res = curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE,
-				     &response_code)) != CURLE_OK) {
-		error("%s %s: curl_easy_getinfo response code failed: %s",
-		      plugin_type, __func__, curl_easy_strerror(res));
-		rc = SLURM_ERROR;
-		goto cleanup;
-	}
+	rc = slurm_curl_request(datastr, url, influxdb_conf.username,
+				influxdb_conf.password, NULL, NULL, NULL, false,
+				influxdb_conf.timeout, &response_str,
+				&response_code, HTTP_REQUEST_POST, true, false);
+	xfree(url);
 
 	/* In general, status codes of the form 2xx indicate success,
 	 * 4xx indicate that InfluxDB could not understand the request, and
@@ -275,48 +201,35 @@ static int _send_data(const char *data)
 	 * Errors are returned in JSON.
 	 * https://docs.influxdata.com/influxdb/v0.13/concepts/api/
 	 */
-	if (response_code >= 200 && response_code <= 205) {
+	if (rc != SLURM_SUCCESS) {
+		error("send data failed");
+	} else if ((response_code >= 200) && (response_code <= 205)) {
 		debug2("%s %s: data write success", plugin_type, __func__);
-		if (error_cnt > 0)
-			error_cnt = 0;
 	} else {
 		rc = SLURM_ERROR;
 		debug2("%s %s: data write failed, response code: %ld",
 		       plugin_type, __func__, response_code);
 		if (slurm_conf.debug_flags & DEBUG_FLAG_PROFILE) {
 			/* Strip any trailing newlines. */
-			while (chunk.message[strlen(chunk.message) - 1] == '\n')
-				chunk.message[strlen(chunk.message) - 1] = '\0';
+			while (response_str[strlen(response_str) - 1] == '\n')
+				response_str[strlen(response_str) - 1] = '\0';
 			info("%s %s: JSON response body: %s", plugin_type,
-			     __func__, chunk.message);
+			     __func__, response_str);
 		}
 	}
 
-cleanup:
-	xfree(chunk.message);
-	xfree(url);
-cleanup_easy_init:
-	curl_easy_cleanup(curl_handle);
+	xfree(response_str);
 
-	END_TIMER;
-	log_flag(PROFILE, "%s %s: took %s to send data",
-		 plugin_type, __func__, TIME_STR);
+	datastr[0] = '\0';
+	if (data)
+		xstrcat(datastr, data);
+	datastrlen = strlen(datastr);
 
-	if (data) {
-		datastr = xstrdup(data);
-		datastrlen = strlen(data);
-	} else {
-		datastr[0] = '\0';
-		datastrlen = 0;
-	}
+	last_send = now;
 
 	return rc;
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called. Put global initialization here.
- */
 extern int init(void)
 {
 	debug3("%s %s called", plugin_type, __func__);
@@ -324,20 +237,19 @@ extern int init(void)
 	if (!running_in_slurmstepd())
 		return SLURM_SUCCESS;
 
-	if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
-		error("%s %s: curl_global_init: %m", plugin_type, __func__);
+	if (slurm_curl_init())
 		return SLURM_ERROR;
-	}
 
 	datastr = xmalloc(BUF_SIZE);
+	last_send = time(NULL);
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	debug3("%s %s called", plugin_type, __func__);
 
-	curl_global_cleanup();
+	slurm_curl_fini();
 
 	_free_tables();
 	xfree(datastr);
@@ -346,7 +258,6 @@ extern int fini(void)
 	xfree(influxdb_conf.password);
 	xfree(influxdb_conf.rt_policy);
 	xfree(influxdb_conf.username);
-	return SLURM_SUCCESS;
 }
 
 extern void acct_gather_profile_p_conf_options(s_p_options_t **full_options,
@@ -355,9 +266,10 @@ extern void acct_gather_profile_p_conf_options(s_p_options_t **full_options,
 	debug3("%s %s called", plugin_type, __func__);
 
 	s_p_options_t options[] = {
-		{"ProfileInfluxDBHost", S_P_STRING},
 		{"ProfileInfluxDBDatabase", S_P_STRING},
 		{"ProfileInfluxDBDefault", S_P_STRING},
+		{"ProfileInfluxDBFrequency", S_P_UINT32},
+		{"ProfileInfluxDBHost", S_P_STRING},
 		{"ProfileInfluxDBPass", S_P_STRING},
 		{"ProfileInfluxDBRTPolicy", S_P_STRING},
 		{"ProfileInfluxDBTimeout", S_P_UINT32},
@@ -376,7 +288,6 @@ extern void acct_gather_profile_p_conf_set(s_p_hashtbl_t *tbl)
 
 	influxdb_conf.def = ACCT_GATHER_PROFILE_ALL;
 	if (tbl) {
-		s_p_get_string(&influxdb_conf.host, "ProfileInfluxDBHost", tbl);
 		if (s_p_get_string(&tmp, "ProfileInfluxDBDefault", tbl)) {
 			influxdb_conf.def =
 				acct_gather_profile_from_string(tmp);
@@ -387,6 +298,10 @@ extern void acct_gather_profile_p_conf_set(s_p_hashtbl_t *tbl)
 		}
 		s_p_get_string(&influxdb_conf.database,
 			       "ProfileInfluxDBDatabase", tbl);
+		if (!s_p_get_uint32(&influxdb_conf.frequency,
+				    "ProfileInfluxDBFrequency", tbl))
+			influxdb_conf.frequency = DEFAULT_INFLUXDB_FREQUENCY;
+		s_p_get_string(&influxdb_conf.host, "ProfileInfluxDBHost", tbl);
 		s_p_get_string(&influxdb_conf.password,
 			       "ProfileInfluxDBPass", tbl);
 		s_p_get_string(&influxdb_conf.rt_policy,
@@ -599,16 +514,19 @@ extern int acct_gather_profile_p_add_sample_data(int table_id, void *data,
 	return SLURM_SUCCESS;
 }
 
-extern void acct_gather_profile_p_conf_values(List *data)
+extern void acct_gather_profile_p_conf_values(list_t **data)
 {
-	add_key_pair(*data, "ProfileInfluxDBHost", "%s",
-		     influxdb_conf.host);
-
 	add_key_pair(*data, "ProfileInfluxDBDatabase", "%s",
 		     influxdb_conf.database);
 
 	add_key_pair(*data, "ProfileInfluxDBDefault", "%s",
 		     acct_gather_profile_to_string(influxdb_conf.def));
+
+	add_key_pair(*data, "ProfileInfluxDBFrequency", "%u",
+		     influxdb_conf.frequency);
+
+	add_key_pair(*data, "ProfileInfluxDBHost", "%s",
+		     influxdb_conf.host);
 
 	/* skip over ProfileInfluxDBPass for security reasons */
 

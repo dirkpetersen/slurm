@@ -36,6 +36,7 @@
 #define _GNU_SOURCE
 
 #include <fcntl.h>
+#include <mntent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -48,6 +49,7 @@
 #include "slurm/slurm_errno.h"
 
 #include "src/common/bitstring.h"
+#include "src/common/fd.h"
 #include "src/common/list.h"
 #include "src/common/log.h"
 #include "src/common/timers.h"
@@ -61,30 +63,37 @@
 #include "src/plugins/cgroup/v2/cgroup_dbus.h"
 #include "src/plugins/cgroup/v2/ebpf.h"
 
-#define SYSTEM_CGSLICE "system.slice"
+#define DEFAULT_SYSTEM_CGSLICE "system.slice"
 #define SYSTEM_CGSCOPE "slurmstepd"
 #define SYSTEM_CGDIR "system"
-#define CGROUP_MAX_RETRIES 100
 
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Cgroup v2 plugin";
 const char plugin_type[] = "cgroup/v2";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
 /* Internal cgroup structs */
-static List task_list;
+static list_t *task_list;
 static uint16_t step_active_cnt;
-static xcgroup_ns_t int_cg_ns;
+static xcgroup_ns_t int_cg_ns = { 0 };
 static xcgroup_t int_cg[CG_LEVEL_CNT];
 static bpf_program_t p[CG_LEVEL_CNT];
 static char *stepd_scope_path = NULL;
 static uint32_t task_special_id = NO_VAL;
 static char *invoc_id;
+static int token_fd = -1;
 static char *ctl_names[] = {
 	[CG_TRACK] = "freezer",
 	[CG_CPUS] = "cpuset",
 	[CG_MEMORY] = "memory",
 	[CG_CPUACCT] = "cpu",
 	[CG_DEVICES] = "devices",
+	/* Below are extra controllers not explicitly tracked by Slurm. */
+	[CG_IO] = "io",
+	[CG_HUGETLB] = "hugetlb",
+	[CG_PIDS] = "pids",
+	[CG_RDMA] = "rdma",
+	[CG_MISC] = "misc"
 };
 
 typedef struct {
@@ -123,75 +132,178 @@ extern int cgroup_p_task_addto(cgroup_ctl_type_t ctl, stepd_step_rec_t *step,
  */
 
 /*
- * The cgroup v2 documented way to know which is the process root in the cgroup
- * hierarchy is just to read /proc/self/cgroup. In Unified hierarchies this
- * must contain only one line. If there are more lines this would mean we are
- * in Hybrid or in Legacy cgroup.
+ * Get the cgroup root mountpoint for a given mount path and pid.
+ *
+ * This function parses the /proc/pid/mountinfo, and gets the 4th element of
+ * the line which 5th element equals to mount parameter.
+ *
+ * From man proc_pid_mountinfo about 4th and 5th fields of mountinfo:
+ * (4) root: the pathname of the directory in the filesystem which forms the
+ * root of this mount.
+ * (5)  mount point: the pathname of the mount point relative to the process's
+ * root directory.
+ *
+ * This is used primarily to get the real mount for a cgroup filesystem as in
+ * some specific containerized environments the real root of the cgroup
+ * filesystem may not be coincide with what we get in /proc/1/cgroup.
+ *
+ * This only checks the first occurrence of the mount as it will always be the
+ * proper one, as this file gets written sequentially, meaning that the "real"
+ * /sys/fs/cgroup will appear first. If it happens to be any bind mount to it
+ * it will appear later, those bind mounts do not affect the /proc/<pid>/cgroup
+ * data.
+ *
+ * Example:
+ * - For mount = "/sys/fs/cgroup" and pid 123, we find the following line in
+ * /proc/123/mountinfo, so as the 5th field matches mount, we will return the
+ * 4th field "/":
+ * 475 337 0:28 / /sys/fs/cgroup rw(...) - cgroup2 cgroup2 rw,nsdelegate(...)
+ *
+ * - If we get a line like this, we will return "/../../../../../..".
+ * 379 377 0:28 /../../../../../.. /sys/fs/cgroup rw(...) - cgroup2(...)
+ *
+ * IN mount - Path to match with the 5th field of mountinfo string.
+ * IN pid_str - Pid to look for the mountinfo.
+ * OUT data - NULL if not found, or a xmalloc'ed string with a copy of the
+ *            4th field of the line which matches mount with the 5th field.
  */
-static char *_get_self_cg_path()
+static char *_get_root_mount_mountinfo(char *mount, char *pid_str)
 {
-	char *buf, *start = NULL, *p, *ret = NULL;
-	size_t sz;
+	char *path = NULL, *line = NULL, *word, *data = NULL, *save_ptr = NULL;
+	size_t len = 0;
+	int count = 0;
+	FILE *f;
+	bool found = false;
 
-	if (common_file_read_content("/proc/self/cgroup", &buf, &sz) !=
-	    SLURM_SUCCESS)
-		fatal("cannot read /proc/self/cgroup contents: %m");
-
-	/*
-	 * In Unified mode there will be just one line containing the path
-	 * of the cgroup and starting by 0, so get it as our root and replace
-	 * the \n:
-	 * "0::/system.slice/slurmd<nodename>.service\n"
-	 *
-	 * The final path will look like this:
-	 * /sys/fs/cgroup/system.slice/slurmd.service/
-	 *
-	 * If we have multiple slurmd, we will likely have one unit file per
-	 * node, and the path takes the name of the service file, e.g:
-	 * /sys/fs/cgroup/system.slice/slurmd-<nodename>.service/
-	 */
-	if ((p = xstrchr(buf, ':'))) {
-		if ((p + 2) < (buf + sz - 1))
-			start = p + 2;
+	path = xstrdup_printf("/proc/%s/mountinfo", pid_str);
+	f = fopen(path, "r");
+	xfree(path);
+	if (f == NULL) {
+		fatal("cannot read /proc/%s/mountinfo contents: %m", pid_str);
+		return NULL;
 	}
 
-	if (start && (*start != '\0')) {
-		if ((p = xstrchr(start, '\n')))
-			*p = '\0';
-		xstrfmtcat(ret, "%s%s",
-			   slurm_cgroup_conf.cgroup_mountpoint, start);
+	while (!found && getline(&line, &len, f) != -1) {
+		if (xstrstr(line, mount)) {
+			count = 0;
+			word = strtok_r(line, " ", &save_ptr);
+			while (word) {
+				/*
+				 * The 4th value is the root of the mount, and
+				 * the 5th is the mount, so we want to get
+				 * the 4th and ensure that the 5th is exactly
+				 * equal to mount, so that we are not looking
+				 * into a subdirectory.
+				 */
+				if (count == 3) {
+					data = word;
+					word = strtok_r(NULL, " ", &save_ptr);
+					if (!xstrcmp(word, mount)) {
+						data = xstrdup(data);
+						found = true;
+						break;
+					}
+				}
+				count++;
+				word = strtok_r(NULL, " ", &save_ptr);
+			}
+		}
 	}
+	free(line);
 
-	xfree(buf);
-	return ret;
+	fclose(f);
+	if (!data) {
+		error("Could not parse '%s' root mount for %s", mount, pid_str);
+	}
+	return data;
 }
 
 /*
- * Get the cgroup root directory by reading /proc/1/cgroup path.
+ * Check whether path is a valid cgroup2 mountpoint. This also checks that the
+ * cgroup mount passed is usable in the current cgroup2 namespace.
  *
- * We expect one single line like this:
+ * IN path - Path to cgroup2 mountpoint.
+ */
+static bool _is_cgroup2_mount(char *path)
+{
+	FILE *fp = setmntent("/proc/mounts", "r");
+	struct mntent *mnt;
+	char *minfo = NULL;
+	bool rc = false;
+
+	if (!fp) {
+		error("Failed to open /proc/mounts");
+		return rc;
+	}
+
+	while ((mnt = getmntent(fp))) {
+		if (!xstrcmp(mnt->mnt_dir, path) &&
+		    !xstrcmp(mnt->mnt_type, "cgroup2")) {
+			rc = true;
+			break;
+		}
+	}
+
+	if (!rc) {
+		error("The cgroup mountpoint %s is not mounted", path);
+		goto end;
+	}
+
+	minfo = _get_root_mount_mountinfo(path, "self");
+	if (xstrcmp(minfo, "/"))
+		error("The cgroup mountpoint does not align with the current namespace. Please, ensure all namespaces are correctly mounted. Refer to the slurm cgroup_v2 documentation.");
+
+end:
+	xfree(minfo);
+	endmntent(fp);
+	return rc;
+}
+
+/*
+ * Read /proc/<pid>/cgroup and return the absolute cgroup path of the given pid.
+ *
+ * We will deal with different cases. For example:
+ *
+ * In regular systems we expect one single line like this:
  * "0::/init.scope\n"
  *
- * But in containerized environments it could look like:
+ * In some containerized environments it could look like:
  * "0::/docker.slice/docker-<some UUID>.scope/init.scope"
  *
- * This function just strips the "0::" and "init.scope" portions.
+ * Or in a cgroup namespace:
+ * "0::/"
  *
- * In normal systems the final path will look like this:
- * /sys/fs/cgroup[/]
+ * This function just strips the initial "0::" and the last part of the path
+ * (e.g "init.scope") portions. Then it adds the cgroup mountpoint prefix.
  *
- * In containerized environments it will look like:
- * /sys/fs/cgroup[/docker.slice/docker-<some UUID>.scope]
+ * In Unified hierarchies this must contain only one line. If there are more
+ * lines this would mean we are in Hybrid or in Legacy cgroup. We do not support
+ * hybrid mode, so if we find more than one line we fatal.
  *
+ * The Cgroup v2 documented way to know which is the cgroup root for a
+ * process in the cgroup hierarchy is just to read /proc/<pid>/cgroup.
+ *
+ * The parameter pid_str is a string representing a numeric pid or the
+ * keyword 'self'. (Note: if we are in a cgroup namespace without a proper proc
+ * mount, using 'self' will possibly return a different value than using
+ * getpid()).
+ *
+ * IN pid_str - pid to read the path for
+ * OUT ret - xmalloc'ed string containing the cgroup path for the passed pid
+ *           read from /proc/<pid>/cgroup.
  */
-static char *_get_init_cg_path()
+static char *_get_proc_cg_path(char *pid_str)
 {
 	char *buf, *start = NULL, *p, *ret = NULL;
+	char *path = NULL, *minfo = NULL;
 	size_t sz;
 
-	if (common_file_read_content("/proc/1/cgroup", &buf, &sz) !=
-	    SLURM_SUCCESS)
-		fatal("cannot read /proc/1/cgroup contents: %m");
+	path = xstrdup_printf("/proc/%s/cgroup", pid_str);
+	if (common_file_read_content(path, &buf, &sz) != SLURM_SUCCESS) {
+		xfree(path);
+		fatal("cannot read /proc/%s/cgroup contents: %m", pid_str);
+	}
+	xfree(path);
 
 	/*
 	 * In Unified mode there will be just one line containing the path
@@ -202,24 +314,98 @@ static char *_get_init_cg_path()
 		fatal("Hybrid mode is not supported. Mounted cgroups are: %s",
 		      buf);
 
+	/*
+	 * Skip until past the :: from the file ensuring that we are not past
+	 * the buffer size.
+	 */
 	if ((p = xstrchr(buf, ':')) != NULL) {
 		if ((p + 2) < (buf + sz - 1))
 			start = p + 2;
-	}
-
-	if (start && *start != '\0') {
+		/* Remove everything after the first newline found. */
 		if ((p = xstrchr(start, '\n')))
 			*p = '\0';
-		p = xdirname(start);
-		if (!xstrcmp(p, "/"))
-			xstrfmtcat(ret, "%s",
-				   slurm_cgroup_conf.cgroup_mountpoint);
-		else
-			xstrfmtcat(ret, "%s%s",
-				   slurm_cgroup_conf.cgroup_mountpoint, p);
-		xfree(p);
 	}
+
+	if (!start || (*start == '\0'))
+		fatal("Unexpected format found in /proc/%s/cgroup file: %s",
+		      pid_str, buf);
+
+	/* Start the return string with the mount point of the cgroup. */
+	ret = xstrdup(slurm_cgroup_conf.cgroup_mountpoint);
+
+	/*
+	 * Only check mountinfo in case that the cgroup file points to a
+	 * location that is not the root of the cgroup mountpoint (/).
+	 */
+	if (xstrcmp(start, "/")) {
+		/*
+		 * Check for correct /proc and cgroup mounts when we are in a
+		 * cgroup namespace by checking mountinfo.
+		 */
+		minfo = _get_root_mount_mountinfo(
+			slurm_cgroup_conf.cgroup_mountpoint,
+			pid_str);
+		/*
+		* If minfo is "/" our root is
+		* slurm_cgroup_conf.cgroup_mountpoint.
+		*
+		* If minfo contains something different than "/":
+		* For containers with remounted cgroups, mountinfo would've
+		* returned a string different than "/", so we first need to
+		* ensure that the minfo is a substring of what we've read in
+		* /proc/pid/cgroup.
+		*
+		* If minfo content is not a substring of our /proc/pid/cgroup
+		* (e.g. minfo is "../../.." and /proc/pid/cgroup is
+		* 0::/something), we're in a wrong situation.
+		*/
+		if (xstrcmp(minfo, "/")) {
+			/*
+			* If the information of /proc/pid/mountinfo is not a
+			* substring of the one in /proc/pid/cgroup, it means
+			* that something is wrong. For example we are in a pid
+			* and a cgroup namespace without /proc properly mounted.
+			*/
+			if (xstrstr(start, minfo))
+				start = start + strlen(minfo);
+			else
+				fatal("mismatch found in /proc/%s/mountinfo: \"%s\" vs /proc/%s/cgroup: \"%s\". Please check that procfs and cgroupfs are correctly mounted in the namespace.",
+				      pid_str, minfo, pid_str, start);
+		}
+
+		/* Append the sanitized path to the cgroup mountpoint. */
+		xstrcat(ret, start);
+
+		xfree(minfo);
+	}
+
 	xfree(buf);
+	return ret;
+}
+
+/*
+ * Get the absolute OS's cgroup root directory by reading /proc/1/cgroup path.
+ *
+ * In normal systems the final path will look like this:
+ * /sys/fs/cgroup[/]
+ *
+ * In containerized environments it will look like:
+ * /sys/fs/cgroup[/docker.slice/docker-<some UUID>.scope]
+ *
+ */
+static char *_get_init_cg_path()
+{
+	char *cg_path, *ret = NULL;
+
+	cg_path = _get_proc_cg_path("1");
+
+	if (xstrcmp(cg_path, slurm_cgroup_conf.cgroup_mountpoint)) {
+		ret = xdirname(cg_path);
+		xfree(cg_path);
+	} else {
+		ret = cg_path;
+	}
+
 	return ret;
 }
 
@@ -230,24 +416,34 @@ static char *_get_init_cg_path()
  */
 static void _set_int_cg_ns()
 {
-	char *init_cg_path = _get_init_cg_path();
+	int_cg_ns.init_cg_path = _get_init_cg_path();
+
+	/*
+	 * When started manually in a container and reconfiguring, if we are pid
+	 * 1 we can directly get the cgroup as it has been configured in our
+	 * previous instance.
+	 */
+	if (slurm_cgroup_conf.ignore_systemd && getenv("SLURMD_RECONF") &&
+	    (getpid() == 1)) {
+		stepd_scope_path = xdirname(int_cg_ns.init_cg_path);
+		int_cg_ns.mnt_point = xstrdup(int_cg_ns.init_cg_path);
+		return;
+	}
+
+	/* The slice is a cgroup/v2 parameter only, so set the default here. */
+	if (!slurm_cgroup_conf.cgroup_slice)
+		slurm_cgroup_conf.cgroup_slice =
+			xstrdup(DEFAULT_SYSTEM_CGSLICE);
 
 #ifdef MULTIPLE_SLURMD
 	xstrfmtcat(stepd_scope_path, "%s/%s/%s_%s.scope",
-		   init_cg_path,
-		   SYSTEM_CGSLICE, conf->node_name,
-		   SYSTEM_CGSCOPE);
+		   int_cg_ns.init_cg_path, slurm_cgroup_conf.cgroup_slice,
+		   conf->node_name, SYSTEM_CGSCOPE);
 #else
-	xstrfmtcat(stepd_scope_path, "%s/%s/%s.scope",
-		   init_cg_path,
-		   SYSTEM_CGSLICE, SYSTEM_CGSCOPE);
+	xstrfmtcat(stepd_scope_path, "%s/%s/%s.scope", int_cg_ns.init_cg_path,
+		   slurm_cgroup_conf.cgroup_slice, SYSTEM_CGSCOPE);
 #endif
-	if (running_in_slurmstepd())
-		int_cg_ns.mnt_point = stepd_scope_path;
-	else
-		int_cg_ns.mnt_point = _get_self_cg_path();
-
-	xfree(init_cg_path);
+	int_cg_ns.mnt_point = _get_proc_cg_path("self");
 }
 
 /*
@@ -301,10 +497,25 @@ static int _enable_subtree_control(char *path, bitstr_t *ctl_bitmap)
 
 static int _get_controllers(char *path, bitstr_t *ctl_bitmap)
 {
-	char *buf = NULL, *ptr, *save_ptr, *ctl_filepath = NULL;
+	char *buf = NULL, *ptr, *save_ptr, *ctl_filepath = NULL, *extra;
 	size_t sz;
 
 	xassert(ctl_bitmap);
+
+	/* Remove the extra controllers if not explicitly asked */
+	extra = slurm_cgroup_conf.enable_extra_controllers;
+	if (!xstrstr(extra, "all")) {
+		if (extra) {
+			for (int i = CG_IO; i < CG_CTL_CNT; i++) {
+				if (!xstrstr(extra, ctl_names[i])) {
+					ctl_names[i] = "";
+				}
+			}
+		} else {
+			for (int i = CG_IO; i < CG_CTL_CNT; i++)
+				ctl_names[i] = "";
+		}
+	}
 
 	xstrfmtcat(ctl_filepath, "%s/cgroup.controllers", path);
 	if (common_file_read_content(ctl_filepath, &buf, &sz) !=
@@ -335,10 +546,42 @@ static int _get_controllers(char *path, bitstr_t *ctl_bitmap)
 	for (int i = 0; i < CG_CTL_CNT; i++) {
 		if ((i == CG_DEVICES) || (i == CG_TRACK))
 			continue;
-		if (invoc_id && !bit_test(ctl_bitmap, i))
+		if (invoc_id && !bit_test(ctl_bitmap, i) &&
+		    xstrcmp(ctl_names[i], ""))
 			error("Controller %s is not enabled!", ctl_names[i]);
 	}
 	return SLURM_SUCCESS;
+}
+
+/*
+ * Enables the cgroup controllers system_ctrls from /sys/fs/cgroup to the one
+ * specified in cg_path. If system_ctrls is null it reads it from
+ * /sys/fs/cgroup/cgroup.controllers
+*/
+static int _enable_controllers(char *cg_path, bitstr_t *system_ctrls)
+{
+	int rc = SLURM_SUCCESS;
+	char *p, *dst;
+
+	xassert(system_ctrls);
+	if (!(xstrstr(cg_path, slurm_cgroup_conf.cgroup_mountpoint))) {
+		error("%s is not under the cgroup mountpoint %s.",
+		      cg_path, slurm_cgroup_conf.cgroup_mountpoint);
+		return SLURM_ERROR;
+	}
+
+	p = dst = xstrdup(cg_path);
+	p += strlen(slurm_cgroup_conf.cgroup_mountpoint);
+	do {
+		*p = '\0';
+		if ((rc = _enable_subtree_control(dst, system_ctrls)))
+			goto cleanup;
+		*p = '/';
+	} while ((p = xstrchr(p + 1, '/')));
+
+cleanup:
+	xfree(dst);
+	return rc;
 }
 
 /*
@@ -357,58 +600,41 @@ static int _enable_system_controllers()
 {
 	char *slice_path = NULL;
 	bitstr_t *system_ctrls = bit_alloc(CG_CTL_CNT);
-	char *tok, *next, *curr;
-	char *save_ptr = NULL, *orig = NULL;
-	bool started = false;
+	int rc = SLURM_ERROR;
 
 	if (_get_controllers(slurm_cgroup_conf.cgroup_mountpoint,
 			     system_ctrls) != SLURM_SUCCESS) {
-		FREE_NULL_BITMAP(system_ctrls);
-		return SLURM_ERROR;
+		error("Could not obtain system controllers from %s",
+		      slurm_cgroup_conf.cgroup_mountpoint);
+		goto end;
 	}
 
-	/* Enable controllers for the top of the tree. */
-	_enable_subtree_control(slurm_cgroup_conf.cgroup_mountpoint,
-				system_ctrls);
-
-	/* Enable it for us, slurmd, recursively. We may be anywhere. */
-	next = xmalloc(strlen(int_cg_ns.mnt_point) + 1);
-	curr = xmalloc(strlen(int_cg_ns.mnt_point) + 1);
-	orig = xstrdup(int_cg_ns.mnt_point);
-	tok = strtok_r(orig, "/", &save_ptr);
-	while (tok) {
-		/* Start from the mnt_point skipping any previous dir. */
-		if (!started &&
-		    (!xstrcmp(next, slurm_cgroup_conf.cgroup_mountpoint)))
-			started = true;
-
-		sprintf(next, "%s/%s", curr, tok);
-		strcpy(curr, next);
-
-		/* Skip the last directory which is a leaf where we live. */
-		if (started && !xstrcmp(curr, int_cg_ns.mnt_point))
-			break;
-
-		if (started)
-			_enable_subtree_control(curr, system_ctrls);
-
-		tok = strtok_r(NULL, "/", &save_ptr);
+	if (_enable_controllers(int_cg_ns.mnt_point, system_ctrls) !=
+	    SLURM_SUCCESS) {
+		error("Could not enable controllers for cgroup path %s",
+		      int_cg_ns.mnt_point);
+		goto end;
 	}
-	xfree(orig);
-	xfree(curr);
-	xfree(next);
-
 
 	/*
 	 * Enable it for system.slice, where the stepd scope will reside when
-	 * it is created later.
+	 * it is created later. Do not do it when ignoresystemd is true as it
+	 * will be done when the stepd_scope_path is created.
 	 */
-	slice_path = xdirname(stepd_scope_path);
-	_enable_subtree_control(slice_path, system_ctrls);
+	if (!slurm_cgroup_conf.ignore_systemd) {
+		slice_path = xdirname(stepd_scope_path);
+		if (_enable_subtree_control(slice_path, system_ctrls) !=
+		    SLURM_SUCCESS) {
+			error("Could not enable subtree control at %s",
+			      slice_path);
+			goto end;
+		}
+	}
+	rc = SLURM_SUCCESS;
+end:
 	xfree(slice_path);
-
 	FREE_NULL_BITMAP(system_ctrls);
-	return SLURM_SUCCESS;
+	return rc;
 }
 
 /*
@@ -460,18 +686,6 @@ static int _find_task_cg_info(void *x, void *key)
 
 	return 0;
 }
-
-static int _find_purge_task_special(task_cg_info_t *task_ptr, uint32_t *id)
-{
-	if (task_ptr->taskid == *id) {
-		if (common_cgroup_delete(&task_ptr->task_cg) != SLURM_SUCCESS)
-			log_flag(CGROUP, "Failed to cleanup %s: %m",
-				 task_ptr->task_cg.path);
-		return 1;
-	}
-	return 0;
-}
-
 
 static void _free_task_cg_info(void *x)
 {
@@ -539,30 +753,69 @@ static int _find_pid_task(void *x, void *key)
 	return found;
 }
 
-static void _wait_cgroup_empty(xcgroup_t *cg, int timeout_ms)
+/*
+ * Check the "populated" key in the cgroup.events file
+ * Returns CGROUP_EMPTY, CGROUP_POPULATED, or SLURM_ERROR.
+ */
+static int _is_cgroup_empty(xcgroup_t *cg)
 {
-	char *cgroup_events = NULL, *events_content = NULL, *ptr;
-	int rc, fd, wd, populated = -1;
-	size_t sz;
-	struct pollfd pfd[1];
+	char *events_content = NULL, *ptr;
+	int rc;
+	int populated = -1;
+	size_t size;
 
 	/* Check if cgroup is empty in the first place. */
-	if (common_cgroup_get_param(
-		    cg, "cgroup.events", &events_content, &sz) != SLURM_SUCCESS)
+	if (common_cgroup_get_param(cg, "cgroup.events", &events_content,
+				    &size) != SLURM_SUCCESS) {
 		error("Cannot read %s/cgroup.events", cg->path);
-
-	if (events_content) {
-		if ((ptr = xstrstr(events_content, "populated"))) {
-			if (sscanf(ptr, "populated %u", &populated) != 1)
-				error("Cannot read populated counter from cgroup.events file.");
-		}
-		xfree(events_content);
+		return SLURM_ERROR;
 	}
 
-	if (populated < 0) {
+	if (!events_content) {
+		error("%s/cgroup.events is empty", cg->path);
+		return SLURM_ERROR;
+	}
+
+	if (!(ptr = xstrstr(events_content, "populated"))) {
+		error("Could not find \"populated\" field in %s/cgroup.events: \"%s\"",
+		      cg->path, events_content);
+		xfree(events_content);
+		return SLURM_ERROR;
+	}
+
+	if ((rc = sscanf(ptr, "populated %u", &populated) != 1)) {
+		error("Could not find value for \"populated\" field in %s/cgroup.events (\"%s\"): %s",
+		      cg->path, events_content, strerror(rc));
+		xfree(events_content);
+		return SLURM_ERROR;
+	}
+
+	xfree(events_content);
+
+	switch (populated) {
+	case 0:
+		return CGROUP_EMPTY;
+	case 1:
+		return CGROUP_POPULATED;
+	default:
+		error("Cannot determine if %s is empty.", cg->path);
+		break;
+	}
+	return SLURM_ERROR;
+}
+
+static void _wait_cgroup_empty(xcgroup_t *cg, int timeout_ms)
+{
+	char *cgroup_events = NULL;
+	int rc, fd, wd, populated = -1;
+	struct pollfd pfd[1];
+
+	populated = _is_cgroup_empty(cg);
+
+	if (populated == SLURM_ERROR) {
 		error("Cannot determine if %s is empty.", cg->path);
 		return;
-	} else if (populated == 0) //We're done
+	} else if (populated == CGROUP_EMPTY) //We're done
 		return;
 
 	/*
@@ -601,21 +854,11 @@ static void _wait_cgroup_empty(xcgroup_t *cg, int timeout_ms)
 		error("Timeout waiting for %s to become empty.", cgroup_events);
 
 	/* Check if cgroup is empty again. */
-	if (common_cgroup_get_param(cg, "cgroup.events",
-				    &events_content, &sz) != SLURM_SUCCESS)
-		error("Cannot read %s/cgroup.events", cg->path);
+	populated = _is_cgroup_empty(cg);
 
-	if (events_content) {
-		if ((ptr = xstrstr(events_content, "populated"))) {
-			if (sscanf(ptr, "populated %u", &populated) != 1)
-				error("Cannot read populated counter from cgroup.events file.");
-		}
-		xfree(events_content);
-	}
-
-	if (populated < 0)
+	if (populated == SLURM_ERROR)
 		error("Cannot determine if %s is empty.", cg->path);
-	else if (populated == 1)
+	else if (populated == CGROUP_POPULATED)
 		log_flag(CGROUP, "Cgroup %s is not empty.", cg->path);
 
 end_inotify:
@@ -662,7 +905,7 @@ static int _wait_scope_ready(xcgroup_t scope_root, pid_t pid, uint32_t t)
 
 	END_TIMER;
 	log_flag(CGROUP, "Took %s and %d retries for scope dir %s to show up.",
-		 TIME_STR, retries, scope_root.path);
+		 TIMER_STR(), retries, scope_root.path);
 
 	/* Wait for the pid to show up in cgroup.procs */
 	START_TIMER;
@@ -686,7 +929,7 @@ static int _wait_scope_ready(xcgroup_t scope_root, pid_t pid, uint32_t t)
 
 	END_TIMER;
 	log_flag(CGROUP, "Took %s and %d retries for pid %d to show up in %s/cgroup.procs.",
-		 TIME_STR, retries, pid, scope_root.path);
+		 TIMER_STR(), retries, pid, scope_root.path);
 
 	log_flag(CGROUP, "Scope initialization complete after %d msec",
 		 (slurm_delta_tv(&start_tv)/1000));
@@ -694,7 +937,7 @@ static int _wait_scope_ready(xcgroup_t scope_root, pid_t pid, uint32_t t)
 	return SLURM_SUCCESS;
 dbus_timeout:
 	END_TIMER;
-	error("Scope initialization timeout after %s", TIME_STR);
+	error("Scope initialization timeout after %s", TIMER_STR());
 	return SLURM_ERROR;
 }
 
@@ -723,10 +966,10 @@ static int _init_stepd_system_scope(pid_t pid)
 	}
 
 	/* Now check we're really where we belong to. */
-	self_cg_path = _get_self_cg_path();
+	self_cg_path = _get_proc_cg_path("self");
 	if (xstrcmp(self_cg_path, int_cg[CG_LEVEL_SYSTEM].path)) {
 		error("Could not move slurmstepd pid %d to a Slurm's delegated cgroup. Should be in %s, we are in %s.",
-		      pid, self_cg_path, int_cg[CG_LEVEL_SYSTEM].path);
+		      pid, int_cg[CG_LEVEL_SYSTEM].path, self_cg_path);
 		xfree(self_cg_path);
 		return SLURM_ERROR;
 	}
@@ -747,12 +990,12 @@ static int _init_new_scope(char *scope_path)
 {
 	int rc;
 
-	rc = mkdir(scope_path, 0755);
+	rc = mkdirpath(scope_path, 0755, true);
 	if (rc && (errno != EEXIST)) {
 		error("Could not create scope directory %s: %m", scope_path);
 		return SLURM_ERROR;
 	}
-
+	_enable_controllers(scope_path, int_cg_ns.avail_controllers);
 	log_flag(CGROUP, "Created %s", scope_path);
 
 	return SLURM_SUCCESS;
@@ -798,7 +1041,7 @@ static int _init_new_scope_dbus(char *scope_path)
 		 * stopped.
 		 *
 		 * This minimizes the interaction with systemd becoming less
-		 * dependant on possible malfunctions it might have.
+		 * dependent on possible malfunctions it might have.
 		 */
 		if (xdaemon())
 			_exit(127);
@@ -845,13 +1088,13 @@ static int _init_new_scope_dbus(char *scope_path)
 
 	/*
 	 * Assuming the scope is created, let's mkdir the /system dir which will
-	 * allocate the sleep inifnity pid. This way the slurmstepd scope won't
+	 * allocate the sleep infinity pid. This way the slurmstepd scope won't
 	 * be a leaf anymore and we'll be able to create more directories.
 	 * _init_new_scope here is simply used as a mkdir.
 	 */
 	memset(&sys_root, 0, sizeof(sys_root));
 	xstrfmtcat(sys_root.path, "%s/%s", scope_path, SYSTEM_CGDIR);
-	if (_init_new_scope(sys_root.path) != SLURM_SUCCESS) {
+	if (mkdirpath(sys_root.path, 0755, true) != SLURM_SUCCESS) {
 		xfree(sys_root.path);
 		kill(pid, SIGKILL);
 		waitpid(pid, &status, WNOHANG);
@@ -946,6 +1189,90 @@ static int _init_slurmd_system_scope()
 	return SLURM_SUCCESS;
 }
 
+static void _get_parent_effective_cpus_mems(char **cpus_effective,
+					    char **mems_effective,
+					    xcgroup_t *cg)
+{
+	size_t sz;
+	xcgroup_t parent_cg = { 0 };
+
+	/* Copy the settings from one level up on the hierarchy. */
+	parent_cg.path = xdirname(cg->path);
+
+	*cpus_effective = NULL;
+	*mems_effective = NULL;
+
+	if (common_cgroup_get_param(&parent_cg, "cpuset.cpus.effective",
+				    cpus_effective, &sz) != SLURM_SUCCESS) {
+		error("Cannot read scope %s/cpuset.cpus.effective",
+		      parent_cg.path);
+	}
+
+	if (common_cgroup_get_param(&parent_cg, "cpuset.mems.effective",
+				    mems_effective, &sz) != SLURM_SUCCESS) {
+		error("Cannot read scope %s/cpuset.mems.effective",
+		      parent_cg.path);
+	}
+
+	common_cgroup_destroy(&parent_cg);
+}
+
+/*
+ * Unset the limits applied to slurmd from _resource_spec_init(), namely
+ * cpuset.cpus, cpuset.mems and memory.max. If others are applied in the future
+ * this function can be extended to reset other limits.
+ *
+ * IN: cg - slurmd cgroup to reset the limits.
+ * RET: SLURM_SUCCESS or SLURM_ERROR if any limit could not be reset.
+ */
+static int _unset_cpu_mem_limits(xcgroup_t *cg)
+{
+	int rc = SLURM_SUCCESS;
+
+	if (!bit_test(cg->ns->avail_controllers, CG_CPUS)) {
+		log_flag(CGROUP, "Not resetting cpuset limits in %s as %s controller is not enabled",
+			 cg->path, ctl_names[CG_CPUS]);
+	} else if (!xstrcmp(cg->path, int_cg_ns.init_cg_path)) {
+		log_flag(CGROUP, "Not resetting cpuset limits in %s as we are already in the top cgroup",
+			 cg->path);
+	} else {
+		/*
+		 * Normally it should suffice to write a "" into cpuset.cpus to
+		 * reset the allowed cpus, but for some reason this seems to be
+		 * interpreted as an "empty" cpuset by the kernel and it does
+		 * not allow us to do it when there are process in it (e.g. in
+		 * a reconfigure when slurmd is started manually). Instead, the
+		 * kernel allows us to specify the full range of cpus so we
+		 * will grab here the parent cpuset.cpus and apply it to our
+		 * cgroup. The same is done for cpuset.mems, as this interface
+		 * suffers from the same problem.
+		 */
+		char *parent_cpus, *parent_mems;
+		int i;
+		_get_parent_effective_cpus_mems(&parent_cpus, &parent_mems, cg);
+		rc += common_cgroup_set_param(cg, "cpuset.cpus", parent_cpus);
+		rc += common_cgroup_set_param(cg, "cpuset.mems", parent_mems);
+		if ((i = strlen(parent_cpus)))
+			parent_cpus[i - 1] = '\0';
+		if ((i = strlen(parent_mems)))
+			parent_mems[i - 1] = '\0';
+		log_flag(CGROUP, "%s reset cpuset.cpus=%s cpuset.mems=%s",
+			 cg->path, parent_cpus, parent_mems);
+		xfree(parent_cpus);
+		xfree(parent_mems);
+	}
+
+	if (!bit_test(cg->ns->avail_controllers, CG_MEMORY)) {
+		log_flag(CGROUP, "Not resetting limits in %s as %s controller is not enabled",
+			 cg->path, ctl_names[CG_MEMORY]);
+	} else {
+		rc += common_cgroup_set_param(cg, "memory.max", "max");
+		log_flag(CGROUP, "%s reset memory.max=max", cg->path);
+	}
+
+	return (rc) ? SLURM_ERROR : SLURM_SUCCESS;
+}
+
 /*
  * Slurmd started manually may not remain in the actual scope. Normally there
  * are other pids there, like the terminal from where it's been launched, so
@@ -961,8 +1288,8 @@ static int _migrate_to_stepd_scope()
 	pid_t slurmd_pid = getpid();
 
 	bit_clear_all(int_cg_ns.avail_controllers);
+	xfree(int_cg_ns.mnt_point);
 	common_cgroup_destroy(&int_cg[CG_LEVEL_ROOT]);
-	common_cgroup_ns_destroy(&int_cg_ns);
 
 	xstrfmtcat(new_home, "%s/slurmd", stepd_scope_path);
 	int_cg_ns.mnt_point = new_home;
@@ -1005,7 +1332,7 @@ static int _migrate_to_stepd_scope()
 		return SLURM_ERROR;
 	}
 
-	return _setup_controllers();
+	return SLURM_SUCCESS;
 }
 
 static void _get_memory_events(uint64_t *job_kills, uint64_t *step_kills)
@@ -1087,6 +1414,131 @@ static void _get_swap_events(uint64_t *job_swkills, uint64_t *step_swkills)
 }
 
 /*
+ * This function checks that all the processes contained in the cgroup cg
+ * belong to our namespace.
+ *
+ * That is checked by ensuring none of the pids contained in the cgroup.procs
+ * interface are 0, which would indicate that we cannot see the pid of that
+ * process, meaning this process belongs to another namespace.
+ *
+ * Trying to move a 0 in Cgroups moves yourself.
+ *
+ * IN cg - the cgroup we want to check for cgroup.procs not containing 0's
+ * RET - SLURM_ERROR if cgroup.procs could not be read or there are 0's.
+ *       SLURM_SUCCESS otherwise.
+ */
+static int _check_cg_pids_correct_ns(xcgroup_t *cg)
+{
+	pid_t *pids = NULL;
+	int npids = 0, rc = SLURM_SUCCESS;
+
+	if (common_cgroup_get_pids(cg, &pids, &npids) != SLURM_SUCCESS) {
+		error("unable to get processes from %s cgroup", cg->path);
+		return SLURM_ERROR;
+	}
+
+	for (int i = 0; i < npids; i++) {
+		if (pids[i] == 0) {
+			error("We detected a pid 0 which means you are in a cgroup namespace and a mounted cgroup but with pids from the host that we're not allowed to manage.");
+			rc = SLURM_ERROR;
+			break;
+		}
+	}
+	xfree(pids);
+	return rc;
+}
+
+/*
+ * Move the pids from 'from' cgroup to 'to' cgroup and enable the controllers.
+ *
+ * Create a new cgroup in the path resulting of the concenation of
+ * int_cg_ns.mnt_point (normally /sys/fs/cgroup ) and the "to" parameter.
+ *
+ * Then get all the processes in the "from" cgroup.procs and move them to the
+ * new cgroup.
+ *
+ * Finally enable the subtree control on the "from" cgroup to ensure that no new
+ * processes will be put there, convert it to a cgroup "domain controller".
+ *
+ * On failure retry by waiting for the processes to show up in the new cgroup,
+ * then try again to enable subtree control. If that last one fails it returns
+ * an error. Is important to note that this function does not guarantee
+ * that all the process can be successfully moved, as it is inherently racy.
+ * It might happen that in between the common_cgroup_get_pids() and the movement
+ * of those to the new cgroup, new processes are spawned there, thus making the
+ * enable_subtree fail. We don't want to freeze the cgroup either as we might
+ * be freezing ourselves.
+ *
+ * IN from - origin cgroup where to move pids from.
+ * IN to   - destination cgroup path to be created, set, and pids moved.
+ * RET rc  - SLURM_SUCCESS if all pids could be read and moved into a new
+ *           configured cgroup, error otherwise.
+ */
+static int _empty_pids(xcgroup_t *from, char *to)
+{
+	pid_t *pids = NULL;
+	int npids = 0;
+	xcgroup_t dest;
+	bitstr_t *system_ctrls = bit_alloc(CG_CTL_CNT);
+	int rc = SLURM_ERROR;
+
+	if (_get_controllers(slurm_cgroup_conf.cgroup_mountpoint,
+			     system_ctrls) != SLURM_SUCCESS) {
+		error("Unable to get cgroup root controllers.");
+		goto fail;
+	}
+
+	if (common_cgroup_create(&int_cg_ns, &dest, to, (uid_t) 0, (gid_t) 0) !=
+	    SLURM_SUCCESS) {
+		error("Unable to create cgroup structure for %s", to);
+		goto fail;
+	}
+
+	if (common_cgroup_instantiate(&dest) != SLURM_SUCCESS) {
+		error("Unable to create cgroup %s", dest.path);
+		goto fail;
+	}
+
+	if (common_cgroup_get_pids(from, &pids, &npids) != SLURM_SUCCESS) {
+		error("Unable to get pids from origin cgroup %s", from->path);
+		goto fail;
+	}
+
+	for (int i = 0; i < npids; i++) {
+		if (common_cgroup_move_process(&dest, pids[i]) !=
+		    SLURM_SUCCESS) {
+			error("Unable to move process %d from %s to %s cgroup.",
+			      pids[i], from->path, dest.path);
+			goto fail;
+		}
+	}
+
+	if (_enable_subtree_control(from->path, system_ctrls)) {
+		error("Cannot enable subtree control in %s cgroup. Trying to wait for process movement: %m",
+		      from->path);
+		for (int i = 0; i < npids; i++) {
+			if (!common_cgroup_wait_pid_moved(from, pids[i],
+							  from->path)) {
+				error("Move pid %d from %s to %s failed.",
+				      pids[i], from->path, dest.path);
+				goto fail;
+			}
+		}
+		if (_enable_subtree_control(from->path, system_ctrls)) {
+			error("Cannot enable subtree control for cgroup %s: %m",
+			      from->path);
+			goto fail;
+		}
+	}
+	rc = SLURM_SUCCESS;
+fail:
+	common_cgroup_destroy(&dest);
+	FREE_NULL_BITMAP(system_ctrls);
+	xfree(pids);
+	return rc;
+}
+
+/*
  * Initialize the cgroup plugin. Slurmd MUST be started by systemd and the
  * option Delegate set to 'Yes' or equal to a string with the desired
  * controllers we want to support in this system. If we are slurmd we're going
@@ -1116,7 +1568,38 @@ extern int init(void)
 	step_active_cnt = 0;
 	FREE_NULL_LIST(task_list);
 	task_list = list_create(_free_task_cg_info);
+	debug("%s loaded", plugin_name);
+	return SLURM_SUCCESS;
+}
 
+static bool _pid_in_root(char *pid_str)
+{
+	char *cg_path, *tmp_str, file_path[PATH_MAX];
+	bool rc = false;
+
+	cg_path = _get_proc_cg_path(pid_str);
+	tmp_str = xdirname(cg_path);
+	xfree(cg_path);
+	cg_path = tmp_str;
+	tmp_str = NULL;
+
+	if (snprintf(file_path, PATH_MAX, "%s/cgroup.procs", cg_path) >=
+	    PATH_MAX) {
+		error("Could not generate cgroup path: %s", file_path);
+		goto end;
+	}
+
+	/* If cgroup.procs is not found one level up, we are in the root */
+	if (access(file_path, F_OK))
+		rc = true;
+
+end:
+	xfree(cg_path);
+	return rc;
+}
+
+extern int cgroup_p_setup_scope(char *scope_path)
+{
 	/*
 	 * Detect if we are started by systemd. Another way could be to check
 	 * if our PPID=1, but we cannot rely on it because when starting slurmd
@@ -1128,12 +1611,22 @@ extern int init(void)
 	 */
 	invoc_id = getenv("INVOCATION_ID");
 
+	if (!_is_cgroup2_mount(slurm_cgroup_conf.cgroup_mountpoint)) {
+		fatal("%s is not a valid cgroup2 mountpoint",
+		      slurm_cgroup_conf.cgroup_mountpoint);
+	}
+
 	/*
-	 * Check our current root dir. Systemd MUST have Delegated it to us,
-	 * so we want slurmd to be started by systemd. In the case of stepd
-	 * we must guess our future path here, and make the directory later.
+	 * Set our current root dir in our "internal cgroup namespace".
+	 * We will create our tree and all directories from this root.
+	 * In slurmstepd, we got it from slurmd at startup so no need to guess.
 	 */
-	_set_int_cg_ns();
+	if (running_in_slurmstepd()) {
+		stepd_scope_path = xstrdup(scope_path);
+		int_cg_ns.mnt_point = stepd_scope_path;
+	} else
+		_set_int_cg_ns();
+
 	if (!int_cg_ns.mnt_point) {
 		error("Cannot setup the cgroup namespace.");
 		return SLURM_ERROR;
@@ -1142,15 +1635,54 @@ extern int init(void)
 	/* Setup the root cgroup object. */
 	if (common_cgroup_create(&int_cg_ns, &int_cg[CG_LEVEL_ROOT], "",
 				 (uid_t) 0, (gid_t) 0) != SLURM_SUCCESS) {
-		error("unable to create root cgroup");
+		error("unable to create root cgroup (%s)",
+		      int_cg[CG_LEVEL_ROOT].path);
 		return SLURM_ERROR;
 	}
 
 	/*
+	 * Check whether there are pids in the root cgroup that do not belong to
+	 * this namespace, and exit if so, as we cannot handle processes from
+	 * another namespace.
+	 */
+	if (running_in_slurmd() &&
+	    (_check_cg_pids_correct_ns(&int_cg[CG_LEVEL_ROOT]) !=
+	     SLURM_SUCCESS)) {
+		error("cgroup %s contains pids from outside of our pid namespace, so we cannot manage this cgroup.",
+		      int_cg[CG_LEVEL_ROOT].path);
+		return SLURM_ERROR;
+	}
+
+	/*
+	 * Convert our false root into a workable root - best effort.
+	 *
+	 * Slurmd will detect when the root cgroup is not a real one. This can
+	 * happen when we have been started in a cgroup namespaced container and
+	 * our /sys/fs/cgroup is mapped to a non-root cgroup directory in the
+	 * host, meaning it cannot have pids in cgroup.procs if there are
+	 * subdirectories.
+	 *
+	 * As we're going to create a hierarchy, we need to move out the pids
+	 * to a child directory, we've chosen /system for that.
+	 *
+	 * So move the pids away from the "false root" cgroup to /system.
+	 *
+	 * Only do that if IgnoreSystemd is set.
+	 */
+	if (running_in_slurmd() && cgroup_p_has_feature(CG_FALSE_ROOT) &&
+	    slurm_cgroup_conf.ignore_systemd && _pid_in_root("self")) {
+		if (_empty_pids(&int_cg[CG_LEVEL_ROOT], "/system") !=
+		    SLURM_SUCCESS){
+			error("cannot empty the false root cgroup (%s) of pids.",
+			      int_cg[CG_LEVEL_ROOT].path);
+			return SLURM_ERROR;
+		}
+	}
+	/*
 	 * Check available controllers in cgroup.controller, record them in our
 	 * bitmap and enable them if EnableControllers option is set.
 	 * We enable them manually just because we support CgroupIgnoreSystemd
-	 * option. Theorically when starting a unit with Delegate=yes, you will
+	 * option. Theoretically when starting a unit with Delegate=yes, you will
 	 * get all controllers available at your level.
 	 */
 	if (_setup_controllers() != SLURM_SUCCESS)
@@ -1175,6 +1707,20 @@ extern int init(void)
 		} else {
 			log_flag(CGROUP, "INVOCATION_ID env var found. Assuming slurmd has been started by systemd.");
 		}
+
+		/*
+		 * We need to unset any cpu and memory limits as we do not want
+		 * to inherit previous limits. We cannot reset them later
+		 * because _load_gres needs to see all the cpus. The CoreSpec
+		 * initialization will happen afterwards and set whatever
+		 * is needed.
+		 */
+		if (_unset_cpu_mem_limits(&int_cg[CG_LEVEL_ROOT]) !=
+		    SLURM_SUCCESS) {
+			error("Cannot reset %s cgroup limits.",
+			      int_cg[CG_LEVEL_ROOT].path);
+			return SLURM_ERROR;
+		}
 	}
 
 	if (running_in_slurmstepd()) {
@@ -1197,11 +1743,10 @@ extern int init(void)
 	 * we will need move ourselves out to a new job directory and then
 	 * create int_cg[CG_LEVEL_ROOT].path/job_x/step_x.
 	 */
-	debug("%s loaded", plugin_name);
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	/*
 	 * Clear up the namespace and cgroups memory. Don't rmdir anything since
@@ -1218,7 +1763,6 @@ extern int fini(void)
 	xfree(stepd_scope_path);
 
 	debug("unloading %s", plugin_name);
-	return SLURM_SUCCESS;
 }
 
 /*
@@ -1330,14 +1874,13 @@ extern int cgroup_p_step_create(cgroup_ctl_type_t ctl, stepd_step_rec_t *step)
 	xstrfmtcat(new_path, "/job_%u", step->step_id.job_id);
 	if (common_cgroup_create(&int_cg_ns, &int_cg[CG_LEVEL_JOB],
 				 new_path, 0, 0) != SLURM_SUCCESS) {
-		error("unable to create job %u cgroup", step->step_id.job_id);
+		error("unable to create %pI cgroup", &step->step_id);
 		rc = SLURM_ERROR;
 		goto endit;
 	}
 	if (common_cgroup_instantiate(&int_cg[CG_LEVEL_JOB]) != SLURM_SUCCESS) {
 		common_cgroup_destroy(&int_cg[CG_LEVEL_JOB]);
-		error("unable to instantiate job %u cgroup",
-		      step->step_id.job_id);
+		error("unable to instantiate %pI cgroup", &step->step_id);
 		rc = SLURM_ERROR;
 		goto endit;
 	}
@@ -1553,14 +2096,24 @@ extern int cgroup_p_step_destroy(cgroup_ctl_type_t ctl)
 	 */
 
 	/*
-	 * Move ourselves to the init root. This is the only cgroup level where
-	 * pids can be put and which is not a leaf.
+	 * Move ourselves to the CGROUP SYETEM level. This is the waiting area
+	 * for new Slurmstepd process which do not have job folders yet, or for
+	 * jobs that are ending execution. This directory also contains the
+	 * "stepd infinity" process to keep the scope alive.
+	 *
+	 * This level is a leaf.  We are not violating the no-internal-processes
+	 * constrain.
+	 *
+	 * Moving the process here instead of to the cgroup root
+	 * (typically /sys/fs/cgroup) will prevent problems when running into
+	 * containerized environments, where cgroupfs root might not be
+	 * writeable.
 	 */
 	memset(&init_root, 0, sizeof(init_root));
-	init_root.path = xstrdup(slurm_cgroup_conf.cgroup_mountpoint);
+	init_root.path = xstrdup(int_cg[CG_LEVEL_SYSTEM].path);
 	rc = common_cgroup_move_process(&init_root, getpid());
 	if (rc != SLURM_SUCCESS) {
-		error("Unable to move pid %d to init root cgroup %s", getpid(),
+		error("Unable to move pid %d to system cgroup %s", getpid(),
 		      init_root.path);
 		goto end;
 	}
@@ -1867,7 +2420,8 @@ extern int cgroup_p_constrain_apply(cgroup_ctl_type_t ctl, cgroup_level_t level,
 			 * last cgroup in the hierarchy.
 			 */
 			return load_ebpf_prog(program, cgroup_path,
-					      (level != CG_LEVEL_TASK));
+					      (level != CG_LEVEL_TASK),
+					      token_fd);
 		} else {
 			log_flag(CGROUP, "EBPF Not loading the program into %s because it is a noop",
 				 cgroup_path);
@@ -1882,10 +2436,60 @@ extern int cgroup_p_constrain_apply(cgroup_ctl_type_t ctl, cgroup_level_t level,
 	return SLURM_SUCCESS;
 }
 
+extern char *cgroup_p_get_scope_path(void)
+{
+	return stepd_scope_path;
+}
+
+static void _get_mem_recursive(xcgroup_t *cg, cgroup_limits_t *limits)
+{
+	char *mem_max = NULL, *tmp_str = NULL, file_path[PATH_MAX];
+	size_t mem_sz;
+
+	if (!xstrcmp(cg->path, "/"))
+		goto end;
+
+	/*
+	 * Break when there is no memory controller anymore.
+	 *
+	 * We check if the file exists before getting its value because at the
+	 * moment we do not have proper error propagation and common_get_param
+	 * will emit an error(), which in our case it would just be a
+	 * verification and not an error.
+	 */
+	snprintf(file_path, PATH_MAX, "%s/memory.max", cg->path);
+	if (access(file_path, F_OK)) {
+		log_flag(CGROUP, "Reached %s cgroup without memory controller",
+			 cg->path);
+		goto end;
+	}
+
+	if (common_cgroup_get_param(cg, "memory.max", &mem_max, &mem_sz) !=
+	    SLURM_SUCCESS)
+		goto end;
+
+	/* Check ancestor */
+	if (xstrstr(mem_max, "max")) {
+		tmp_str = xdirname(cg->path);
+		xfree(cg->path);
+		cg->path = tmp_str;
+		_get_mem_recursive(cg, limits);
+		if (limits->limit_in_bytes != NO_VAL64)
+			goto end;
+	} else {
+		/* found it! */
+		mem_max[mem_sz - 1] = '\0';
+		limits->limit_in_bytes = slurm_atoull(mem_max);
+	}
+end:
+	xfree(mem_max);
+}
+
 extern cgroup_limits_t *cgroup_p_constrain_get(cgroup_ctl_type_t ctl,
 					       cgroup_level_t level)
 {
 	cgroup_limits_t *limits;
+	xcgroup_t tmp_cg = { 0 };
 
 	/*
 	 * cgroup/v1 legacy compatibility: We have no such levels in cgroup/v2
@@ -1992,7 +2596,7 @@ extern cgroup_limits_t *cgroup_p_constrain_get(cgroup_ctl_type_t ctl,
 
 		/*
 		 * Replace the last \n by \0. We lose one byte but we don't care
-		 * since tipically this object will be freed soon and we still
+		 * since typically this object will be freed soon and we still
 		 * keep the correct array size.
 		 */
 		if (limits->cores_size > 0)
@@ -2002,8 +2606,10 @@ extern cgroup_limits_t *cgroup_p_constrain_get(cgroup_ctl_type_t ctl,
 			limits->allow_mems[(limits->mems_size)-1] = '\0';
 		break;
 	case CG_MEMORY:
-		/* Not implemented. */
-		goto fail;
+		tmp_cg.path = xstrdup(int_cg[level].path);
+		_get_mem_recursive(&tmp_cg, limits);
+		xfree(tmp_cg.path);
+		break;
 	case CG_DEVICES:
 		/* Not implemented. */
 		goto fail;
@@ -2019,9 +2625,20 @@ fail:
 	return NULL;
 }
 
-extern int cgroup_p_step_start_oom_mgr(void)
+extern int cgroup_p_step_start_oom_mgr(stepd_step_rec_t *step)
 {
-	/* Just return, no need to start anything. */
+	/* Only set the memory.oom.group if needed. */
+	if (step->oom_kill_step) {
+		if (!cgroup_p_has_feature(CG_MEMCG_OOMGROUP))
+			log_flag(CGROUP, "OOMKillStep was requested but memory.oom.group interface is not available.");
+		else {
+			if (common_cgroup_set_param(&int_cg[CG_LEVEL_STEP_USER],
+						    "memory.oom.group", "1")) {
+				error("Cannot set memory.oom.group");
+				return SLURM_ERROR;
+			}
+		}
+	}
 	return SLURM_SUCCESS;
 }
 
@@ -2110,7 +2727,7 @@ extern int cgroup_p_task_addto(cgroup_ctl_type_t ctl, stepd_step_rec_t *step,
 			xfree(task_cg_info);
 			return SLURM_ERROR;
 		}
-                /* Inititalize the bpf_program before appending to the list. */
+                /* Initialize the bpf_program before appending to the list. */
 		init_ebpf_prog(&task_cg_info->p);
 
 		/* Add the cgroup to the list now that it is initialized. */
@@ -2123,28 +2740,20 @@ extern int cgroup_p_task_addto(cgroup_ctl_type_t ctl, stepd_step_rec_t *step,
 		error("Unable to move pid %d to %s cg",
 		      pid, (task_cg_info->task_cg).path);
 
-	/*
-	 * If we did not play with task_special and task_special exists it is
-	 * possible that another plugin (proctrack) added a pid there and now
-	 * this pid has been moved to another normal task, leaving task_special
-	 * empty. In that case, try to remove task_special directory and purge
-	 * it from the tasks list.
-	 */
-	if (task_id != task_special_id)
-		list_delete_first(task_list,
-				  (ListFindF)_find_purge_task_special,
-				  &task_special_id);
-
 	return SLURM_SUCCESS;
 }
 
 extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t task_id)
 {
+	uint64_t active_file, inactive_file;
 	char *cpu_stat = NULL, *memory_stat = NULL, *memory_current = NULL;
+	char *memory_peak = NULL;
 	char *ptr;
 	size_t tmp_sz = 0;
 	cgroup_acct_t *stats = NULL;
 	task_cg_info_t *task_cg_info;
+	bool memory_peak_interface = false, no_file_cache = false;
+	static bool interfaces_checked = false;
 
 	if (!(task_cg_info = list_find_first(task_list, _find_task_cg_info,
 					     &task_id))) {
@@ -2155,6 +2764,23 @@ extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t task_id)
 			error("No task found with id %u, this should never happen",
 			      task_id);
 		return NULL;
+	}
+
+	if (xstrcasestr(slurm_conf.job_acct_gather_params, "no_file_cache"))
+		no_file_cache = true;
+
+	/*
+	 * Check optional interfaces existence and permissions. This check
+	 * will help to avoid querying unexistent cgroup interfaces every time,
+	 * as might happen in kernel versions that do not provide all of them
+	 */
+	if (!interfaces_checked) {
+		/*
+		 * Check for memory.peak support as RHEL8 and other OSes with
+		 * old kernels might not provide it.
+		 */
+		memory_peak_interface = cgroup_p_has_feature(CG_MEMCG_PEAK);
+		interfaces_checked = true;
 	}
 
 	if (common_cgroup_get_param(&task_cg_info->task_cg,
@@ -2190,6 +2816,19 @@ extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t task_id)
 				 task_id);
 	}
 
+	if (memory_peak_interface) {
+		if (common_cgroup_get_param(&task_cg_info->task_cg,
+					    "memory.peak",
+					    &memory_peak,
+					    &tmp_sz) != SLURM_SUCCESS) {
+			if (task_id == task_special_id)
+				log_flag(CGROUP, "Cannot read task_special memory.peak interface, does your OS support it?");
+			else
+				log_flag(CGROUP, "Cannot read task %d memory.peak interface, does your OS support it?",
+					 task_id);
+		}
+	}
+
 	/*
 	 * Initialize values. A NO_VAL64 will indicate the caller that something
 	 * happened here. Values that aren't set here are returned as 0.
@@ -2199,6 +2838,7 @@ extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t task_id)
 	stats->ssec = NO_VAL64;
 	stats->total_rss = NO_VAL64;
 	stats->total_pgmajfault = NO_VAL64;
+	stats->memory_peak = INFINITE64; /* As required in common_jag.c */
 
 	if (cpu_stat) {
 		ptr = xstrstr(cpu_stat, "user_usec");
@@ -2213,27 +2853,49 @@ extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t task_id)
 		xfree(cpu_stat);
 	}
 
-	/*
-	 * In cgroup/v1, total_rss was the hierarchical sum of # of bytes of
-	 * anonymous and swap cache memory (including transparent huge pages).
-	 *
-	 * In cgroup/v2 we use memory.current which includes all the
-	 * memory the app has touched. Using this value makes it consistent with
-	 * the OOM killer limit.
-	 */
-	if (memory_current) {
-		if (sscanf(memory_current, "%"PRIu64, &stats->total_rss) != 1)
-			error("Cannot parse memory.current file");
-		xfree(memory_current);
-	}
-
 	if (memory_stat) {
 		ptr = xstrstr(memory_stat, "pgmajfault");
 		if (ptr && (sscanf(ptr, "pgmajfault %"PRIu64,
 				   &stats->total_pgmajfault) != 1))
 			log_flag(CGROUP, "Cannot parse pgmajfault field in memory.stat file");
+
+		if (no_file_cache) {
+			ptr = xstrstr(memory_stat, "\nactive_file");
+			if (ptr && (sscanf(ptr, "\nactive_file %" PRIu64,
+					   &active_file) != 1))
+				log_flag(CGROUP, "Cannot parse active_file field in memory.stat file");
+
+			ptr = xstrstr(memory_stat, "\ninactive_file");
+			if (ptr && (sscanf(ptr, "\ninactive_file %" PRIu64,
+					   &inactive_file) != 1))
+				log_flag(CGROUP, "Cannot parse inactive_file field in memory.stat file");
+		}
+
 		xfree(memory_stat);
 	}
+
+	/* memory.current includes all the memory the app has touched. */
+	if (memory_current) {
+		if (sscanf(memory_current, "%"PRIu64, &stats->total_rss) != 1)
+			error("Cannot parse memory.current file");
+
+		if (no_file_cache) {
+			stats->total_rss -= active_file + inactive_file;
+		}
+
+		xfree(memory_current);
+	}
+
+	/*
+	 * memory.peak includes all memory, including filesystem-backed mem, so
+	 * do not provide it if user does not want it.
+	 */
+	if (memory_peak && !no_file_cache) {
+		if (sscanf(memory_peak, "%"PRIu64, &stats->memory_peak) != 1)
+			error("Cannot parse memory.peak file");
+	}
+
+	xfree(memory_peak);
 
 	return stats;
 }
@@ -2250,23 +2912,152 @@ extern long int cgroup_p_get_acct_units(void)
 
 extern bool cgroup_p_has_feature(cgroup_ctl_feature_t f)
 {
-	struct stat st;
-	int rc;
-	char *memsw_filepath = NULL;
+	char file_path[PATH_MAX];
 
-	/* Check if swap constrain capability is enabled in this system. */
 	switch (f) {
+	case CG_MEMCG_OOMGROUP:
+		if (!bit_test(int_cg_ns.avail_controllers, CG_MEMORY))
+			break;
+		if (snprintf(file_path, PATH_MAX, "%s/memory.oom.group",
+			     int_cg[CG_LEVEL_ROOT].path) >= PATH_MAX)
+			break;
+		if (!access(file_path, F_OK))
+			return true;
+		break;
+	case CG_MEMCG_PEAK:
+		if (!bit_test(int_cg_ns.avail_controllers, CG_MEMORY))
+			break;
+		if (snprintf(file_path, PATH_MAX, "%s/memory.peak",
+			     int_cg[CG_LEVEL_ROOT].path) >= PATH_MAX)
+			break;
+		if (!access(file_path, F_OK))
+			return true;
+		break;
 	case CG_MEMCG_SWAP:
 		if (!bit_test(int_cg_ns.avail_controllers, CG_MEMORY))
-			return false;
-		xstrfmtcat(memsw_filepath, "%s/memory.swap.max",
-			   int_cg[CG_LEVEL_ROOT].path);
-		rc = stat(memsw_filepath, &st);
-		xfree(memsw_filepath);
-		return (rc == 0);
+			break;
+		if (snprintf(file_path, PATH_MAX, "%s/memory.swap.max",
+			     int_cg[CG_LEVEL_ROOT].path) >= PATH_MAX)
+			break;
+		if (!access(file_path, F_OK))
+			return true;
+		break;
+	case CG_FALSE_ROOT:
+		/*
+		 * The cgroup.type file is only present on non-root cgroups.
+		 * This is done to ensure that we do not have a cgroup non-root
+		 * mounted into /sys/fs/cgroup.
+		 */
+		if (snprintf(file_path, PATH_MAX, "%s/cgroup.type",
+			     slurm_cgroup_conf.cgroup_mountpoint) >= PATH_MAX)
+			break;
+		if (!access(file_path, F_OK))
+			return true;
+		break;
+	case CG_KILL_BUTTON:
+		if (snprintf(file_path, PATH_MAX, "%s/cgroup.kill",
+			     int_cg[CG_LEVEL_ROOT].path) >= PATH_MAX)
+			break;
+		if (!access(file_path, F_OK))
+			return true;
+		break;
 	default:
 		break;
 	}
 
 	return false;
+}
+
+extern int cgroup_p_signal(int signal)
+{
+	if (signal != SIGKILL) {
+		error("cgroup/v2 cgroup.kill only supports SIGKILL");
+		return SLURM_ERROR;
+	}
+
+	if (common_cgroup_set_param(&int_cg[CG_LEVEL_STEP_USER],
+				    "cgroup.kill", "1")) {
+		error("Writing 1 to %s/cgroup.kill failed",
+		      int_cg[CG_LEVEL_STEP_USER].path);
+		return SLURM_ERROR;
+	}
+
+	log_flag(CGROUP, "Sent signal %d to %s", signal,
+		 int_cg[CG_LEVEL_STEP_USER].path);
+
+	return SLURM_SUCCESS;
+}
+
+extern char *cgroup_p_get_task_empty_event_path(uint32_t taskid,
+						bool *on_modify)
+{
+	task_cg_info_t *task_cg_info;
+
+	xassert(on_modify);
+
+	if (!(task_cg_info = list_find_first(task_list, _find_task_cg_info,
+					     &taskid))) {
+		return NULL;
+	}
+
+	/* We want to watch when cgroups.events is modified */
+	*on_modify = true;
+
+	return xstrdup_printf("%s/cgroup.events", task_cg_info->task_cg.path);
+}
+
+extern int cgroup_p_is_task_empty(uint32_t taskid)
+{
+	task_cg_info_t *task_cg_info;
+	xcgroup_t cg;
+
+	if (!(task_cg_info = list_find_first(task_list, _find_task_cg_info,
+					     &taskid))) {
+		return SLURM_ERROR;
+	}
+
+	cg = task_cg_info->task_cg;
+
+	return _is_cgroup_empty(&cg);
+}
+
+extern int cgroup_p_bpf_fsopen(void)
+{
+	return bpf_fsopen();
+}
+
+extern int cgroup_p_bpf_fsconfig(int fd)
+{
+	return bpf_fsconfig(fd);
+}
+
+extern int cgroup_p_bpf_create_token(int fd)
+{
+	int tok_fd;
+	/*
+	 * The token should only be generated once. If the static is already
+	 * set, something strange happened.
+	 */
+	if (token_fd != -1) {
+		error("The BPF token is already generated, this should not happen");
+		return token_fd;
+	}
+
+	tok_fd = bpf_create_token(fd);
+	if (tok_fd < 0) {
+		error("Error generating BPF token");
+		return SLURM_ERROR;
+	}
+
+	return tok_fd;
+}
+
+extern void cgroup_p_bpf_set_token(int fd)
+{
+	token_fd = fd;
+}
+
+extern int cgroup_p_bpf_get_token()
+{
+	return token_fd;
 }

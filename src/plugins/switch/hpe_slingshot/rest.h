@@ -68,14 +68,22 @@ typedef struct {
 	const char *auth_dir;
 	union {
 		struct {
-			const char *user_name;
-			const char *password;
+			char *user_name;
+			char *password;
 		} basic;
 		struct {
-			const char *auth_cache;
+			char *auth_cache;
 		} oauth;
 	} u;
 } slingshot_rest_authdata_t;
+
+typedef struct {
+	char *ca_path; /* path to FM certificate bundle */
+	char *cert_path; /* path to client public certificate */
+	bool enabled; /* true if mTLS is enabled */
+	char *key_path; /* path to client private key */
+	char *url; /* url for mTLS authentication to FM */
+} slingshot_rest_mtls_t;
 
 typedef struct {
 	CURL *handle;            /* CURL connection handle */
@@ -85,25 +93,20 @@ typedef struct {
 	const char *name;        /* Descriptive name for logging */
 	char *base_url;          /* The current site URL */
 	slingshot_rest_authdata_t auth; /* Authorization method/data */
+	slingshot_rest_mtls_t mtls; /* mTLS data */
 	unsigned short timeout;  /* Communication timeout */
 	unsigned short connect_timeout; /* Connection timeout */
 } slingshot_rest_conn_t;
 
-#define SLINGSHOT_AUTH_BASIC_STR  "BASIC" /* {jlope,fm}_auth token */
-#define SLINGSHOT_AUTH_OAUTH_STR  "OAUTH" /* {jlope,fm}_auth token */
+#define SLINGSHOT_AUTH_BASIC_STR  "BASIC" /* fm_auth token */
+#define SLINGSHOT_AUTH_OAUTH_STR  "OAUTH" /* fm_auth token */
 #define SLINGSHOT_AUTH_OAUTH_CLIENT_ID_FILE     "client-id"
 #define SLINGSHOT_AUTH_OAUTH_CLIENT_SECRET_FILE "client-secret"
 #define SLINGSHOT_AUTH_OAUTH_ENDPOINT_FILE      "endpoint"
-#define SLINGSHOT_JLOPE_AUTH_BASIC_USER "cxi" /* user name for BASIC auth */
-#define SLINGSHOT_JLOPE_AUTH_BASIC_DIR       "/etc/jackaloped"
-#define SLINGSHOT_JLOPE_AUTH_BASIC_PWD_FILE  "passwd"
-#define SLINGSHOT_JLOPE_AUTH_OAUTH_DIR       "/etc/wlm-client-auth"
 #define SLINGSHOT_FM_AUTH_BASIC_USER "cxi"   /* user name for BASIC auth */
 #define SLINGSHOT_FM_AUTH_BASIC_DIR          "/etc/fmsim"
 #define SLINGSHOT_FM_AUTH_BASIC_PWD_FILE     "passwd"
 #define SLINGSHOT_FM_AUTH_OAUTH_DIR          "/etc/wlm-client-auth"
-#define SLINGSHOT_JLOPE_TIMEOUT         10   /* jackaloped REST call timeout */
-#define SLINGSHOT_JLOPE_CONNECT_TIMEOUT 10   /* jackaloped REST connect " */
 #define SLINGSHOT_FM_TIMEOUT            10   /* fabric manager REST call tout */
 #define SLINGSHOT_FM_CONNECT_TIMEOUT    10   /* fabric manager REST connect " */
 #define SLINGSHOT_TOKEN_TIMEOUT         10   /* OAUTH token REST call timeout */
@@ -111,18 +114,16 @@ typedef struct {
 
 /* global functions */
 /* NOTE: all strings are copied to the conn struct */
-bool slingshot_rest_connection(slingshot_rest_conn_t *conn,
-			       const char *url,
+bool slingshot_rest_connection(slingshot_rest_conn_t *conn, const char *url,
 			       slingshot_rest_auth_t auth_type,
-			       const char *auth_dir,
-			       const char *basic_user,
-			       const char *basic_pwdfile,
-			       int timeout,
-			       int conn_timeout,
+			       const char *auth_dir, const char *basic_user,
+			       const char *basic_pwdfile, bool mtls_enabled,
+			       const char *mtls_ca_path,
+			       const char *mtls_cert_path,
+			       const char *mtls_key_path, const char *mtls_url,
+			       int timeout, int conn_timeout,
 			       const char *conn_name);
 void slingshot_rest_destroy_connection(slingshot_rest_conn_t *conn);
-void slingshot_rest_disconnect(slingshot_rest_conn_t *conn);
-bool slingshot_rest_connect(slingshot_rest_conn_t *conn);
 json_object *slingshot_rest_post(slingshot_rest_conn_t *conn,
 				 const char *urlsuffix, json_object *reqjson,
 				 long *status);

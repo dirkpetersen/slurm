@@ -49,18 +49,20 @@
 #include "src/common/slurm_protocol_api.h"
 #include "src/interfaces/cred.h"
 
+#define MAX_CPU_CNT 1024
+#define STEPD_OOM_ADJ -999
+
 extern int devnull;
 extern bool get_reg_resp;
 extern bool refresh_cached_features;
 extern pthread_mutex_t cached_features_mutex;
 
 typedef struct {
+	slurm_step_id_t step_id;
 	uint32_t derived_ec;
 	uint32_t exit_code;
 	char **gres_job_env;
 	uint32_t het_job_id;
-	uint32_t jobid;
-	uint32_t step_id;
 	char *node_aliases;
 	char *node_list;
 	char *partition;
@@ -111,7 +113,6 @@ typedef struct slurmd_config {
 	uint16_t     block_map_size;	/* size of block map               */
 	uint16_t     *block_map;	/* abstract->machine block map     */
 	uint16_t     *block_map_inv;	/* machine->abstract (inverse) map */
-	char         *hwloc_xml;	/* path of hwloc xml file if using */
 	int           nice;		/* command line nice value spec    */
 	char         *node_name;	/* node name                       */
 	char         *node_topo_addr;   /* node's topology address         */
@@ -121,6 +122,7 @@ typedef struct slurmd_config {
 	char         *instance_id;	/* cloud instance id		   */
 	char         *instance_type;	/* cloud instance type		   */
 	char         *logfile;		/* slurmd logfile, if any          */
+	char 	     *parameters;	/* additions to SlurmdParameters */
 	char         *pidfile;		/* slurmd pidfile, if any          */
 	char         *tmp_fs;		/* TmpFS                           */
 	uint32_t     syslog_debug;	/* send output to both logfile and
@@ -136,7 +138,6 @@ typedef struct slurmd_config {
 	time_t	      boot_time;	/* Use this as node boot time if set */
 	bool	      daemonize;	/* daemonize flag (-D)		   */
 	bool          setwd;		/* setwd flag (-s)		   */
-	bool          def_config;       /* We haven't read in the config yet */
 	bool	      cleanstart;	/* clean start requested (-c)      */
 	bool	      mlock_pages;	/* mlock() slurmd  */
 
@@ -171,8 +172,8 @@ int send_registration_msg(uint32_t status);
 /* Run the health check program if configured */
 int run_script_health_check(void);
 
-/* Handler for SIGTERM; can also be called to shutdown the slurmd. */
-void slurmd_shutdown(int signum);
+/* shutdown the slurmd daemon */
+extern void slurmd_shutdown(void);
 
 /* Handler for debug level update */
 extern void update_slurmd_logging(log_level_t log_lvl);

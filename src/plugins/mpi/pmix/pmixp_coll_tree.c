@@ -189,8 +189,7 @@ static void _reset_coll(pmixp_coll_t *coll)
 		PMIXP_ERROR("Bad collective state = %d", (int)tree->state);
 		/* collective is spoiled, reset state */
 		tree->state = PMIXP_COLL_TREE_SYNC;
-		slurm_kill_job_step(pmixp_info_jobid(),
-				    pmixp_info_stepid(), SIGKILL, 0);
+		slurm_kill_job_step(pmixp_info_step_id(), SIGKILL, 0);
 	}
 }
 
@@ -211,7 +210,7 @@ int pmixp_coll_tree_init(pmixp_coll_t *coll, hostlist_t **hl)
 			  &tree->prnt_peerid, &tree->chldrn_cnt, &depth,
 			  &max_depth);
 
-	/* We interested in amount of direct childs */
+	/* We interested in amount of direct children */
 	tree->contrib_children = 0;
 	tree->contrib_local = false;
 	tree->chldrn_ids = xmalloc(sizeof(int) * width);
@@ -224,7 +223,7 @@ int pmixp_coll_tree_init(pmixp_coll_t *coll, hostlist_t **hl)
 		/* if we are the root of the tree:
 		 * - we don't have a parent;
 		 * - we have large list of all_childrens (we don't want
-		 * ourselfs there)
+		 * ourselves there)
 		 */
 		tree->prnt_host = NULL;
 		tree->all_chldrn_hl = hostlist_copy(*hl);
@@ -262,7 +261,7 @@ int pmixp_coll_tree_init(pmixp_coll_t *coll, hostlist_t **hl)
 		tree->chldrn_str = NULL;
 	}
 
-	/* fixup children peer ids to te global ones */
+	/* fixup children peer ids to the global ones */
 	for(i=0; i<tree->chldrn_cnt; i++){
 		p = hostlist_nth(*hl, tree->chldrn_ids[i]);
 		tree->chldrn_ids[i] = pmixp_info_job_hostid(p);
@@ -507,7 +506,7 @@ static int _progress_collect(pmixp_coll_t *coll)
 		 * So, only root has to go through the full UPFWD
 		 * state and send the message back.
 		 * Other procs have to go through other route. The reason for
-		 * that is the fact that som of out children can receive bcast
+		 * that is the fact that some of out children can receive bcast
 		 * message early and initiate next collective. We need to handle
 		 * that properly.
 		 */
@@ -581,7 +580,7 @@ static int _progress_ufwd(pmixp_coll_t *coll)
 
 	xassert(PMIXP_COLL_TREE_UPFWD == tree->state);
 
-	/* for some reasons doesnt switch to downfwd */
+	/* for some reasons doesn't switch to downfwd */
 
 	switch (tree->ufwd_status) {
 	case PMIXP_COLL_TREE_SND_FAILED:
@@ -610,8 +609,7 @@ static int _progress_ufwd(pmixp_coll_t *coll)
 			    (int)tree->ufwd_status);
 		/* collective is spoiled, reset state */
 		tree->state = PMIXP_COLL_TREE_SYNC;
-		slurm_kill_job_step(pmixp_info_jobid(),
-				    pmixp_info_stepid(), SIGKILL, 0);
+		slurm_kill_job_step(pmixp_info_step_id(), SIGKILL, 0);
 		return false;
 	}
 
@@ -717,7 +715,7 @@ static int _progress_ufwd_sc(pmixp_coll_t *coll)
 
 	xassert(PMIXP_COLL_TREE_UPFWD_WSC == tree->state);
 
-	/* for some reasons doesnt switch to downfwd */
+	/* for some reasons doesn't switch to downfwd */
 	switch (tree->ufwd_status) {
 	case PMIXP_COLL_TREE_SND_FAILED:
 		/* something went wrong with upward send.
@@ -742,8 +740,7 @@ static int _progress_ufwd_sc(pmixp_coll_t *coll)
 			    (int)tree->ufwd_status);
 		/* collective is spoiled, reset state */
 		tree->state = PMIXP_COLL_TREE_SYNC;
-		slurm_kill_job_step(pmixp_info_jobid(),
-				    pmixp_info_stepid(), SIGKILL, 0);
+		slurm_kill_job_step(pmixp_info_step_id(), SIGKILL, 0);
 		return false;
 	}
 
@@ -807,7 +804,7 @@ static int _progress_dfwd(pmixp_coll_t *coll)
 	pmixp_coll_tree_t *tree = &coll->state.tree;
 	xassert(PMIXP_COLL_TREE_DOWNFWD == tree->state);
 
-	/* if all childrens + local callbacks was invoked */
+	/* if all children + local callbacks was invoked */
 	if (tree->dfwd_cb_wait == tree->dfwd_cb_cnt) {
 		tree->dfwd_status = PMIXP_COLL_TREE_SND_DONE;
 	}
@@ -836,8 +833,7 @@ static int _progress_dfwd(pmixp_coll_t *coll)
 			    (int)tree->dfwd_status);
 		/* collective is spoiled, reset state */
 		tree->state = PMIXP_COLL_TREE_SYNC;
-		slurm_kill_job_step(pmixp_info_jobid(),
-				    pmixp_info_stepid(), SIGKILL, 0);
+		slurm_kill_job_step(pmixp_info_step_id(), SIGKILL, 0);
 		return false;
 	}
 #ifdef PMIXP_COLL_DEBUG
@@ -944,8 +940,7 @@ int pmixp_coll_tree_local(pmixp_coll_t *coll, char *data, size_t size,
 			    coll, pmixp_coll_tree_state2str(tree->state));
 		/* collective is spoiled, reset state */
 		tree->state = PMIXP_COLL_TREE_SYNC;
-		slurm_kill_job_step(pmixp_info_jobid(),
-				    pmixp_info_stepid(), SIGKILL, 0);
+		slurm_kill_job_step(pmixp_info_step_id(), SIGKILL, 0);
 		ret = SLURM_ERROR;
 		goto exit;
 	}
@@ -1074,7 +1069,7 @@ int pmixp_coll_tree_child(pmixp_coll_t *coll, uint32_t peerid, uint32_t seq,
 	case PMIXP_COLL_TREE_DOWNFWD:
 #ifdef PMIXP_COLL_DEBUG
 		/* It looks like a retransmission attempt when remote side
-		 * identified transmission failure, but we actually successfuly
+		 * identified transmission failure, but we actually successfully
 		 * received the message */
 		PMIXP_DEBUG("%p: contrib for the next coll. nodeid=%u, child=%d seq=%u, coll->seq=%u, state=%s",
 			    coll, peerid, chld_id, seq, coll->seq,
@@ -1145,8 +1140,7 @@ error:
 	pmixp_coll_log(coll);
 	_reset_coll(coll);
 error2:
-	slurm_kill_job_step(pmixp_info_jobid(),
-			    pmixp_info_stepid(), SIGKILL, 0);
+	slurm_kill_job_step(pmixp_info_step_id(), SIGKILL, 0);
 	/* unlock the structure */
 	slurm_mutex_unlock(&coll->lock);
 
@@ -1173,7 +1167,7 @@ int pmixp_coll_tree_parent(pmixp_coll_t *coll, uint32_t peerid, uint32_t seq,
 
 	if (expected_peerid != peerid) {
 		char *nodename = pmixp_info_job_host(peerid);
-		/* protect ourselfs if we are running with no asserts */
+		/* protect ourselves if we are running with no asserts */
 		PMIXP_ERROR("%p: parent contrib from bad nodeid=%s:%u, expect=%d",
 			    coll, nodename, peerid, expected_peerid);
 		xfree(nodename);
@@ -1190,7 +1184,7 @@ int pmixp_coll_tree_parent(pmixp_coll_t *coll, uint32_t peerid, uint32_t seq,
 	case PMIXP_COLL_TREE_SYNC:
 	case PMIXP_COLL_TREE_COLLECT:
 		/* It looks like a retransmission attempt when remote side
-		 * identified transmission failure, but we actually successfuly
+		 * identified transmission failure, but we actually successfully
 		 * received the message */
 #ifdef PMIXP_COLL_DEBUG
 		PMIXP_DEBUG("%p: prev contrib nodeid=%u: seq=%u, cur_seq=%u, state=%s",
@@ -1212,7 +1206,7 @@ int pmixp_coll_tree_parent(pmixp_coll_t *coll, uint32_t peerid, uint32_t seq,
 		/* we are not actually ready to receive this contribution as
 		 * the upward portion of the collective wasn't received yet.
 		 * This should not happen as SAPI (Slurm API) is blocking and
-		 * we chould transit to PMIXP_COLL_UPFWD_WPC immediately */
+		 * we should transit to PMIXP_COLL_UPFWD_WPC immediately */
 		/* FATAL: should not happen in normal workflow */
 		char *nodename = pmixp_info_job_host(peerid);
 		PMIXP_ERROR("%p: unexpected from %s:%d: seq = %d, coll->seq = %d, state=%s",
@@ -1227,7 +1221,7 @@ int pmixp_coll_tree_parent(pmixp_coll_t *coll, uint32_t peerid, uint32_t seq,
 		break;
 	case PMIXP_COLL_TREE_DOWNFWD:
 		/* It looks like a retransmission attempt when remote side
-		 * identified transmission failure, but we actually successfuly
+		 * identified transmission failure, but we actually successfully
 		 * received the message */
 #ifdef PMIXP_COLL_DEBUG
 		PMIXP_DEBUG("%p: double contrib nodeid=%u seq=%u, cur_seq=%u, state=%s",
@@ -1294,8 +1288,7 @@ error:
 	pmixp_coll_log(coll);
 	_reset_coll(coll);
 error2:
-	slurm_kill_job_step(pmixp_info_jobid(),
-			    pmixp_info_stepid(), SIGKILL, 0);
+	slurm_kill_job_step(pmixp_info_step_id(), SIGKILL, 0);
 	slurm_mutex_unlock(&coll->lock);
 
 	return SLURM_ERROR;

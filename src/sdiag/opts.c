@@ -52,6 +52,7 @@
 #define OPT_LONG_JSON 0x102
 #define OPT_LONG_YAML 0x103
 #define OPT_LONG_AUTOCOMP 0x104
+#define OPT_LONG_NO_TRUNC 0x105
 
 static void  _help( void );
 static void  _usage( void );
@@ -81,6 +82,7 @@ extern void parse_command_line(int argc, char **argv)
 		{"sort-by-id",	no_argument,	0,	'i'},
 		{"cluster",     required_argument, 0,   'M'},
 		{"clusters",    required_argument, 0,   'M'},
+		{"no-trunc", 	no_argument, 	0, 	OPT_LONG_NO_TRUNC},
 		{"sort-by-time",no_argument,	0,	't'},
 		{"sort-by-time2",no_argument,	0,	'T'},
 		{"usage",	no_argument,	0,	OPT_LONG_USAGE},
@@ -93,6 +95,7 @@ extern void parse_command_line(int argc, char **argv)
 	/* default options */
 	params.mode = STAT_COMMAND_GET;
 	params.sort = SORT_COUNT;
+	params.no_trunc = false;
 
 	/* get defaults from environment */
 	_opt_env();
@@ -139,16 +142,15 @@ extern void parse_command_line(int argc, char **argv)
 			case OPT_LONG_JSON:
 				params.mimetype = MIME_TYPE_JSON;
 				params.data_parser = optarg;
-				if (serializer_g_init(MIME_TYPE_JSON_PLUGIN,
-						      NULL))
-					fatal("JSON plugin load failure");
+				serializer_required(MIME_TYPE_JSON);
+				break;
+			case OPT_LONG_NO_TRUNC:
+				params.no_trunc = true;
 				break;
 			case OPT_LONG_YAML:
 				params.mimetype = MIME_TYPE_YAML;
 				params.data_parser = optarg;
-				if (serializer_g_init(MIME_TYPE_YAML_PLUGIN,
-						      NULL))
-					fatal("YAML plugin load failure");
+				serializer_required(MIME_TYPE_YAML);
 				break;
 			case OPT_LONG_AUTOCOMP:
 				suggest_completion(long_options, optarg);
@@ -193,6 +195,7 @@ Usage: sdiag [OPTIONS]\n\
   -t, --sort-by-time  sort RPCs by total run time\n\
   -T, --sort-by-time2 sort RPCs by average run time\n\
   -V, --version       display current version number\n\
+  --no-trunc          do not truncate long lines\n\
   --json[=data_parser] Produce JSON output\n\
   --yaml[=data_parser] Produce YAML output\n\
 \nHelp options:\n\

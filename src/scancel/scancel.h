@@ -45,10 +45,11 @@
 
 typedef struct scancel_options {
 	char *account;		/* --account=n, -a		*/
+	char *admin_comment;
 	bool batch;		/* --batch, -b			*/
 	char *sibling;		/* --sibling=<sib_name>		*/
 	bool ctld;		/* --ctld			*/
-	List clusters;          /* --cluster=cluster_name -Mcluster-name */
+	list_t *clusters;	/* --cluster=cluster_name -Mcluster-name */
 	bool cron;		/* --cron */
 	bool full;		/* --full, -f			*/
 	bool hurry;		/* --hurry, -H			*/
@@ -92,4 +93,5 @@ extern int initialize_and_process_args(int argc, char **argv);
  */
 extern bool has_default_opt(void);
 extern bool has_job_steps(void);
+extern bool has_fed_jobs(void);
 #endif	/* _HAVE_SCANCEL_H */

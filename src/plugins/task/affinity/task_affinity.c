@@ -54,39 +54,12 @@
 
 #include "src/interfaces/task.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *      <application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "task" for task control) and <method> is a description
- * of how this plugin satisfies that application.  Slurm will only load
- * a task plugin if the plugin_type string has a prefix of "task/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-const char plugin_name[]        = "task affinity plugin";
-const char plugin_type[]        = "task/affinity";
-const uint32_t plugin_version   = SLURM_VERSION_NUMBER;
+/* Required Slurm plugin symbols: */
+const char plugin_name[] = "task affinity plugin";
+const char plugin_type[] = "task/affinity";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- *	are called.  Put global initialization here.
- */
-extern int init (void)
+extern int init(void)
 {
 	cpu_set_t cur_mask;
 	char mstr[CPU_SET_HEX_STR_SIZE];
@@ -98,14 +71,9 @@ extern int init (void)
 	return SLURM_SUCCESS;
 }
 
-/*
- * fini() is called when the plugin is removed. Clear any allocated
- *	storage here.
- */
-extern int fini (void)
+extern void fini(void)
 {
 	debug("%s unloaded", plugin_name);
-	return SLURM_SUCCESS;
 }
 
 /*
@@ -113,7 +81,7 @@ extern int fini (void)
  */
 extern int task_p_slurmd_batch_request (batch_job_launch_msg_t *req)
 {
-	info("task_p_slurmd_batch_request: %u", req->job_id);
+	info("%s: %pI", __func__, &req->step_id);
 	batch_bind(req);
 	return SLURM_SUCCESS;
 }
@@ -143,24 +111,6 @@ extern int task_p_slurmd_launch_request (launch_tasks_request_msg_t *req,
 	}
 
 	return rc;
-}
-
-/*
- * task_p_slurmd_suspend_job()
- */
-extern int task_p_slurmd_suspend_job (uint32_t job_id)
-{
-	debug("task_p_slurmd_suspend_job: %u", job_id);
-	return SLURM_SUCCESS;
-}
-
-/*
- * task_p_slurmd_resume_job()
- */
-extern int task_p_slurmd_resume_job (uint32_t job_id)
-{
-	debug("task_p_slurmd_resume_job: %u", job_id);
-	return SLURM_SUCCESS;
 }
 
 static void _calc_cpu_affinity(stepd_step_rec_t *step)
@@ -225,7 +175,6 @@ extern int task_p_pre_launch (stepd_step_rec_t *step)
 
 		cur_mask = numa_get_membind();
 		if ((step->mem_bind_type & MEM_BIND_NONE) ||
-		    (step->mem_bind_type == MEM_BIND_SORT) ||
 		    (step->mem_bind_type == MEM_BIND_VERBOSE)) {
 			/* Do nothing */
 		} else if (get_memset(&new_mask, step)) {

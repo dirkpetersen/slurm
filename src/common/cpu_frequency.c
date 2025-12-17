@@ -74,6 +74,7 @@
 
 static uint16_t cpu_freq_count = 0;
 static int set_batch_freq = -1;
+static int set_interactive_freq = -1;
 
 static struct cpu_freq_data {
 	uint8_t  avail_governors;
@@ -449,10 +450,18 @@ cpu_freq_cpuset_validate(stepd_step_rec_t *step)
 		else
 			set_batch_freq = 0;
 	}
+	if (set_interactive_freq == -1) {
+		if (xstrcasestr(slurm_conf.launch_params,
+				"interactive_step_set_cpu_freq"))
+			set_interactive_freq = 1;
+		else
+			set_interactive_freq = 0;
+	}
 
 	if (((step->step_id.step_id == SLURM_BATCH_SCRIPT) &&
 	     !set_batch_freq) ||
-	    (step->step_id.step_id == SLURM_INTERACTIVE_STEP) ||
+	    ((step->step_id.step_id == SLURM_INTERACTIVE_STEP) &&
+	     !set_interactive_freq) ||
 	    (step->step_id.step_id == SLURM_EXTERN_CONT))
 		return;
 
@@ -476,8 +485,8 @@ cpu_freq_cpuset_validate(stepd_step_rec_t *step)
 		 * slurm_verify_cpu_bind will set cpu_bind to NULL for manual
 		 * binding that doesn't require an argument
 		 */
-		if ((step->cpu_bind_type != CPU_BIND_NONE) &&
-		    (step->cpu_bind_type != CPU_BIND_LDRANK))
+		if (!((step->cpu_bind_type & CPU_BIND_NONE) ||
+		      (step->cpu_bind_type & CPU_BIND_LDRANK)))
 			error("cpu_freq_cpuset_validate: cpu_bind string is null");
 		return;
 	}
@@ -489,8 +498,8 @@ cpu_freq_cpuset_validate(stepd_step_rec_t *step)
 		return;
 	}
 
-	cpu_map     = (bitstr_t *) bit_alloc(cpu_freq_count);
-	cpus_to_set = (bitstr_t *) bit_alloc(cpu_freq_count);
+	cpu_map = bit_alloc(cpu_freq_count);
+	cpus_to_set = bit_alloc(cpu_freq_count);
 
 	do {
 		debug3("  cpu_str = %s", cpu_str);
@@ -552,10 +561,18 @@ cpu_freq_cgroup_validate(stepd_step_rec_t *step, char *step_alloc_cores)
 		else
 			set_batch_freq = 0;
 	}
+	if (set_interactive_freq == -1) {
+		if (xstrcasestr(slurm_conf.launch_params,
+				"interactive_step_set_cpu_freq"))
+			set_interactive_freq = 1;
+		else
+			set_interactive_freq = 0;
+	}
 
 	if (((step->step_id.step_id == SLURM_BATCH_SCRIPT) &&
 	     !set_batch_freq) ||
-	    (step->step_id.step_id == SLURM_INTERACTIVE_STEP) ||
+	    ((step->step_id.step_id == SLURM_INTERACTIVE_STEP) &&
+	     !set_interactive_freq) ||
 	    (step->step_id.step_id == SLURM_EXTERN_CONT))
 		return;
 

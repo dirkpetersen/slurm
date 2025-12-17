@@ -52,31 +52,7 @@
 #include "src/common/parse_time.h"
 #include "src/interfaces/select.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobacct" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobacct/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Job completion MYSQL plugin";
 const char plugin_type[] = "jobcomp/mysql";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -122,10 +98,6 @@ static int _mysql_jobcomp_check_tables()
 	return SLURM_SUCCESS;
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	static int first = 1;
@@ -142,13 +114,12 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	if (jobcomp_mysql_conn) {
 		destroy_mysql_conn(jobcomp_mysql_conn);
 		jobcomp_mysql_conn = NULL;
 	}
-	return SLURM_SUCCESS;
 }
 
 extern int jobcomp_p_set_location(void)
@@ -193,10 +164,11 @@ extern int jobcomp_p_set_location(void)
 	return rc;
 }
 
-extern int jobcomp_p_log_record(job_record_t *job_ptr)
+extern int jobcomp_p_record_job_end(job_record_t *job_ptr, uint32_t event)
 {
 	int rc = SLURM_SUCCESS;
 	char *usr_str = NULL, *grp_str = NULL, lim_str[32], *jname = NULL;
+	char *partition = NULL;
 	uint32_t job_state;
 	char *query = NULL, *on_dup = NULL;
 	uint32_t time_limit;
@@ -209,6 +181,8 @@ extern int jobcomp_p_log_record(job_record_t *job_ptr)
 
 	usr_str = user_from_job(job_ptr);
 	grp_str = group_from_job(job_ptr);
+	partition = job_ptr->part_ptr ? job_ptr->part_ptr->name :
+					job_ptr->partition;
 
 	if ((job_ptr->time_limit == NO_VAL) && job_ptr->part_ptr)
 		time_limit = job_ptr->part_ptr->max_time;
@@ -263,14 +237,14 @@ extern int jobcomp_p_log_record(job_record_t *job_ptr)
 		   "'%s', '%s', %ld, %ld, %u",
 		   job_ptr->job_id, job_ptr->user_id, usr_str,
 		   job_ptr->group_id, grp_str, jname,
-		   job_state, job_ptr->total_cpus, job_ptr->partition, lim_str,
+		   job_state, job_ptr->total_cpus, partition, lim_str,
 		   start_time, end_time, job_ptr->node_cnt);
 
 	xstrfmtcat(on_dup, "uid=%u, user_name='%s', gid=%u, group_name='%s', "
 		   "name='%s', state=%u, proc_cnt=%u, `partition`='%s', "
 		   "timelimit='%s', nodecnt=%u",
 		   job_ptr->user_id, usr_str, job_ptr->group_id, grp_str, jname,
-		   job_state, job_ptr->total_cpus, job_ptr->partition, lim_str,
+		   job_state, job_ptr->total_cpus, partition, lim_str,
 		   job_ptr->node_cnt);
 
 	if (job_ptr->nodes) {
@@ -300,12 +274,12 @@ extern int jobcomp_p_log_record(job_record_t *job_ptr)
 
 /*
  * get info from the storage
- * in/out job_list List of job_rec_t *
- * note List needs to be freed when called
+ * in/out job_list list of job_rec_t *
+ * note list needs to be freed when called
  */
-extern List jobcomp_p_get_jobs(slurmdb_job_cond_t *job_cond)
+extern list_t *jobcomp_p_get_jobs(slurmdb_job_cond_t *job_cond)
 {
-	List job_list = NULL;
+	list_t *job_list = NULL;
 
 	if (!jobcomp_mysql_conn || mysql_db_ping(jobcomp_mysql_conn) != 0) {
 		if (jobcomp_p_set_location())
@@ -315,4 +289,9 @@ extern List jobcomp_p_get_jobs(slurmdb_job_cond_t *job_cond)
 	job_list = mysql_jobcomp_process_get_jobs(job_cond);
 
 	return job_list;
+}
+
+extern int jobcomp_p_record_job_start(job_record_t *job_ptr, uint32_t event)
+{
+	return SLURM_SUCCESS;
 }

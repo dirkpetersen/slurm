@@ -24,7 +24,7 @@ configuration used.</p>
 
 <p>Several system configuration parameters may require modification to support a large number
 of open files and TCP connections with large bursts of messages. Changes can
-be made using the <b>/etc/rc.d/rc.local</b> or <b>/etc/sysctl.conf</b> 
+be made using the <b>/etc/rc.d/rc.local</b> or <b>/etc/sysctl.conf</b>
 script to preserve changes after reboot. In either case, you can write values
 directly into these files
 (e.g. <i>"echo 32832 &gt; /proc/sys/fs/file-max"</i>).</p>
@@ -192,6 +192,54 @@ in every case, but it may serve as a good starting point.</li>
 <li>sched_min_interval=2000000</li>
 </ul>
 </ul></li>
+<li><b>SlurmctldParameters</b>:
+Many slurmctld daemon parameters are available.
+<ul>
+<li>Increasing <b>conmgr_max_connections</b> will allow slurmctld to accept
+more connections at once to avoid connect() timeouts during times of high load
+but not necessarily read or write timeouts. The trade off is that slurmctld will
+use more memory as each connection reserves memory to buffer inbound and
+outbound data along with the connection state. <b>conmgr_max_connections</b>
+should at least be the number of hardware CPU threads available but less than
+<code>sysctl net.nf_conntrack_max</code> and
+<code>sysctl net.core.somaxconn</code>. Enabling
+<code>sysctl net.ipv4.tcp_syncookies=1</code> is also suggested to
+allow the kernel to better manage larger bursts of incoming sockets.
+When modifying this parameter, you should monitor for relative changes in
+<code>sdiag</code>'s output. The <i>ave_time</i> field section under <i>Remote
+Procedure Call statistics</i> should be given special attention as changes to
+that can have a dramatic impact on overall response times. Increasing
+<b>conmgr_max_connections</b> too much could cause an <i>Out of Memory</i>
+event which will cause slurmctld to crash, potentially losing jobs and
+accounting. Sites are advised to try changing <b>MessageTimeout</b> and
+<b>TCPTimeout</b> before changing the <b>conmgr_max_connections</b> parameter.
+</li>
+<li>
+The <b>conmgr_threads</b> option controls the size of the thread pool that is
+used to process communications. Threads are used as needed to handle I/O or to
+process incoming RPCs and generate replies. The trade off is that slurmctld will
+use more memory for each additional thread. Increasing thread counts will also
+cause increased kernel scheduler contention when there are more threads than
+available hardware CPUs, increasing the potential for thread starvation. While
+processing incoming RPC requests, slurmctld usually has to obtain one or
+more of the global slurmctld locks. Each thread attempting to obtain a lock can
+cause increased contention with the scheduler threads. Lock contention will
+result in the job scheduler running slower or with noticeable delays, and
+increase the average time per RPC.
+Sites wishing for more RPC throughput can increase <b>conmgr_threads</b> from
+the defaults, while sites wishing to prioritize scheduler threads can decrease
+the thread count. We recommend trying to modify <b>conmgr_max_connections</b>
+and the <b>SchedulerParameters</b> to get the performance you want, before
+attempting to change <b>conmgr_threads</b>.
+You should monitor for changes in <code>sdiag</code>'s job start statistics
+when changing this parameter. In most cases, sites should consider reducing
+<b>conmgr_threads</b> instead of adding more threads, as having too many
+threads can cause locking overhead and cause <code>slurmctld</code> to hang.
+Increasing <b>conmgr_threads</b> also uses more memory, potentially causing an
+<i>Out of Memory</i> event for <code>slurmctld</code>, which could result in
+lost jobs and accounting.
+</li>
+</ul>
 <li><b>SchedulerType</b>:
 If most jobs are short lived then use of the <i>sched/builtin</i> plugin is
 recommended. This manages a queue of jobs on a First-In-First-Out (FIFO) basis
@@ -235,20 +283,15 @@ appropriate for your environment.</li>
   requests to be accumulated and reduces the number of commit requests
   to the database.</p>
 
-<p>You might also consider setting the '<i>Purge*</i>' options in your
-  slurmdbd.conf to clear out old Data.  A Typical configuration would
-  look like this...</p>
-<ul>
-<li><b>PurgeEventAfter</b>=12months</li>
-<li><b>PurgeJobAfter</b>=12months</li>
-<li><b>PurgeResvAfter</b>=2months</li>
-<li><b>PurgeStepAfter</b>=2months</li>
-<li><b>PurgeSuspendAfter</b>=1month</li>
-<li><b>PurgeTXNAfter</b>=12months</li>
-<li><b>PurgeUsageAfter</b>=12months</li>
-
-</ul>
-
-<p style="text-align:center;">Last modified 6 December 2023</p>
+<p>High job throughput leads to the database growing much faster than in a
+  typical environment, potentially to a size that becomes difficult to manage
+  depending on the capabilities of the database server. Sites are strongly
+  encouraged to make a plan for data retention early on and to configure the
+  relevant <a href="accounting.html#slurmdbd-archive-purge">Purge options</a> to
+  keep the database files at a manageable size. Also consider the frequency of
+  these purges as explained in the linked  documentation. Alternately, sites may
+  prefer to skip the storage of steps or jobs entirely through the relevant
+  <a href="slurm.conf.html#OPT_AccountingStorageEnforce">AccountingStorageEnforce</a>
+  options (<b>nosteps</b> and <b>nojobs</b>).</p>
 
 <!--#include virtual="footer.txt"-->

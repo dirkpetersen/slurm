@@ -39,7 +39,6 @@
 
 #define _GNU_SOURCE
 #include <pthread.h>
-#include <sched.h>
 #include <ctype.h>
 
 #include "src/common/plugin.h"
@@ -57,8 +56,6 @@ typedef struct slurmd_task_ops {
 	int	(*slurmd_batch_request)	    (batch_job_launch_msg_t *req);
 	int	(*slurmd_launch_request)    (launch_tasks_request_msg_t *req,
 					     uint32_t node_id, char **err_msg);
-	int	(*slurmd_suspend_job)	    (uint32_t job_id);
-	int	(*slurmd_resume_job)	    (uint32_t job_id);
 
 	int	(*pre_setuid)		    (stepd_step_rec_t *step);
 	int	(*pre_launch_priv)	    (stepd_step_rec_t *step,
@@ -77,8 +74,6 @@ typedef struct slurmd_task_ops {
 static const char *syms[] = {
 	"task_p_slurmd_batch_request",
 	"task_p_slurmd_launch_request",
-	"task_p_slurmd_suspend_job",
-	"task_p_slurmd_resume_job",
 	"task_p_pre_setuid",
 	"task_p_pre_launch_priv",
 	"task_p_pre_launch",
@@ -97,7 +92,7 @@ static pthread_mutex_t		g_task_context_lock = PTHREAD_MUTEX_INITIALIZER;
  *
  * RET - slurm error code
  */
-extern int slurmd_task_init(void)
+extern int task_g_init(void)
 {
 	int retval = SLURM_SUCCESS;
 	char *plugin_type = "task";
@@ -143,7 +138,7 @@ extern int slurmd_task_init(void)
 	xfree(task_plugin_type);
 
 	if (retval != SLURM_SUCCESS)
-		slurmd_task_fini();
+		task_g_fini();
 
 	return retval;
 }
@@ -153,7 +148,7 @@ extern int slurmd_task_init(void)
  *
  * RET - slurm error code
  */
-extern int slurmd_task_fini(void)
+extern int task_g_fini(void)
 {
 	int i, rc = SLURM_SUCCESS, rc2;
 
@@ -228,62 +223,6 @@ extern int task_g_slurmd_launch_request(launch_tasks_request_msg_t *req,
 	slurm_mutex_lock( &g_task_context_lock );
 	for (i = 0; i < g_task_context_num; i++) {
 		rc = (*(ops[i].slurmd_launch_request)) (req, node_id, err_msg);
-		if (rc != SLURM_SUCCESS) {
-			debug("%s: %s: %s", __func__,
-			      g_task_context[i]->type, slurm_strerror(rc));
-			break;
-		}
-	}
-	slurm_mutex_unlock( &g_task_context_lock );
-
-	return (rc);
-}
-
-/*
- * Slurmd is suspending a job.
- *
- * RET - slurm error code
- */
-extern int task_g_slurmd_suspend_job(uint32_t job_id)
-{
-	int i, rc = SLURM_SUCCESS;
-
-	xassert(g_task_context_num >= 0);
-
-	if (!g_task_context_num)
-		return SLURM_SUCCESS;
-
-	slurm_mutex_lock( &g_task_context_lock );
-	for (i = 0; i < g_task_context_num; i++) {
-		rc = (*(ops[i].slurmd_suspend_job))(job_id);
-		if (rc != SLURM_SUCCESS) {
-			debug("%s: %s: %s", __func__,
-			      g_task_context[i]->type, slurm_strerror(rc));
-			break;
-		}
-	}
-	slurm_mutex_unlock( &g_task_context_lock );
-
-	return (rc);
-}
-
-/*
- * Slurmd is resuming a previously suspended job.
- *
- * RET - slurm error code
- */
-extern int task_g_slurmd_resume_job(uint32_t job_id)
-{
-	int i, rc = SLURM_SUCCESS;
-
-	xassert(g_task_context_num >= 0);
-
-	if (!g_task_context_num)
-		return SLURM_SUCCESS;
-
-	slurm_mutex_lock( &g_task_context_lock );
-	for (i = 0; i < g_task_context_num; i++) {
-		rc = (*(ops[i].slurmd_resume_job))(job_id);
 		if (rc != SLURM_SUCCESS) {
 			debug("%s: %s: %s", __func__,
 			      g_task_context[i]->type, slurm_strerror(rc));
@@ -527,85 +466,5 @@ extern void task_slurm_chkaffinity(cpu_set_t *mask, stepd_step_rec_t *step,
 			task_cpuset_to_str(mask, mstr),
 			action,
 			status);
-#endif
-}
-
-extern char *task_cpuset_to_str(const cpu_set_t *mask, char *str)
-{
-#if defined(__APPLE__)
-	fatal("%s: not supported on macOS", __func__);
-#else
-	int base;
-	char *ptr = str;
-	char *ret = NULL;
-	bool leading_zeros = true;
-
-	for (base = CPU_SETSIZE - 4; base >= 0; base -= 4) {
-		char val = 0;
-		if (CPU_ISSET(base, mask))
-			val |= 1;
-		if (CPU_ISSET(base + 1, mask))
-			val |= 2;
-		if (CPU_ISSET(base + 2, mask))
-			val |= 4;
-		if (CPU_ISSET(base + 3, mask))
-			val |= 8;
-		/* If it's a leading zero, ignore it */
-		if (leading_zeros && !val)
-			continue;
-		if (!ret && val)
-			ret = ptr;
-		*ptr++ = slurm_hex_to_char(val);
-		/* All zeros from here on out will be written */
-		leading_zeros = false;
-	}
-	/* If the bitmask is all 0s, add a single 0 */
-	if (leading_zeros)
-		*ptr++ = '0';
-	*ptr = '\0';
-	return ret ? ret : ptr - 1;
-#endif
-}
-
-extern int task_str_to_cpuset(cpu_set_t *mask, const char* str)
-{
-#if defined(__APPLE__)
-	fatal("%s: not supported on macOS", __func__);
-#else
-	int len = strlen(str);
-	const char *ptr = str + len - 1;
-	int base = 0;
-
-	/* skip 0x, it's all hex anyway */
-	if ((len > 1) && !memcmp(str, "0x", 2L)) {
-		str += 2;
-		len -= 2;
-	}
-
-	/* Check that hex chars plus NULL <= CPU_SET_HEX_STR_SIZE */
-	if ((len + 1) > CPU_SET_HEX_STR_SIZE) {
-		error("%s: Hex string is too large to convert to cpu_set_t (length %ld > %d)",
-		      __func__, (long int)len, CPU_SET_HEX_STR_SIZE - 1);
-		return -1;
-	}
-
-	CPU_ZERO(mask);
-	while (ptr >= str) {
-		char val = slurm_char_to_hex(*ptr);
-		if (val == (char) -1)
-			return -1;
-		if (val & 1)
-			CPU_SET(base, mask);
-		if (val & 2)
-			CPU_SET(base + 1, mask);
-		if (val & 4)
-			CPU_SET(base + 2, mask);
-		if (val & 8)
-			CPU_SET(base + 3, mask);
-		ptr--;
-		base += 4;
-	}
-
-	return 0;
 #endif
 }

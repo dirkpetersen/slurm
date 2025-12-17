@@ -86,16 +86,18 @@ extern void prep_prolog_slurmctld_callback(int rc, uint32_t job_id,
 
 	/* all async prologs have completed, continue on now */
 	if (job_ptr->prep_prolog_failed) {
+		job_record_t *target = job_ptr;
 		uint32_t jid = job_id;
 
 		job_ptr->prep_prolog_failed = false;
 
 		/* requeue het leader if het job */
 		if (job_ptr->het_job_id)
-			jid = job_ptr->het_job_id;
+			target = find_job_record(job_ptr->het_job_id);
 
-		if ((rc = job_requeue(0, jid, NULL, false, 0)) &&
-		    (rc != ESLURM_JOB_PENDING)) {
+		if (!target ||
+		    ((rc = job_requeue_internal(0, target, false, 0)) &&
+		     (rc != ESLURM_JOB_PENDING))) {
 			info("unable to requeue JobId=%u: %s", jid,
 			     slurm_strerror(rc));
 
@@ -170,9 +172,8 @@ extern void prep_epilog_slurmctld_callback(int rc, uint32_t job_id,
 	 * Clear the JOB_COMPLETING flag only if the node count is 0
 	 * meaning the slurmd epilogs have already completed.
 	 */
-	if ((job_ptr->node_cnt == 0) && IS_JOB_COMPLETING(job_ptr)) {
-		cleanup_completing(job_ptr);
-		batch_requeue_fini(job_ptr);
+	if (IS_JOB_COMPLETING(job_ptr)) {
+		cleanup_completing(job_ptr, true);
 	}
 
 	unlock_slurmctld(job_write_lock);

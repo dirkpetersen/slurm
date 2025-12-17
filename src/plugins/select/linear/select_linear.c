@@ -92,28 +92,20 @@
 #if defined (__APPLE__)
 extern slurm_conf_t slurm_conf __attribute__((weak_import));
 extern node_record_t **node_record_table_ptr __attribute__((weak_import));
-extern List part_list __attribute__((weak_import));
-extern List job_list __attribute__((weak_import));
+extern list_t *part_list __attribute__((weak_import));
+extern list_t *job_list __attribute__((weak_import));
 extern int node_record_count __attribute__((weak_import));
 extern time_t last_node_update __attribute__((weak_import));
 extern slurmctld_config_t slurmctld_config __attribute__((weak_import));
 #else
 slurm_conf_t slurm_conf;
 node_record_t **node_record_table_ptr;
-List part_list;
-List job_list;
+list_t *part_list;
+list_t *job_list;
 int node_record_count;
 time_t last_node_update;
 slurmctld_config_t slurmctld_config;
 #endif
-
-struct select_nodeinfo {
-	uint16_t magic;		/* magic number */
-	uint16_t alloc_cpus;
-	uint64_t alloc_memory;
-	char    *tres_alloc_fmt_str;	/* formatted str of allocated tres */
-	double   tres_alloc_weighted;	/* weighted number of tres allocated. */
-};
 
 static int  _add_job_to_nodes(struct cr_record *cr_ptr, job_record_t *job_ptr,
 			      char *pre_err, int suspended);
@@ -151,8 +143,8 @@ static int _rm_job_from_one_node(job_record_t *job_ptr, node_record_t *node_ptr,
 static int _run_now(job_record_t *job_ptr, bitstr_t *bitmap,
 		    uint32_t min_nodes, uint32_t max_nodes,
 		    int max_share, uint32_t req_nodes,
-		    List preemptee_candidates,
-		    List *preemptee_job_list);
+		    list_t *preemptee_candidates,
+		    list_t **preemptee_job_list);
 static int _sort_usable_nodes_dec(void *, void *);
 static bool _test_run_job(struct cr_record *cr_ptr, uint32_t job_id);
 static bool _test_tot_job(struct cr_record *cr_ptr, uint32_t job_id);
@@ -162,41 +154,16 @@ static int _test_only(job_record_t *job_ptr, bitstr_t *bitmap,
 static int _will_run_test(job_record_t *job_ptr, bitstr_t *bitmap,
 			  uint32_t min_nodes, uint32_t max_nodes,
 			  int max_share, uint32_t req_nodes,
-			  List preemptee_candidates,
-			  List *preemptee_job_list);
+			  list_t *preemptee_candidates,
+			  list_t **preemptee_job_list);
 
-extern select_nodeinfo_t *select_p_select_nodeinfo_alloc(void);
-extern int select_p_select_nodeinfo_free(select_nodeinfo_t *nodeinfo);
+/* Required Slurm plugin symbols: */
+const char plugin_name[] = "Linear node selection plugin";
+const char plugin_type[] = "select/linear";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "select" for Slurm node selection) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load select plugins if the plugin_type string has a
- * prefix of "select/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-const char plugin_name[]       	= "Linear node selection plugin";
-const char plugin_type[]       	= "select/linear";
-const uint32_t plugin_id	= SELECT_PLUGIN_LINEAR;
-const uint32_t plugin_version	= SLURM_VERSION_NUMBER;
+/* Required for select plugins: */
+const uint32_t plugin_id = SELECT_PLUGIN_LINEAR;
 
 static uint16_t cr_type;
 
@@ -424,7 +391,7 @@ static void _build_select_struct(job_record_t *job_ptr, bitstr_t *bitmap)
 	job_resources_t *job_resrcs_ptr;
 	node_record_t *node_ptr;
 
-	if (job_ptr->details->pn_min_memory  && (cr_type & CR_MEMORY)) {
+	if (job_ptr->details->pn_min_memory && (cr_type & SELECT_MEMORY)) {
 		if (job_ptr->details->pn_min_memory & MEM_PER_CPU)
 			job_memory_cpu = job_ptr->details->pn_min_memory &
 				(~MEM_PER_CPU);
@@ -442,7 +409,7 @@ static void _build_select_struct(job_record_t *job_ptr, bitstr_t *bitmap)
 	job_resrcs_ptr->ncpus = job_ptr->total_cpus;
 	job_resrcs_ptr->threads_per_core =
 		job_ptr->details->mc_ptr->threads_per_core;
-	job_resrcs_ptr->cr_type = cr_type | CR_LINEAR;
+	job_resrcs_ptr->cr_type = cr_type | SELECT_LINEAR;
 
 	if (build_job_resources(job_resrcs_ptr))
 		error("_build_select_struct: build_job_resources: %m");
@@ -454,6 +421,11 @@ static void _build_select_struct(job_record_t *job_ptr, bitstr_t *bitmap)
 		/* Use all CPUs for accounting */
 		job_resrcs_ptr->cpus[j] = node_cpus;
 		total_cpus += node_cpus;
+
+		/* Set the start lower if any nodes have a lower version */
+		if (job_ptr->start_protocol_ver > node_ptr->protocol_version)
+			job_ptr->start_protocol_ver =
+				node_ptr->protocol_version;
 
 		/*
 		 * Get the usable cpu count for cpu_array_value and memory
@@ -477,7 +449,7 @@ static void _build_select_struct(job_record_t *job_ptr, bitstr_t *bitmap)
 		} else if (job_memory_cpu) {
 			job_resrcs_ptr->memory_allocated[j] =
 				job_memory_cpu * node_cpus;
-		} else if (cr_type & CR_MEMORY) {
+		} else if (cr_type & SELECT_MEMORY) {
 			job_resrcs_ptr->memory_allocated[j] =
 				node_ptr->config_ptr->real_memory;
 			if (!min_mem ||
@@ -492,7 +464,7 @@ static void _build_select_struct(job_record_t *job_ptr, bitstr_t *bitmap)
 		}
 		j++;
 	}
-	if (cr_type & CR_MEMORY && !job_ptr->details->pn_min_memory)
+	if (cr_type & SELECT_MEMORY && !job_ptr->details->pn_min_memory)
 		job_ptr->details->pn_min_memory = min_mem;
 
 	if (job_resrcs_ptr->ncpus != total_cpus) {
@@ -517,15 +489,15 @@ static int _job_count_bitmap(struct cr_record *cr_ptr,
 	uint64_t alloc_mem = 0, job_mem = 0, avail_mem = 0;
 	uint32_t cpu_cnt, gres_cpus, gres_cores;
 	int core_start_bit, core_end_bit, cpus_per_core;
-	List gres_list;
+	list_t *gres_list;
 	bool use_total_gres = true;
 
 	xassert(cr_ptr);
 	xassert(cr_ptr->nodes);
 	if (mode != SELECT_MODE_TEST_ONLY) {
 		use_total_gres = false;
-		if (job_ptr->details->pn_min_memory  &&
-		    (cr_type & CR_MEMORY)) {
+		if (job_ptr->details->pn_min_memory &&
+		    (cr_type & SELECT_MEMORY)) {
 			if (job_ptr->details->pn_min_memory & MEM_PER_CPU) {
 				job_memory_cpu = job_ptr->details->pn_min_memory
 					& (~MEM_PER_CPU);
@@ -547,11 +519,10 @@ static int _job_count_bitmap(struct cr_record *cr_ptr,
 		core_start_bit = cr_get_coremap_offset(i);
 		core_end_bit   = cr_get_coremap_offset(i+1) - 1;
 		cpus_per_core  = cpu_cnt / (core_end_bit - core_start_bit + 1);
-		gres_cores = gres_job_test(job_ptr->gres_list_req,
-						  gres_list, use_total_gres,
-						  NULL, core_start_bit,
-						  core_end_bit, job_ptr->job_id,
-						  node_ptr->name, false);
+		gres_cores = gres_job_test(job_ptr->gres_list_req, gres_list,
+					   use_total_gres, core_start_bit,
+					   core_end_bit, job_ptr->job_id,
+					   node_ptr->name);
 		gres_cpus = gres_cores;
 		if (gres_cpus != NO_VAL) {
 			gres_cpus *= cpus_per_core;
@@ -571,7 +542,7 @@ static int _job_count_bitmap(struct cr_record *cr_ptr,
 		}
 
 		if (!job_memory_cpu && !job_memory_node &&
-		    (cr_type & CR_MEMORY))
+		    (cr_type & SELECT_MEMORY))
 			job_memory_node = node_ptr->config_ptr->real_memory;
 
 		if (job_memory_cpu || job_memory_node) {
@@ -741,7 +712,7 @@ static int _job_test(job_record_t *job_ptr, bitstr_t *bitmap,
 		} else if (consec_nodes[consec_index] == 0) {
 			consec_req[consec_index] = -1;
 			/* already picked up any required nodes */
-			/* re-use this record */
+			/* reuse this record */
 		} else {
 			consec_end[consec_index] = i - 1;
 			if (++consec_index >= consec_size) {
@@ -978,7 +949,7 @@ static int _rm_job_from_nodes(struct cr_record *cr_ptr, job_record_t *job_ptr,
 		old_job = true;
 
 	if (remove_all && job_ptr->details &&
-	    job_ptr->details->pn_min_memory && (cr_type & CR_MEMORY)) {
+	    job_ptr->details->pn_min_memory && (cr_type & SELECT_MEMORY)) {
 		if (job_ptr->details->pn_min_memory & MEM_PER_CPU) {
 			job_memory_cpu = job_ptr->details->pn_min_memory &
 				(~MEM_PER_CPU);
@@ -1006,7 +977,7 @@ static int _rm_job_from_nodes(struct cr_record *cr_ptr, job_record_t *job_ptr,
 			job_memory = job_memory_cpu * cpu_cnt;
 		else if (job_memory_node)
 			job_memory = job_memory_node;
-		else if (cr_type & CR_MEMORY)
+		else if (cr_type & SELECT_MEMORY)
 			job_memory = node_ptr->config_ptr->real_memory;
 
 		if (cr_ptr->nodes[i].alloc_memory >= job_memory)
@@ -1018,7 +989,7 @@ static int _rm_job_from_nodes(struct cr_record *cr_ptr, job_record_t *job_ptr,
 		}
 
 		if (remove_all) {
-			List node_gres_list;
+			list_t *node_gres_list;
 
 			if (cr_ptr->nodes[i].gres_list)
 				node_gres_list = cr_ptr->nodes[i].gres_list;
@@ -1357,7 +1328,7 @@ static int _rm_job_from_one_node(job_record_t *job_ptr, node_record_t *node_ptr,
 	uint64_t job_memory = 0, job_memory_cpu = 0, job_memory_node = 0;
 	int first_bit;
 	uint16_t cpu_cnt;
-	List node_gres_list;
+	list_t *node_gres_list;
 	bool old_job = false;
 
 	if (cr_ptr == NULL) {
@@ -1372,7 +1343,7 @@ static int _rm_job_from_one_node(job_record_t *job_ptr, node_record_t *node_ptr,
 	}
 
 	if (job_ptr->details &&
-	    job_ptr->details->pn_min_memory && (cr_type & CR_MEMORY)) {
+	    job_ptr->details->pn_min_memory && (cr_type & SELECT_MEMORY)) {
 		if (job_ptr->details->pn_min_memory & MEM_PER_CPU) {
 			job_memory_cpu = job_ptr->details->pn_min_memory &
 				(~MEM_PER_CPU);
@@ -1413,7 +1384,7 @@ static int _rm_job_from_one_node(job_record_t *job_ptr, node_record_t *node_ptr,
 		job_memory = job_memory_cpu * cpu_cnt;
 	else if (job_memory_node)
 		job_memory = job_memory_node;
-	else if (cr_type & CR_MEMORY)
+	else if (cr_type & SELECT_MEMORY)
 		job_memory = node_ptr->config_ptr->real_memory;
 
 	if (cr_ptr->nodes[node_inx].alloc_memory >= job_memory)
@@ -1453,7 +1424,7 @@ static int _add_job_to_nodes(struct cr_record *cr_ptr,
 	uint64_t job_memory_cpu = 0, job_memory_node = 0;
 	uint16_t cpu_cnt;
 	node_record_t *node_ptr;
-	List gres_list;
+	list_t *gres_list;
 	bool new_alloc = true;
 
 	if (cr_ptr == NULL) {
@@ -1462,7 +1433,7 @@ static int _add_job_to_nodes(struct cr_record *cr_ptr,
 	}
 
 	if (alloc_all && job_ptr->details &&
-	    job_ptr->details->pn_min_memory && (cr_type & CR_MEMORY)) {
+	    job_ptr->details->pn_min_memory && (cr_type & SELECT_MEMORY)) {
 		if (job_ptr->details->pn_min_memory & MEM_PER_CPU) {
 			job_memory_cpu = job_ptr->details->pn_min_memory &
 				(~MEM_PER_CPU);
@@ -1499,7 +1470,7 @@ static int _add_job_to_nodes(struct cr_record *cr_ptr,
 				cpu_cnt;
 		} else if (job_memory_node) {
 			cr_ptr->nodes[i].alloc_memory += job_memory_node;
-		} else if (cr_type & CR_MEMORY) {
+		} else if (cr_type & SELECT_MEMORY) {
 			cr_ptr->nodes[i].alloc_memory +=
 				node_ptr->config_ptr->real_memory;
 		}
@@ -1580,7 +1551,7 @@ static void _dump_node_cr(struct cr_record *cr_ptr)
 	int i;
 	struct part_cr_record *part_cr_ptr;
 	node_record_t *node_ptr;
-	List gres_list;
+	list_t *gres_list;
 
 	if ((cr_ptr == NULL) || (cr_ptr->nodes == NULL))
 		return;
@@ -1625,7 +1596,7 @@ static struct cr_record *_dup_cr(struct cr_record *cr_ptr)
 	struct cr_record *new_cr_ptr;
 	struct part_cr_record *part_cr_ptr, *new_part_cr_ptr;
 	node_record_t *node_ptr;
-	List gres_list;
+	list_t *gres_list;
 
 	if (cr_ptr == NULL)
 		return NULL;
@@ -1730,7 +1701,7 @@ static void _init_node_cr(void)
 		job_memory_cpu  = 0;
 		job_memory_node = 0;
 		if (job_ptr->details && job_ptr->details->pn_min_memory &&
-		    (cr_type & CR_MEMORY)) {
+		    (cr_type & SELECT_MEMORY)) {
 			if (job_ptr->details->pn_min_memory & MEM_PER_CPU) {
 				job_memory_cpu = job_ptr->details->
 					pn_min_memory &
@@ -1765,7 +1736,8 @@ static void _init_node_cr(void)
 			if (exclusive)
 				cr_ptr->nodes[i].exclusive_cnt++;
 			if (job_memory_cpu == 0) {
-				if (!job_memory_node && (cr_type & CR_MEMORY))
+				if (!job_memory_node &&
+				    (cr_type & SELECT_MEMORY))
 					job_memory_node = node_ptr->config_ptr->
 						real_memory;
 				cr_ptr->nodes[i].alloc_memory +=
@@ -1825,7 +1797,7 @@ static int _find_job (void *x, void *key)
 	return 0;
 }
 
-static bool _is_preemptable(job_record_t *job_ptr, List preemptee_candidates)
+static bool _is_preemptable(job_record_t *job_ptr, list_t *preemptee_candidates)
 {
 	if (!preemptee_candidates)
 		return false;
@@ -1882,8 +1854,8 @@ static int _sort_usable_nodes_dec(void *j1, void *j2)
 static int _run_now(job_record_t *job_ptr, bitstr_t *bitmap,
 		    uint32_t min_nodes, uint32_t max_nodes,
 		    int max_share, uint32_t req_nodes,
-		    List preemptee_candidates,
-		    List *preemptee_job_list)
+		    list_t *preemptee_candidates,
+		    list_t **preemptee_job_list)
 {
 
 	bitstr_t *orig_map;
@@ -2024,12 +1996,12 @@ top:	if ((rc != SLURM_SUCCESS) && preemptee_candidates &&
 static int _will_run_test(job_record_t *job_ptr, bitstr_t *bitmap,
 			  uint32_t min_nodes, uint32_t max_nodes,
 			  int max_share, uint32_t req_nodes,
-			  List preemptee_candidates,
-			  List *preemptee_job_list)
+			  list_t *preemptee_candidates,
+			  list_t **preemptee_job_list)
 {
 	struct cr_record *exp_cr;
 	job_record_t *tmp_job_ptr;
-	List cr_job_list;
+	list_t *cr_job_list;
 	list_itr_t *job_iterator, *preemptee_iterator;
 	bitstr_t *orig_map;
 	int i, max_run_jobs, rc = SLURM_ERROR;
@@ -2141,7 +2113,7 @@ static int _will_run_test(job_record_t *job_ptr, bitstr_t *bitmap,
 	if ((rc == SLURM_SUCCESS) && preemptee_job_list &&
 	    preemptee_candidates) {
 		/* Build list of preemptee jobs whose resources are
-		 * actually used. List returned even if not killed
+		 * actually used. list returned even if not killed
 		 * in selected plugin, but by Moab or something else. */
 		if (*preemptee_job_list == NULL) {
 			*preemptee_job_list = list_create(NULL);
@@ -2168,15 +2140,11 @@ static int  _cr_job_list_sort(void *x, void *y)
 	job_record_t *job1_ptr = *(job_record_t **) x;
 	job_record_t *job2_ptr = *(job_record_t **) y;
 
-	return slurm_sort_uint_list_asc(&job1_ptr->end_time,
+	return slurm_sort_time_list_asc(&job1_ptr->end_time,
 					&job2_ptr->end_time);
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
-extern int init ( void )
+extern int init(void)
 {
 	int rc = SLURM_SUCCESS;
 
@@ -2187,41 +2155,19 @@ extern int init ( void )
 	return rc;
 }
 
-extern int fini ( void )
+extern void fini(void)
 {
-	int rc = SLURM_SUCCESS;
-
 	cr_fini_global_core_data();
 	slurm_mutex_lock(&cr_mutex);
 	_free_cr(cr_ptr);
 	cr_ptr = NULL;
 	slurm_mutex_unlock(&cr_mutex);
-	return rc;
 }
 
 /*
  * The remainder of this file implements the standard Slurm
  * node selection API.
  */
-
-extern int select_p_state_save(char *dir_name)
-{
-	return SLURM_SUCCESS;
-}
-
-extern int select_p_state_restore(char *dir_name)
-{
-	return SLURM_SUCCESS;
-}
-
-/*
- * Note the initialization of job records, issued upon restart of
- * slurmctld and used to synchronize any job state.
- */
-extern int select_p_job_init(List job_list_arg)
-{
-	return SLURM_SUCCESS;
-}
 
 extern int select_p_node_init(void)
 {
@@ -2254,12 +2200,13 @@ extern int select_p_node_init(void)
  * IN mode - SELECT_MODE_RUN_NOW: try to schedule job now
  *           SELECT_MODE_TEST_ONLY: test if job can ever run
  *           SELECT_MODE_WILL_RUN: determine when and where job can run
- * IN preemptee_candidates - List of pointers to jobs which can be preempted.
+ * IN preemptee_candidates - list of pointers to jobs which can be preempted.
  * IN/OUT preemptee_job_list - Pointer to list of job pointers. These are the
  *		jobs to be preempted to initiate the pending job. Not set
  *		if mode=SELECT_MODE_TEST_ONLY or input pointer is NULL.
  * IN resv_exc_ptr - Various TRES which the job can NOT use.
- * RET zero on success, EINVAL otherwise
+ * IN will_run_ptr - Pointer to data specific to WILL_RUN mode
+ * RET SLURM_SUCCESS on success, rc otherwise
  * globals (passed via select_p_node_init):
  *	node_record_count - count of nodes configured
  *	node_record_table_ptr - pointer to global node table
@@ -2273,9 +2220,10 @@ extern int select_p_node_init(void)
 extern int select_p_job_test(job_record_t *job_ptr, bitstr_t *bitmap,
 			     uint32_t min_nodes, uint32_t max_nodes,
 			     uint32_t req_nodes, uint16_t mode,
-			     List preemptee_candidates,
-			     List *preemptee_job_list,
-			     resv_exc_t *resv_exc_ptr)
+			     list_t *preemptee_candidates,
+			     list_t **preemptee_job_list,
+			     resv_exc_t *resv_exc_ptr,
+			     will_run_data_t *will_run_ptr)
 {
 	int max_share = 0, rc = EINVAL, license_rc;
 
@@ -2491,103 +2439,7 @@ extern int select_p_job_resume(job_record_t *job_ptr, bool indf_susp)
 	return rc;
 }
 
-extern bitstr_t *select_p_step_pick_nodes(job_record_t *job_ptr,
-					  select_jobinfo_t *jobinfo,
-					  uint32_t node_count,
-					  bitstr_t **avail_nodes)
-{
-	return NULL;
-}
-
-extern int select_p_step_start(step_record_t *step_ptr)
-{
-	return SLURM_SUCCESS;
-}
-
-extern int select_p_step_finish(step_record_t *step_ptr, bool killing_step)
-{
-	return SLURM_SUCCESS;
-}
-
-extern int select_p_select_nodeinfo_pack(select_nodeinfo_t *nodeinfo,
-					 buf_t *buffer,
-					 uint16_t protocol_version)
-{
-	select_nodeinfo_t *nodeinfo_empty = NULL;
-
-	if (!nodeinfo) {
-		/*
-		 * We should never get here,
-		 * but avoid abort with bad data structures
-		 */
-		error("%s: nodeinfo is NULL", __func__);
-		nodeinfo_empty = xmalloc(sizeof(select_nodeinfo_t));
-		nodeinfo = nodeinfo_empty;
-	}
-
-	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		pack16(nodeinfo->alloc_cpus, buffer);
-		pack64(nodeinfo->alloc_memory, buffer);
-		packstr(nodeinfo->tres_alloc_fmt_str, buffer);
-		packdouble(nodeinfo->tres_alloc_weighted, buffer);
-	}
-	xfree(nodeinfo_empty);
-
-	return SLURM_SUCCESS;
-}
-
-extern int select_p_select_nodeinfo_unpack(select_nodeinfo_t **nodeinfo,
-					   buf_t *buffer,
-					   uint16_t protocol_version)
-{
-	uint32_t uint32_tmp;
-	select_nodeinfo_t *nodeinfo_ptr = NULL;
-
-	nodeinfo_ptr = select_p_select_nodeinfo_alloc();
-	*nodeinfo = nodeinfo_ptr;
-
-	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		safe_unpack16(&nodeinfo_ptr->alloc_cpus, buffer);
-		safe_unpack64(&nodeinfo_ptr->alloc_memory, buffer);
-		safe_unpackstr_xmalloc(&nodeinfo_ptr->tres_alloc_fmt_str,
-				       &uint32_tmp, buffer);
-		safe_unpackdouble(&nodeinfo_ptr->tres_alloc_weighted, buffer);
-	}
-
-	return SLURM_SUCCESS;
-
-unpack_error:
-	error("select_nodeinfo_unpack: error unpacking here");
-	select_p_select_nodeinfo_free(nodeinfo_ptr);
-	*nodeinfo = NULL;
-
-	return SLURM_ERROR;
-}
-
-extern select_nodeinfo_t *select_p_select_nodeinfo_alloc(void)
-{
-	select_nodeinfo_t *nodeinfo = xmalloc(sizeof(struct select_nodeinfo));
-
-	nodeinfo->magic = NODEINFO_MAGIC;
-
-	return nodeinfo;
-}
-
-extern int select_p_select_nodeinfo_free(select_nodeinfo_t *nodeinfo)
-{
-	if (nodeinfo) {
-		if (nodeinfo->magic != NODEINFO_MAGIC) {
-			error("select_p_select_nodeinfo_free: "
-			      "nodeinfo magic bad");
-			return EINVAL;
-		}
-		nodeinfo->magic = 0;
-		xfree(nodeinfo->tres_alloc_fmt_str);
-		xfree(nodeinfo);
-	}
-	return SLURM_SUCCESS;
-}
-
+/* Requires node READ_LOCK and select_node WRITE_LOCK */
 extern int select_p_select_nodeinfo_set_all(void)
 {
 	node_record_t *node_ptr = NULL;
@@ -2605,40 +2457,24 @@ extern int select_p_select_nodeinfo_set_all(void)
 	last_set_all = last_node_update;
 
 	for (n = 0; (node_ptr = next_node(&n)); n++) {
-		select_nodeinfo_t *nodeinfo = NULL;
-		/* We have to use the '_g_' here to make sure we get the
-		 * correct data to work on.  i.e. cray calls this plugin
-		 * from within select/cray which has it's own struct. */
-		select_g_select_nodeinfo_get(node_ptr->select_nodeinfo,
-					     SELECT_NODEDATA_PTR, 0,
-					     (void *)&nodeinfo);
-		if (!nodeinfo) {
-			error("no nodeinfo returned from structure");
-			continue;
-		}
+		node_select_stats_t *node_stats = node_select_stats_array[n];
 
-		xfree(nodeinfo->tres_alloc_fmt_str);
+		xfree(node_stats->alloc_tres_fmt_str);
 		if (IS_NODE_COMPLETING(node_ptr) || IS_NODE_ALLOCATED(node_ptr)) {
-			nodeinfo->alloc_cpus = node_ptr->config_ptr->cpus;
+			node_stats->alloc_cpus = node_ptr->config_ptr->cpus;
 
-			nodeinfo->tres_alloc_fmt_str =
+			node_stats->alloc_tres_fmt_str =
 				assoc_mgr_make_tres_str_from_array(
-						node_ptr->tres_cnt,
-						TRES_STR_CONVERT_UNITS, false);
-			nodeinfo->tres_alloc_weighted =
-				assoc_mgr_tres_weighted(
 					node_ptr->tres_cnt,
-					node_ptr->config_ptr->tres_weights,
-					slurm_conf.priority_flags, false);
+					TRES_STR_CONVERT_UNITS, false);
 		} else {
-			nodeinfo->alloc_cpus = 0;
-			nodeinfo->tres_alloc_weighted = 0.0;
+			node_stats->alloc_cpus = 0;
 		}
 		if (cr_ptr && cr_ptr->nodes) {
-			nodeinfo->alloc_memory =
+			node_stats->alloc_memory =
 				cr_ptr->nodes[node_ptr->index].alloc_memory;
 		} else {
-			nodeinfo->alloc_memory = 0;
+			node_stats->alloc_memory = 0;
 		}
 	}
 
@@ -2654,148 +2490,6 @@ extern int select_p_select_nodeinfo_set(job_record_t *job_ptr)
 		_init_node_cr();
 	slurm_mutex_unlock(&cr_mutex);
 
-	return SLURM_SUCCESS;
-}
-
-extern int select_p_select_nodeinfo_get(select_nodeinfo_t *nodeinfo,
-					enum select_nodedata_type dinfo,
-					enum node_states state,
-					void *data)
-{
-	int rc = SLURM_SUCCESS;
-	uint16_t *uint16 = (uint16_t *) data;
-	uint64_t *uint64 = (uint64_t *) data;
-	char **tmp_char = (char **) data;
-	double *tmp_double = (double *) data;
-	select_nodeinfo_t **select_nodeinfo = (select_nodeinfo_t **) data;
-
-	if (nodeinfo == NULL) {
-		error("get_nodeinfo: nodeinfo not set");
-		return SLURM_ERROR;
-	}
-
-	if (nodeinfo->magic != NODEINFO_MAGIC) {
-		error("get_nodeinfo: nodeinfo magic bad");
-		return SLURM_ERROR;
-	}
-
-	switch (dinfo) {
-	case SELECT_NODEDATA_SUBCNT:
-		if (state == NODE_STATE_ALLOCATED)
-			*uint16 = nodeinfo->alloc_cpus;
-		else
-			*uint16 = 0;
-		break;
-	case SELECT_NODEDATA_PTR:
-		*select_nodeinfo = nodeinfo;
-		break;
-	case SELECT_NODEDATA_MEM_ALLOC:
-		*uint64 = nodeinfo->alloc_memory;
-		break;
-	case SELECT_NODEDATA_TRES_ALLOC_FMT_STR:
-		*tmp_char = xstrdup(nodeinfo->tres_alloc_fmt_str);
-		break;
-	case SELECT_NODEDATA_TRES_ALLOC_WEIGHTED:
-		*tmp_double = nodeinfo->tres_alloc_weighted;
-		break;
-	default:
-		error("Unsupported option %d for get_nodeinfo.", dinfo);
-		rc = SLURM_ERROR;
-		break;
-	}
-	return rc;
-}
-
-/*
- * allocate storage for a select job credential
- * RET        - storage for a select job credential
- * NOTE: storage must be freed using select_p_select_jobinfo_free
- */
-extern select_jobinfo_t *select_p_select_jobinfo_alloc(void)
-{
-	return NULL;
-}
-
-/*
- * fill in a previously allocated select job credential
- * IN/OUT jobinfo  - updated select job credential
- * IN data_type - type of data to enter into job credential
- * IN data - the data to enter into job credential
- */
-extern int select_p_select_jobinfo_set(select_jobinfo_t *jobinfo,
-				       enum select_jobdata_type data_type,
-				       void *data)
-{
-	return SLURM_SUCCESS;
-}
-
-/*
- * get data from a select job credential
- * IN jobinfo  - updated select job credential
- * IN data_type - type of data to enter into job credential
- * OUT data - the data to get from job credential, caller must xfree
- */
-extern int select_p_select_jobinfo_get (select_jobinfo_t *jobinfo,
-					enum select_jobdata_type data_type,
-					void *data)
-{
-	return SLURM_ERROR;
-}
-
-/*
- * copy a select job credential
- * IN jobinfo - the select job credential to be copied
- * RET        - the copy or NULL on failure
- * NOTE: returned value must be freed using select_p_select_jobinfo_free
- */
-extern select_jobinfo_t *select_p_select_jobinfo_copy(
-	select_jobinfo_t *jobinfo)
-{
-	return NULL;
-}
-
-/*
- * free storage previously allocated for a select job credential
- * IN jobinfo  - the select job credential to be freed
- * RET         - slurm error code
- */
-extern int select_p_select_jobinfo_free  (select_jobinfo_t *jobinfo)
-{
-	return SLURM_SUCCESS;
-}
-
-/*
- * pack a select job credential into a buffer in machine independent form
- * IN jobinfo  - the select job credential to be saved
- * OUT buffer  - buffer with select credential appended
- * IN protocol_version - slurm protocol version of client
- * RET         - slurm error code
- */
-extern int select_p_select_jobinfo_pack(select_jobinfo_t *jobinfo,
-					buf_t *buffer,
-					uint16_t protocol_version)
-{
-	return SLURM_SUCCESS;
-}
-
-/*
- * unpack a select job credential from a buffer
- * OUT jobinfo - the select job credential read
- * IN  buffer  - buffer with select credential read from current pointer loc
- * IN protocol_version - slurm protocol version of client
- * RET         - slurm error code
- * NOTE: returned value must be freed using select_p_select_jobinfo_free
- */
-extern int select_p_select_jobinfo_unpack(select_jobinfo_t **jobinfo,
-					  buf_t *buffer,
-					  uint16_t protocol_version)
-{
-	return SLURM_SUCCESS;
-}
-
-extern int select_p_get_info_from_plugin(enum select_plugindata_info dinfo,
-					 job_record_t *job_ptr, void *data)
-{
 	return SLURM_SUCCESS;
 }
 

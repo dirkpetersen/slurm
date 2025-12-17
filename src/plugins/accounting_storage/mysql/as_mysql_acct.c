@@ -110,17 +110,17 @@ static int _foreach_flag_coord_user(void *x, void *arg)
 		flag_coord_acct->acct = NULL;
 	}
 
-	if (assoc_ptr->usage->children_list)
-		rc = list_for_each(assoc_ptr->usage->children_list,
-				   _foreach_flag_coord_user,
-				   flag_coord_acct);
+	/*
+	 * Do not evaluate the assoc_ptr->usage->children_list here, it means we
+	 * would be in a sub-account from the account that has the flag. So any
+	 * users further down the hierarchy shouldn't be part of this flag.
+	 */
 
 	return rc;
 }
 
 static int _foreach_flag_coord_acct(void *x, void *arg)
 {
-	int rc = 1;
 	flag_coord_acct_t *flag_coord_acct = arg;
 	slurmdb_assoc_rec_t *assoc_ptr = NULL;
 	slurmdb_assoc_rec_t assoc_req = {
@@ -130,11 +130,17 @@ static int _foreach_flag_coord_acct(void *x, void *arg)
 	};
 
 	if (assoc_mgr_fill_in_assoc(flag_coord_acct->mysql_conn,
-				     &assoc_req,
-				     ACCOUNTING_ENFORCE_ASSOCS,
-				     &assoc_ptr,
-				     true) != SLURM_SUCCESS)
-		return -1;
+				    &assoc_req,
+				    ACCOUNTING_ENFORCE_ASSOCS,
+				    &assoc_ptr,
+				    true) != SLURM_SUCCESS) {
+		/*
+		 * Return 0 since the account requested might not exist on
+		 * every cluster in the system.
+		 */
+		return 0;
+	}
+
 	/* Only change if needed */
 	if (((assoc_ptr->flags & ASSOC_FLAG_USER_COORD) &&
 	     (flag_coord_acct->flags & ASSOC_FLAG_USER_COORD_NO)) ||
@@ -174,26 +180,23 @@ static int _foreach_flag_coord_acct(void *x, void *arg)
 		}
 
 		if (assoc_ptr->usage->children_list)
-			rc = list_for_each(assoc_ptr->usage->children_list,
-					   _foreach_flag_coord_user,
-					   flag_coord_acct);
+			(void) list_for_each(assoc_ptr->usage->children_list,
+					     _foreach_flag_coord_user,
+					     flag_coord_acct);
 	}
 
-	return rc;
+	return 0;
 }
 
 static int _foreach_flag_coord_cluster(void *x, void *arg)
 {
-	int rc;
 	flag_coord_acct_t *flag_coord_acct = arg;
 
 	flag_coord_acct->cluster_name = x;
 
-	rc = list_for_each_ro(flag_coord_acct->acct_list,
-			      _foreach_flag_coord_acct,
-			      flag_coord_acct);
-	if (!rc)
-		return rc;
+	(void) list_for_each_ro(flag_coord_acct->acct_list,
+				_foreach_flag_coord_acct,
+				flag_coord_acct);
 
 	if (flag_coord_acct->query) {
 		xstrcatat(flag_coord_acct->query,
@@ -203,17 +206,18 @@ static int _foreach_flag_coord_cluster(void *x, void *arg)
 		DB_DEBUG(DB_ASSOC, flag_coord_acct->mysql_conn->conn,
 			 "query\n%s",
 			 flag_coord_acct->query);
-		if ((rc = mysql_db_query(flag_coord_acct->mysql_conn,
-					 flag_coord_acct->query)) !=
-		    SLURM_SUCCESS) {
+		if (mysql_db_query(flag_coord_acct->mysql_conn,
+				   flag_coord_acct->query) != SLURM_SUCCESS)
 			error("Couldn't update flags");
-			rc = 0;
-		}
 
 		xfree(flag_coord_acct->query);
 	}
 
-	return rc;
+	/*
+	 * Return 0 since the accounts requested might not exist on
+	 * every cluster in the system.
+	 */
+	return 0;
 }
 
 static void _handle_flag_coord(flag_coord_acct_t *flag_coord_acct)
@@ -255,7 +259,7 @@ static void _setup_acct_cond_limits(slurmdb_account_cond_t *acct_cond,
 			set = 1;
 		}
 		list_iterator_destroy(itr);
-		xstrcat(*extra, ")");
+		xstrcatat(*extra, at, ")");
 	}
 
 	if (acct_cond->description_list
@@ -276,10 +280,10 @@ static void _setup_acct_cond_limits(slurmdb_account_cond_t *acct_cond,
 	if (acct_cond->flags != SLURMDB_ACCT_FLAG_NONE) {
 		if (acct_cond->flags & SLURMDB_ACCT_FLAG_USER_COORD_NO) {
 			xstrfmtcatat(*extra, at, " && !(flags & %u)",
-				   SLURMDB_ACCT_FLAG_USER_COORD);
+				     SLURMDB_ACCT_FLAG_USER_COORD);
 		} else if (acct_cond->flags & SLURMDB_ACCT_FLAG_USER_COORD) {
 			xstrfmtcatat(*extra, at, " && (flags & %u)",
-				   SLURMDB_ACCT_FLAG_USER_COORD);
+				     SLURMDB_ACCT_FLAG_USER_COORD);
 		}
 	}
 
@@ -390,7 +394,7 @@ static int _foreach_add_acct(void *x, void *arg)
 }
 
 extern int as_mysql_add_accts(mysql_conn_t *mysql_conn, uint32_t uid,
-			      List acct_list)
+			      list_t *acct_list)
 {
 	list_itr_t *itr = NULL;
 	int rc = SLURM_SUCCESS;
@@ -401,7 +405,7 @@ extern int as_mysql_add_accts(mysql_conn_t *mysql_conn, uint32_t uid,
 	char *extra = NULL, *tmp_extra = NULL;
 
 	int affect_rows = 0;
-	List assoc_list;
+	list_t *assoc_list;
 
 	if (check_connection(mysql_conn) != SLURM_SUCCESS)
 		return ESLURM_DB_CONNECTION;
@@ -539,6 +543,8 @@ extern int as_mysql_add_accts(mysql_conn_t *mysql_conn, uint32_t uid,
 	}
 	FREE_NULL_LIST(assoc_list);
 
+	as_mysql_user_create_user_coords_list(mysql_conn);
+
 	return rc;
 }
 
@@ -589,7 +595,7 @@ extern char *as_mysql_add_accts_cond(mysql_conn_t *mysql_conn, uint32_t uid,
 		 */
 	}
 
-	/* Transfer over relavant flags from the account to the association. */
+	/* Transfer over relevant flags from the account to the association. */
 	if (acct->flags & SLURMDB_ACCT_FLAG_USER_COORD)
 		add_assoc->assoc.flags |= ASSOC_FLAG_USER_COORD;
 
@@ -677,15 +683,17 @@ end_it:
 		return NULL;
 	}
 
+	as_mysql_user_create_user_coords_list(mysql_conn);
+
 	errno = SLURM_SUCCESS;
 	return add_acct_cond.ret_str;
 }
 
-extern List as_mysql_modify_accts(mysql_conn_t *mysql_conn, uint32_t uid,
-				  slurmdb_account_cond_t *acct_cond,
-				  slurmdb_account_rec_t *acct)
+extern list_t *as_mysql_modify_accts(mysql_conn_t *mysql_conn, uint32_t uid,
+				     slurmdb_account_cond_t *acct_cond,
+				     slurmdb_account_rec_t *acct)
 {
-	List ret_list = NULL;
+	list_t *ret_list = NULL;
 	int rc = SLURM_SUCCESS;
 	char *object = NULL, *at = NULL;
 	char *vals = NULL, *extra = NULL, *query = NULL, *name_char = NULL;
@@ -790,6 +798,7 @@ extern List as_mysql_modify_accts(mysql_conn_t *mysql_conn, uint32_t uid,
 			.flags = assoc_flags,
 			.mysql_conn = mysql_conn,
 		};
+		as_mysql_user_create_user_coords_list(mysql_conn);
 
 		/* Update associations based on account flags */
 		_handle_flag_coord(&flag_coord_acct);
@@ -798,24 +807,28 @@ extern List as_mysql_modify_accts(mysql_conn_t *mysql_conn, uint32_t uid,
 	return ret_list;
 }
 
-extern List as_mysql_remove_accts(mysql_conn_t *mysql_conn, uint32_t uid,
-				  slurmdb_account_cond_t *acct_cond)
+extern list_t *as_mysql_remove_accts(mysql_conn_t *mysql_conn, uint32_t uid,
+				     slurmdb_account_cond_t *acct_cond)
 {
-	list_itr_t *itr = NULL;
-	List ret_list = NULL;
-	List coord_list = NULL;
-	List cluster_list_tmp = NULL;
+	list_t *ret_list = NULL;
+	list_t *coord_list = NULL;
 	int rc = SLURM_SUCCESS;
-	char *object = NULL, *at = NULL;
+	char *at = NULL;
 	char *extra = NULL, *query = NULL,
 		*name_char = NULL, *name_char_pos = NULL,
 		*assoc_char = NULL, *assoc_char_pos = NULL;
 	time_t now = time(NULL);
-	char *user_name = NULL;
 	MYSQL_RES *result = NULL;
 	MYSQL_ROW row;
-	bool jobs_running = 0;
-	bool default_account = 0;
+
+	remove_common_args_t args = {
+		.default_account = false,
+		.jobs_running = false,
+		.mysql_conn = mysql_conn,
+		.now = now,
+		.table = acct_table,
+		.type = DBD_REMOVE_ACCOUNTS,
+	};
 
 	if (!acct_cond) {
 		error("we need something to change");
@@ -881,24 +894,20 @@ extern List as_mysql_remove_accts(mysql_conn_t *mysql_conn, uint32_t uid,
 		mysql_conn, uid, ret_list, NULL);
 	FREE_NULL_LIST(coord_list);
 
-	user_name = uid_to_string((uid_t) uid);
+	args.assoc_char = assoc_char;
+	args.name_char = name_char;
+	args.ret_list = ret_list;
+	args.user_name = uid_to_string((uid_t) uid);
 
 	slurm_rwlock_rdlock(&as_mysql_cluster_list_lock);
-	cluster_list_tmp = list_shallow_copy(as_mysql_cluster_list);
-	itr = list_iterator_create(cluster_list_tmp);
-	while ((object = list_next(itr))) {
-		if ((rc = remove_common(mysql_conn, DBD_REMOVE_ACCOUNTS, now,
-					user_name, acct_table, name_char,
-					assoc_char, object, ret_list,
-					&jobs_running, &default_account))
-		    != SLURM_SUCCESS)
-			break;
-	}
-	list_iterator_destroy(itr);
-	FREE_NULL_LIST(cluster_list_tmp);
+	args.use_cluster_list = list_shallow_copy(as_mysql_cluster_list);
+
+	rc = remove_common(&args);
+
+	FREE_NULL_LIST(args.use_cluster_list);
 	slurm_rwlock_unlock(&as_mysql_cluster_list_lock);
 
-	xfree(user_name);
+	xfree(args.user_name);
 	xfree(name_char);
 	xfree(assoc_char);
 	if (rc == SLURM_ERROR) {
@@ -906,22 +915,25 @@ extern List as_mysql_remove_accts(mysql_conn_t *mysql_conn, uint32_t uid,
 		return NULL;
 	}
 
-	if (default_account)
+	if (args.default_account)
 		errno = ESLURM_NO_REMOVE_DEFAULT_ACCOUNT;
-	else if (jobs_running)
+	else if (args.jobs_running)
 		errno = ESLURM_JOBS_RUNNING_ON_ASSOC;
-	else
+	else {
+		as_mysql_user_create_user_coords_list(mysql_conn);
 		errno = SLURM_SUCCESS;
+	}
+
 	return ret_list;
 }
 
-extern List as_mysql_get_accts(mysql_conn_t *mysql_conn, uid_t uid,
-			       slurmdb_account_cond_t *acct_cond)
+extern list_t *as_mysql_get_accts(mysql_conn_t *mysql_conn, uid_t uid,
+				  slurmdb_account_cond_t *acct_cond)
 {
 	char *query = NULL;
 	char *extra = NULL, *at = NULL;
 	char *tmp = NULL;
-	List acct_list = NULL;
+	list_t *acct_list = NULL;
 	list_itr_t *itr = NULL;
 	int set = 0;
 	int i=0, is_admin=1;
@@ -1036,7 +1048,8 @@ empty:
 		FREE_NULL_LIST(acct_cond->assoc_cond->acct_list);
 		acct_cond->assoc_cond->acct_list = list_create(NULL);
 		if (acct_cond->flags & SLURMDB_ACCT_FLAG_DELETED)
-			acct_cond->assoc_cond->with_deleted = 1;
+			acct_cond->assoc_cond->flags |=
+				ASSOC_COND_FLAG_WITH_DELETED;
 	}
 
 	while ((row = mysql_fetch_row(result))) {
@@ -1076,7 +1089,7 @@ empty:
 		list_itr_t *assoc_itr = NULL;
 		slurmdb_account_rec_t *acct = NULL;
 		slurmdb_assoc_rec_t *assoc = NULL;
-		List assoc_list = as_mysql_get_assocs(
+		list_t *assoc_list = as_mysql_get_assocs(
 			mysql_conn, uid, acct_cond->assoc_cond);
 
 		if (!assoc_list) {

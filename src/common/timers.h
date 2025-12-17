@@ -39,42 +39,184 @@
 #ifndef _HAVE_TIMERS_H
 #define _HAVE_TIMERS_H
 
+#include <stdbool.h>
+#include <stdint.h>
 #include <sys/time.h>
+#include <sys/types.h>
 
-#define DEF_TIMERS	struct timeval tv1, tv2; char tv_str[20] = ""; long delta_t;
-#define START_TIMER	gettimeofday(&tv1, NULL)
-#define END_TIMER do {							\
-	gettimeofday(&tv2, NULL);					\
-	slurm_diff_tv_str(&tv1, &tv2, tv_str, 20, NULL, 0, &delta_t);	\
-} while (0)
-#define END_TIMER2(from) do {						\
-	gettimeofday(&tv2, NULL);					\
-	slurm_diff_tv_str(&tv1, &tv2, tv_str, 20, from, 0, &delta_t);	\
-} while (0)
-#define END_TIMER3(from, limit) do {					\
-	gettimeofday(&tv2, NULL);					\
-	slurm_diff_tv_str(&tv1, &tv2, tv_str, 20, from, limit, &delta_t); \
-} while (0)
-#define DELTA_TIMER	delta_t
-#define TIME_STR 	tv_str
+#include <src/common/slurm_time.h>
 
-/* Return the number of micro-seconds between now and argument "tv",
- * Initialize tv to NOW if zero on entry */
-extern int slurm_delta_tv(struct timeval *tv);
+#define TIMER_START_TS tv1
+#define TIMER_END_TS tv2
+#define DEF_TIMERS \
+	struct timeval TIMER_START_TS = { 0, 0 }; \
+	struct timeval TIMER_END_TS = { 0, 0 };
+#define START_TIMER \
+	do { \
+		gettimeofday(&TIMER_START_TS, NULL); \
+	} while (false)
+#define END_TIMER \
+	do { \
+		gettimeofday(&TIMER_END_TS, NULL); \
+	} while (false)
+#define END_TIMER2(from) \
+	do { \
+		gettimeofday(&TIMER_END_TS, NULL); \
+		timer_compare_limit(&TIMER_START_TS, &TIMER_END_TS, from, 0); \
+	} while (false)
+#define END_TIMER3(from, limit) \
+	do { \
+		gettimeofday(&TIMER_END_TS, NULL); \
+		timer_compare_limit(&TIMER_START_TS, &TIMER_END_TS, from, \
+				    limit); \
+	} while (false)
+/*
+ * Get duration of time between START_TIMER and END_TIMER as string
+ * Note: Must be called after START_TIMER and END_TIMER macros
+ * RET: string of duration of time between calls or "INVALID"
+ */
+#define TIMER_STR() (timer_duration_str(&TIMER_START_TS, &TIMER_END_TS).str)
+/* Get timer duration in microseconds */
+#define TIMER_DURATION_USEC() timer_get_duration(&TIMER_START_TS, &TIMER_END_TS)
 
 /*
- * slurm_diff_tv_str - build a string showing the time difference between two
- *		       times
+ * Get timer duration in microseconds
+ * IN/OUT start - ptr to start of timer. Will be populated with now if zero.
+ * IN/OUT end - ptr to end of timer. Will be populated with now if zero.
+ * RET duration of timer in microseconds
+ */
+extern long timer_get_duration(struct timeval *start, struct timeval *end);
+
+typedef struct {
+	char str[20];
+} timer_str_t;
+
+/*
+ * Compare the time difference between two times and log when over the limit
  * IN tv1 - start of event
  * IN tv2 - end of event
- * OUT tv_str - place to put delta time in format "usec=%ld"
- * IN len_tv_str - size of tv_str in bytes
  * IN from - Name to be printed on long diffs
  * IN limit - limit to wait
- * OUT delta_t - raw time difference in usec
  */
-extern void slurm_diff_tv_str(struct timeval *tv1,struct timeval *tv2,
-			      char *tv_str, int len_tv_str, const char *from,
-			      long limit, long *delta_t);
+extern void timer_compare_limit(struct timeval *tv1, struct timeval *tv2,
+				const char *from, long limit);
+
+/*
+ * Get string of time difference between tv1 and tv2 into tv_str
+ * IN tv1 - time value start
+ * IN tv2 - time value end
+ * RET string of duration
+ */
+extern timer_str_t timer_duration_str(struct timeval *tv1, struct timeval *tv2);
+
+/*
+ * Number of latency ranges in latency histogram.
+ * WARNING: Must be kept in sync with ARRAY_SIZE(latency_ranges).
+ */
+#define LATENCY_RANGE_COUNT 24
+
+typedef struct {
+	ssize_t count;
+} latency_histogram_bucket_t;
+
+typedef struct {
+	latency_histogram_bucket_t buckets[LATENCY_RANGE_COUNT];
+} latency_histogram_t;
+
+#define LATENCY_HISTOGRAM_INITIALIZER \
+	((latency_histogram_t) { \
+		.buckets = { { 0 } }, \
+	})
+
+/* Struct to hold latency metric state */
+typedef struct {
+	latency_histogram_t histogram;
+	timespec_t total;
+	uint64_t count;
+	timespec_t last_log;
+} latency_metric_t;
+
+typedef struct {
+	double avg; /* Average latency in seconds or 0 if not calculated */
+	timespec_t delay; /* Delay from START_LATENCY_TIMER() */
+} latency_metric_rc_t;
+
+/*
+ * Start recording latency metric
+ * NOTE: Must have DECL_LATENCY_TIMER() in scope
+ * NOTE: call BEGIN_LATENCY_TIMER() instead
+ * IN metric - metric state
+ * IN start - timestamp to populate
+ */
+extern void latency_metric_begin(latency_metric_t *metric, timespec_t *start);
+
+/*
+ * Stop recording latency metric and perform analysis
+ * NOTE: Must have DECL_LATENCY_TIMER() in scope
+ * NOTE: call END_LATENCY_TIMER() instead
+ * IN metric - metric state
+ * IN start - timestamp populated by START_LATENCY_TIMER()
+ * IN end - timestamp when event ended or timespec_now()
+ * IN interval
+ *	Min interval between calculating analysis
+ *	TIMESPEC_INFINITE to skip
+ * RET struct full of latency metric analysis
+ */
+extern latency_metric_rc_t latency_metric_end(latency_metric_t *metric,
+					      timespec_t *start, timespec_t end,
+					      const timespec_t interval);
+
+/* Declare latency timer */
+#define DECL_LATENCY_TIMER \
+	static latency_metric_t latency_metric = LATENCY_METRIC_INITIALIZER; \
+	static __thread timespec_t latency_metric_start = { 0, 0 };
+
+#define LATENCY_METRIC_INITIALIZER \
+	((latency_metric_t) { \
+		.histogram = LATENCY_HISTOGRAM_INITIALIZER, \
+		.total = { 0, 0 }, \
+		.count = 0, \
+		.last_log = { 0, 0 }, \
+	})
+
+/* Start latency timer */
+#define START_LATENCY_TIMER() \
+	latency_metric_begin(&latency_metric, &latency_metric_start)
+
+/* End latency timer and generate analysis if past interval */
+#define END_LATENCY_TIMER(interval) \
+	latency_metric_end(&latency_metric, &latency_metric_start, \
+			   timespec_now(), interval)
+
+/* Expected buffer size to hold printed latency histogram */
+#define LATENCY_METRIC_HISTOGRAM_STR_LEN 1024
+
+/*
+ * print histogram buckets labels to buffer
+ * IN buffer - pointer to buffer to populate
+ * IN buffer_len - number of bytes in buffer. should be at least
+ *	LATENCY_METRIC_HISTOGRAM_STR_LEN.
+ * IN numbers of bytes written (excluding \0)
+ */
+extern int latency_histogram_print_labels(char *buffer, size_t buffer_len);
+
+/*
+ * print histogram buckets to buffer
+ * IN metric - latency metric to print histogram from
+ * IN buffer - pointer to buffer to populate
+ * IN buffer_len - number of bytes in buffer. should be at least
+ *	LATENCY_METRIC_HISTOGRAM_STR_LEN.
+ * IN numbers of bytes written (excluding \0)
+ */
+extern int latency_histogram_print(latency_histogram_t *histogram, char *buffer,
+				   size_t buffer_len);
+
+/*
+ * Add latency value to histogram
+ * IN metric - latency metric to add new result
+ * IN value - duration of time spent waiting
+ */
+extern void latency_metric_add_histogram_value(latency_histogram_t *histogram,
+					       timespec_t value);
 
 #endif

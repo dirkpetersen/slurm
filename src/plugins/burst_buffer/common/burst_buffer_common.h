@@ -208,7 +208,7 @@ typedef struct bb_state {
 	time_t		next_end_time;
 	time_t		last_update_time;
 	uint64_t	persist_resv_sz; /* Space reserved for persistent buffers */
-	List		persist_resv_rec;/* List of bb_pend_persist_t records */
+	list_t *	persist_resv_rec;/* list of bb_pend_persist_t records */
 	pthread_cond_t	term_cond;
 	bool		term_flag;
 	pthread_mutex_t	term_mutex;
@@ -336,14 +336,6 @@ char *bb_handle_job_script(job_record_t *job_ptr, bb_job_t *bb_job);
 /* Load and process configuration parameters */
 extern void bb_load_config(bb_state_t *state_ptr, char *plugin_type);
 
-/*
- * Open the state save file, or the backup if necessary.
- * IN file_name - the name of the state save file to open
- * OUT state_file - the name (including path) of the state save file
- * RET the file description to read from or error code
- */
-extern int bb_open_state_file(const char *file_name, char **state_file);
-
 /* Pack individual burst buffer records into a buffer */
 extern int bb_pack_bufs(uid_t uid, bb_state_t *state_ptr, buf_t *buffer,
 			uint16_t protocol_version);
@@ -435,21 +427,5 @@ extern int bb_write_file(char *file_name, char *buf);
  */
 extern int bb_write_nid_file(char *file_name, char *node_list,
 			     job_record_t *job_ptr);
-/*
- * Save buffer to state file
- * IN old_file - state file name with ".old" appended
- * IN reg_file - state file name
- * IN new_file - state file name with ".new" appended
- * IN plugin - name of plugin, just used for debugging
- * IN buffer - write this data to the file
- * IN buffer_size - size of buffer to create
- * IN save_time - timestamp when state saving began
- * OUT last_save_time - set to save_time if writing to the state save file
- *                      succeeds
- */
-extern void bb_write_state_file(char* old_file, char *reg_file, char *new_file,
-				const char *plugin, buf_t *buffer,
-				int buffer_size, time_t save_time,
-				time_t *last_save_time);
 
 #endif	/* __BURST_BUFFER_COMMON_H__ */

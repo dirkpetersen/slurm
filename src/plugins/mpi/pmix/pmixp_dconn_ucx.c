@@ -125,7 +125,7 @@ static void recv_handle(void *request, ucs_status_t status,
 }
 
 static bool _epoll_readable(eio_obj_t *obj);
-static int _epoll_read(eio_obj_t *obj, List objs);
+static int _epoll_read(eio_obj_t *obj, list_t *objs);
 
 static struct io_operations _epoll_ops = {
 	.readable = _epoll_readable,
@@ -133,7 +133,7 @@ static struct io_operations _epoll_ops = {
 };
 
 static bool _progress_readable(eio_obj_t *obj);
-static int _progress_read(eio_obj_t *obj, List objs);
+static int _progress_read(eio_obj_t *obj, list_t *objs);
 
 static struct io_operations _progress_ops = {
 	.readable = _progress_readable,
@@ -440,7 +440,7 @@ static bool _ucx_progress()
 		req->len = info_tag.length;
 		if (PMIXP_UCX_ACTIVE == req->status) {
 			/* this message is long enough, so it makes
-			 * sense to do the progres one more timer */
+			 * sense to do the progress one more timer */
 			pmixp_rlist_enq(&_rcv_pending, req);
 		} else {
 			pmixp_rlist_enq(&_rcv_complete, req);
@@ -568,7 +568,7 @@ static bool _epoll_readable(eio_obj_t *obj)
 	return true;
 }
 
-static int _epoll_read(eio_obj_t *obj, List objs)
+static int _epoll_read(eio_obj_t *obj, list_t *objs)
 {
 	if (obj->shutdown) {
 		/* corresponding connection will be
@@ -597,7 +597,7 @@ static bool _progress_readable(eio_obj_t *obj)
 	return true;
 }
 
-static int _progress_read(eio_obj_t *obj, List objs)
+static int _progress_read(eio_obj_t *obj, list_t *objs)
 {
 	char buf;
 

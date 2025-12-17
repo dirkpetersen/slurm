@@ -44,14 +44,13 @@
 
 static int _set_cond(int *start, int argc, char **argv,
 		     slurmdb_account_cond_t *acct_cond,
-		     List format_list)
+		     list_t *format_list)
 {
 	int i;
 	int cond_set = 0;
 	int end = 0;
 	slurmdb_assoc_cond_t *assoc_cond = NULL;
 	int command_len = 0;
-	int option = 0;
 
 	if (!acct_cond) {
 		exit_code=1;
@@ -67,16 +66,10 @@ static int _set_cond(int *start, int argc, char **argv,
 	assoc_cond = acct_cond->assoc_cond;
 
 	for (i=(*start); i<argc; i++) {
-		end = parse_option_end(argv[i]);
-		if (!end)
-			command_len=strlen(argv[i]);
-		else {
-			command_len=end-1;
-			if (argv[i][end] == '=') {
-				option = (int)argv[i][end-1];
-				end++;
-			}
-		}
+		int op_type;
+		end = parse_option_end(argv[i], &op_type, &command_len);
+		if (!common_verify_option_syntax(argv[i], op_type, false))
+			continue;
 
 		if (!xstrncasecmp(argv[i], "Set", MAX(command_len, 3))) {
 			i--;
@@ -93,14 +86,14 @@ static int _set_cond(int *start, int argc, char **argv,
 			   !xstrncasecmp(argv[i], "WithDeleted",
 					 MAX(command_len, 5))) {
 			acct_cond->flags |= SLURMDB_ACCT_FLAG_DELETED;
-			assoc_cond->with_deleted = 1;
+			assoc_cond->flags |= ASSOC_COND_FLAG_WITH_DELETED;
 		} else if (!end &&
 			   !xstrncasecmp(argv[i], "WithRawQOSLevel",
 					 MAX(command_len, 5))) {
-			assoc_cond->with_raw_qos = 1;
+			assoc_cond->flags |= ASSOC_COND_FLAG_RAW_QOS;
 		} else if (!end && !xstrncasecmp(argv[i], "WOPLimits",
 						 MAX(command_len, 4))) {
-			assoc_cond->without_parent_limits = 1;
+			assoc_cond->flags |= ASSOC_COND_FLAG_WOPL;
 		} else if (!end && !xstrncasecmp(argv[i], "where",
 					       MAX(command_len, 5))) {
 			continue;
@@ -129,9 +122,19 @@ static int _set_cond(int *start, int argc, char **argv,
 				cond_set |= SA_SET_USER;
 		} else if (!xstrncasecmp(argv[i], "Flags",
 					 MAX(command_len, 2))) {
-			acct_cond->flags |= str_2_slurmdb_acct_flags(
-				argv[i]+end);
-			cond_set |= SA_SET_USER;
+			const char *flag_str = (argv[i] + end);
+			slurmdb_acct_flags_t *flags_ptr = &acct_cond->flags;
+			int rc;
+
+			if ((rc = str_2_slurmdb_acct_flags(flag_str,
+							   flags_ptr))) {
+				fprintf(stderr, " Unknown Flag(s)=%s\n",
+					flag_str);
+				exit_code = 1;
+				break;
+			} else {
+				cond_set |= SA_SET_USER;
+			}
 		} else if (!xstrncasecmp(argv[i], "Format",
 					 MAX(command_len, 2))) {
 			if (format_list)
@@ -146,8 +149,8 @@ static int _set_cond(int *start, int argc, char **argv,
 						 argv[i]+end))
 				cond_set |= SA_SET_USER;
 		} else if (sacctmgr_set_assoc_cond(
-				    assoc_cond, argv[i], argv[i]+end,
-				    command_len, option)) {
+				   assoc_cond, argv[i], argv[i]+end,
+				   command_len)) {
 			cond_set |= SA_SET_ASSOC;
 		} else {
 			exit_code=1;
@@ -163,8 +166,8 @@ static int _set_cond(int *start, int argc, char **argv,
 }
 
 static int _set_rec(int *start, int argc, char **argv,
-		    List acct_list,
-		    List cluster_list,
+		    list_t *acct_list,
+		    list_t *cluster_list,
 		    slurmdb_account_rec_t *acct,
 		    slurmdb_assoc_rec_t *assoc)
 {
@@ -173,21 +176,13 @@ static int _set_rec(int *start, int argc, char **argv,
 	int end = 0;
 	int command_len = 0;
 	int option = 0;
+	bool allow_option = false;
 
 	xassert(acct);
 	xassert(assoc);
 
 	for (i=(*start); i<argc; i++) {
-		end = parse_option_end(argv[i]);
-		if (!end)
-			command_len=strlen(argv[i]);
-		else {
-			command_len=end-1;
-			if (argv[i][end] == '=') {
-				option = (int)argv[i][end-1];
-				end++;
-			}
-		}
+		end = parse_option_end(argv[i], &option, &command_len);
 
 		if (!xstrncasecmp(argv[i], "Where", MAX(command_len, 5))) {
 			i--;
@@ -228,8 +223,18 @@ static int _set_rec(int *start, int argc, char **argv,
 
 		} else if (!xstrncasecmp(argv[i], "Flags",
 					 MAX(command_len, 2))) {
-			acct->flags = str_2_slurmdb_acct_flags(argv[i]+end);
-			rec_set |= SA_SET_USER;
+			const char *flag_str = (argv[i] + end);
+			int rc;
+
+			if ((rc = str_2_slurmdb_acct_flags(flag_str,
+							   &acct->flags))) {
+				fprintf(stderr, " Unknown Flag(s)=%s\n",
+					flag_str);
+				exit_code = 1;
+				break;
+			} else {
+				rec_set |= SA_SET_USER;
+			}
 		} else if (!xstrncasecmp(argv[i], "Organization",
 					 MAX(command_len, 1))) {
 			acct->organization = strip_quotes(argv[i]+end, NULL, 1);
@@ -247,15 +252,19 @@ static int _set_rec(int *start, int argc, char **argv,
 				rec_set |= SA_SET_ASSOC;
 			}
 		} else if (sacctmgr_set_assoc_rec(
-					      assoc, argv[i], argv[i]+end,
-					      command_len, option)) {
+				   assoc, argv[i], argv[i]+end,
+				   command_len, option,
+				   &allow_option)) {
 			rec_set |= SA_SET_ASSOC;
 		} else {
+			allow_option = true;
 			exit_code=1;
 			fprintf(stderr, " Unknown option: %s\n"
 				" Use keyword 'where' to modify condition\n",
 				argv[i]);
 		}
+
+		common_verify_option_syntax(argv[i], option, allow_option);
 	}
 
 	(*start) = i;
@@ -316,10 +325,16 @@ extern int sacctmgr_add_account(int argc, char **argv)
 			}
 		}
 		if (commit_check("Would you like to commit changes?")) {
-			slurmdb_connection_commit(db_conn, 1);
+			rc = slurmdb_connection_commit(db_conn, 1);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr,	" Error committing changes: %s\n",
+					slurm_strerror(rc));
 		} else {
 			printf(" Changes Discarded\n");
-			slurmdb_connection_commit(db_conn, 0);
+			rc = slurmdb_connection_commit(db_conn, 0);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr,	" Error rolling back changes: %s\n",
+					slurm_strerror(rc));
 		}
 	} else if (rc == SLURM_NO_CHANGE_IN_DATA) {
 		printf(" %s", ret_str ? ret_str : slurm_strerror(rc));
@@ -347,7 +362,7 @@ extern int sacctmgr_list_account(int argc, char **argv)
 	int rc = SLURM_SUCCESS;
 	slurmdb_account_cond_t *acct_cond =
 		xmalloc(sizeof(slurmdb_account_cond_t));
- 	List acct_list;
+	list_t *acct_list;
 	int i=0, cond_set=0, prev_set=0;
 	list_itr_t *itr = NULL;
 	list_itr_t *itr2 = NULL;
@@ -360,8 +375,8 @@ extern int sacctmgr_list_account(int argc, char **argv)
 
 	print_field_t *field = NULL;
 
-	List format_list = list_create(xfree_ptr);
-	List print_fields_list; /* types are of print_field_t */
+	list_t *format_list = list_create(xfree_ptr);
+	list_t *print_fields_list; /* types are of print_field_t */
 
 	if (with_assoc_flag)
 		acct_cond->flags |= SLURMDB_ACCT_FLAG_WASSOC;
@@ -572,7 +587,7 @@ extern int sacctmgr_modify_account(int argc, char **argv)
 
 	int i=0;
 	int cond_set = 0, prev_set = 0, rec_set = 0, set = 0;
-	List ret_list = NULL;
+	list_t *ret_list = NULL;
 
 	slurmdb_init_assoc_rec(assoc, 0);
 
@@ -630,7 +645,6 @@ extern int sacctmgr_modify_account(int argc, char **argv)
 		return rc;
 	}
 
-	notice_thread_init();
 	if (rec_set & SA_SET_USER) { // process the account changes
 		if (cond_set == SA_SET_ASSOC) {
 			exit_code=1;
@@ -640,19 +654,20 @@ extern int sacctmgr_modify_account(int argc, char **argv)
 			rc = SLURM_ERROR;
 			goto assoc_start;
 		}
+		notice_thread_init();
 		ret_list = slurmdb_accounts_modify(
 			db_conn, acct_cond, acct);
+		printf(" Modified accounts...\n");
 		if (ret_list && list_count(ret_list)) {
 			char *object = NULL;
 			list_itr_t *itr = list_iterator_create(ret_list);
-			printf(" Modified accounts...\n");
 			while((object = list_next(itr))) {
 				printf("  %s\n", object);
 			}
 			list_iterator_destroy(itr);
 			set = 1;
 		} else if (ret_list) {
-			printf(" Nothing modified\n");
+			printf("  Nothing modified\n");
 			rc = SLURM_ERROR;
 		} else {
 			exit_code=1;
@@ -663,6 +678,22 @@ extern int sacctmgr_modify_account(int argc, char **argv)
 		}
 
 		FREE_NULL_LIST(ret_list);
+		notice_thread_fini();
+		if (set) {
+			if (commit_check("Would you like to commit changes?")) {
+				rc = slurmdb_connection_commit(db_conn, 1);
+				if (rc != SLURM_SUCCESS)
+					fprintf(stderr,	" Error committing changes: %s\n",
+						slurm_strerror(rc));
+			} else {
+				printf(" Changes Discarded\n");
+				rc = slurmdb_connection_commit(db_conn, 0);
+				if (rc != SLURM_SUCCESS)
+					fprintf(stderr,	" Error rolling back changes: %s\n",
+						slurm_strerror(rc));
+			}
+			set = 0;
+		}
 	}
 
 assoc_start:
@@ -677,20 +708,21 @@ assoc_start:
 			goto assoc_end;
 		}
 
+		notice_thread_init();
 		ret_list = slurmdb_associations_modify(
 			db_conn, acct_cond->assoc_cond, assoc);
 
+		printf(" Modified account associations...\n");
 		if (ret_list && list_count(ret_list)) {
 			char *object = NULL;
 			list_itr_t *itr = list_iterator_create(ret_list);
-			printf(" Modified account associations...\n");
 			while ((object = list_next(itr))) {
 				printf("  %s\n", object);
 			}
 			list_iterator_destroy(itr);
 			set = 1;
-		} else if (ret_list) {
-			printf(" Nothing modified\n");
+		} else if (ret_list || (errno == SLURM_NO_CHANGE_IN_DATA)) {
+			printf("  Nothing modified\n");
 			rc = SLURM_ERROR;
 		} else if ((errno == ESLURM_INVALID_PARENT_ACCOUNT) &&
 			   assoc->parent_acct) {
@@ -713,19 +745,27 @@ assoc_start:
 		}
 
 		FREE_NULL_LIST(ret_list);
+
+		notice_thread_fini();
+		if (set) {
+			if (commit_check("Would you like to commit changes?")) {
+				rc = slurmdb_connection_commit(db_conn, 1);
+				if (rc != SLURM_SUCCESS)
+					fprintf(stderr,	" Error committing changes: %s\n",
+						slurm_strerror(rc));
+			} else {
+				printf(" Changes Discarded\n");
+				rc = slurmdb_connection_commit(db_conn, 0);
+				if (rc != SLURM_SUCCESS)
+					fprintf(stderr,	" Error rolling back changes: %s\n",
+						slurm_strerror(rc));
+			}
+			set = 0;
+		}
 	}
 
 assoc_end:
 
-	notice_thread_fini();
-	if (set) {
-		if (commit_check("Would you like to commit changes?"))
-			slurmdb_connection_commit(db_conn, 1);
-		else {
-			printf(" Changes Discarded\n");
-			slurmdb_connection_commit(db_conn, 0);
-		}
-	}
 	slurmdb_destroy_account_cond(acct_cond);
 	slurmdb_destroy_account_rec(acct);
 	slurmdb_destroy_assoc_rec(assoc);
@@ -739,7 +779,7 @@ extern int sacctmgr_delete_account(int argc, char **argv)
 	slurmdb_account_cond_t *acct_cond =
 		xmalloc(sizeof(slurmdb_account_cond_t));
 	int i = 0;
-	List ret_list = NULL;
+	list_t *ret_list = NULL;
 	list_itr_t *itr = NULL;
 	int cond_set = 0, prev_set = 0;
 
@@ -794,7 +834,7 @@ extern int sacctmgr_delete_account(int argc, char **argv)
 		}
 	}
 
-	acct_cond->assoc_cond->only_defs = 0;
+	acct_cond->assoc_cond->flags &= ~ASSOC_COND_FLAG_ONLY_DEFS;;
 
 	notice_thread_init();
 	if (cond_set == SA_SET_USER) {
@@ -857,10 +897,16 @@ extern int sacctmgr_delete_account(int argc, char **argv)
 		}
 		list_iterator_destroy(itr);
 		if (commit_check("Would you like to commit changes?")) {
-			slurmdb_connection_commit(db_conn, 1);
+			rc = slurmdb_connection_commit(db_conn, 1);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr,	" Error committing changes: %s\n",
+					slurm_strerror(rc));
 		} else {
 			printf(" Changes Discarded\n");
-			slurmdb_connection_commit(db_conn, 0);
+			rc = slurmdb_connection_commit(db_conn, 0);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr,	" Error rolling back changes: %s\n",
+					slurm_strerror(rc));
 		}
 	} else if (ret_list) {
 		printf(" Nothing deleted\n");

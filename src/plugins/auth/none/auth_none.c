@@ -48,38 +48,17 @@
 
 #include "src/common/pack.h"
 #include "src/common/slurm_protocol_api.h"
+#include "src/common/slurm_protocol_defs.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Null authentication plugin";
 const char plugin_type[] = "auth/none";
-const uint32_t plugin_id = AUTH_PLUGIN_NONE;
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
+/* Required for auth plugins: */
+const uint32_t plugin_id = AUTH_PLUGIN_NONE;
 const bool hash_enable = false;
 
 /*
@@ -120,19 +99,15 @@ typedef struct {
 	gid_t gid;
 } auth_credential_t;
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	debug("%s loaded", plugin_name);
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
-	return SLURM_SUCCESS;
+	return;
 }
 
 /*
@@ -199,7 +174,7 @@ extern void auth_p_get_ids(auth_credential_t *cred, uid_t *uid, gid_t *gid)
 char *auth_p_get_host(auth_credential_t *cred)
 {
 	if (!cred) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return NULL;
 	}
 
@@ -209,7 +184,7 @@ char *auth_p_get_host(auth_credential_t *cred)
 extern int auth_p_get_data(auth_credential_t *cred, char **data, uint32_t *len)
 {
 	if (!cred) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return SLURM_ERROR;
 	}
 
@@ -222,7 +197,7 @@ extern int auth_p_get_data(auth_credential_t *cred, char **data, uint32_t *len)
 extern void *auth_p_get_identity(auth_credential_t *cred)
 {
 	if (!cred) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return NULL;
 	}
 
@@ -236,7 +211,7 @@ extern void *auth_p_get_identity(auth_credential_t *cred)
 int auth_p_pack(auth_credential_t *cred, buf_t *buf, uint16_t protocol_version)
 {
 	if (!cred || !buf) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return SLURM_ERROR;
 	}
 
@@ -253,37 +228,59 @@ int auth_p_pack(auth_credential_t *cred, buf_t *buf, uint16_t protocol_version)
 	return SLURM_SUCCESS;
 }
 
+/* takes ownership of hostname pointer */
+static auth_credential_t *_cred(uid_t uid, gid_t gid, char *hostname)
+{
+	auth_credential_t *cred = NULL;
+
+	if ((uid == SLURM_AUTH_NOBODY) || (gid == SLURM_AUTH_NOBODY)) {
+		error("%s: rejecting user nobody", __func__);
+		errno = ESLURM_AUTH_NOBODY;
+		xfree(hostname);
+		return NULL;
+	}
+
+	/* Allocate a new credential. */
+	cred = xmalloc(sizeof(*cred));
+	*cred = (auth_credential_t) {
+		.uid = uid,
+		.gid = gid,
+		.hostname = hostname,
+	};
+
+	return cred;
+}
+
 /*
  * Unmarshall a credential after transmission over the network according
  * to Slurm's marshalling protocol.
  */
 auth_credential_t *auth_p_unpack(buf_t *buf, uint16_t protocol_version)
 {
-	auth_credential_t *cred = NULL;
+	uid_t uid = SLURM_AUTH_NOBODY;
+	gid_t gid = SLURM_AUTH_NOBODY;
+	char *hostname = NULL;
 
 	if (!buf) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return NULL;
 	}
 
-	/* Allocate a new credential. */
-	cred = xmalloc(sizeof(*cred));
-
 	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		safe_unpack32(&cred->uid, buf);
-		safe_unpack32(&cred->gid, buf);
-		safe_unpackstr(&cred->hostname, buf);
+		safe_unpack32(&uid, buf);
+		safe_unpack32(&gid, buf);
+		safe_unpackstr(&hostname, buf);
 	} else {
 		error("%s: unknown protocol version %u",
 		      __func__, protocol_version);
 		goto unpack_error;
 	}
 
-	return cred;
+	return _cred(uid, gid, hostname);
 
 unpack_error:
-	auth_p_destroy(cred);
-	slurm_seterrno(ESLURM_AUTH_UNPACK);
+	xfree(hostname);
+	errno = ESLURM_AUTH_UNPACK;
 	return NULL;
 }
 
@@ -301,4 +298,26 @@ void auth_p_thread_clear(void)
 char *auth_p_token_generate(const char *username, int lifespan)
 {
 	return NULL;
+}
+
+extern int auth_p_get_reconfig_fd(void)
+{
+	return -1;
+}
+
+extern auth_credential_t *auth_p_cred_generate(const char *token,
+					       const char *username, uid_t uid,
+					       gid_t gid)
+{
+	/*
+	 * Without any type of authentication token, there is no way to guess
+	 * the username
+	 */
+	if (!username) {
+		error("%s: required username not provided", __func__);
+		errno = ESLURM_AUTH_CRED_INVALID;
+		return NULL;
+	}
+
+	return _cred(uid, gid, NULL);
 }

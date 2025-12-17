@@ -1,7 +1,7 @@
 /*****************************************************************************\
  *  xahash.h - functions used for arbitrary hash table
  *****************************************************************************
- *  Copyright (C) 2024 SchedMD LLC.
+ *  Copyright (C) SchedMD LLC.
  *
  *  This file is part of Slurm, a resource management program.
  *  For details, see <https://slurm.schedmd.com/>.
@@ -112,7 +112,7 @@ typedef xahash_foreach_control_t (*xahash_foreach_func_t)(void *entry,
 							  void *arg);
 
 /*
- * Free anything releated to entry's bytes
+ * Free anything related to entry's bytes
  * IN entry - pointer to bytes for entry in hash table
  * IN state - arbitrary bytes to hand to function for state tracking
  */

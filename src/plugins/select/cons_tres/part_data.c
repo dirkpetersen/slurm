@@ -59,7 +59,7 @@ static int _compare_support(const void *v1, const void *v2)
 	if (rc)
 		return rc;
 
-	rc = slurm_sort_uint_list_asc(&s1->tmpjobs->ncpus, &s2->tmpjobs->ncpus);
+	rc = slurm_sort_uint32_list_asc(&s1->tmpjobs->ncpus, &s2->tmpjobs->ncpus);
 	if (rc)
 		return rc;
 
@@ -250,7 +250,7 @@ extern void part_data_build_row_bitmaps(part_res_record_t *p_ptr,
 	if (j < num_jobs) {
 		/*
 		 * we found a dangling job, which means our packing
-		 * algorithm couldn't improve apon the existing layout.
+		 * algorithm couldn't improve upon the existing layout.
 		 * Thus, we'll restore the original layout here
 		 */
 		debug3("dangling job found");
@@ -322,7 +322,7 @@ extern void part_data_build_row_bitmaps(part_res_record_t *p_ptr,
 /* (re)create the global select_part_record array */
 extern void part_data_create_array(void)
 {
-	List part_rec_list = NULL;
+	list_t *part_rec_list = NULL;
 	list_itr_t *part_iterator;
 	part_record_t *p_ptr;
 	part_res_record_t *this_ptr, *last_ptr = NULL;

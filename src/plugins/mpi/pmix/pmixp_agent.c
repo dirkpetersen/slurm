@@ -43,10 +43,11 @@
 #define _GNU_SOURCE
 
 #include <pthread.h>
-#include <sched.h>
 #include <poll.h>
 #include <arpa/inet.h>
 #include <time.h>
+
+#include "src/interfaces/conn.h"
 
 #include "pmixp_common.h"
 #include "pmixp_server.h"
@@ -59,9 +60,13 @@
 
 static pthread_mutex_t agent_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t agent_running_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t abort_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t abort_mutex_cond = PTHREAD_COND_INITIALIZER;
 
 static eio_handle_t *_io_handle = NULL;
 static eio_handle_t *_abort_handle = NULL;
+
+static int _abort_agent_start_count = 0;
 
 static pthread_t _agent_tid = 0;
 static pthread_t _timer_tid = 0;
@@ -74,10 +79,10 @@ struct timer_data_t {
 static struct timer_data_t timer_data;
 
 static bool _conn_readable(eio_obj_t *obj);
-static int _server_conn_read(eio_obj_t *obj, List objs);
-static int _abort_conn_close(eio_obj_t *obj, List objs);
-static int _timer_conn_read(eio_obj_t *obj, List objs);
-static int _abort_conn_read(eio_obj_t *obj, List objs);
+static int _server_conn_read(eio_obj_t *obj, list_t *objs);
+static int _abort_conn_close(eio_obj_t *obj, list_t *objs);
+static int _timer_conn_read(eio_obj_t *obj, list_t *objs);
+static int _abort_conn_read(eio_obj_t *obj, list_t *objs);
 
 static struct io_operations abort_ops = {
 	.readable = &_conn_readable,
@@ -108,7 +113,7 @@ static bool _conn_readable(eio_obj_t *obj)
 	return true;
 }
 
-static int _server_conn_read(eio_obj_t *obj, List objs)
+static int _server_conn_read(eio_obj_t *obj, list_t *objs)
 {
 	int fd;
 	struct sockaddr addr;
@@ -161,16 +166,16 @@ static int _server_conn_read(eio_obj_t *obj, List objs)
 	return 0;
 }
 
-static int _abort_conn_close(eio_obj_t *obj, List objs)
+static int _abort_conn_close(eio_obj_t *obj, list_t *objs)
 {
 	close(obj->fd);
 	return SLURM_SUCCESS;
 }
 
-static int _abort_conn_read(eio_obj_t *obj, List objs)
+static int _abort_conn_read(eio_obj_t *obj, list_t *objs)
 {
+	void *conn = NULL;
 	slurm_addr_t abort_client;
-	int client_fd;
 	int shutdown = 0;
 
 	while (1) {
@@ -186,19 +191,18 @@ static int _abort_conn_read(eio_obj_t *obj, List objs)
 			return SLURM_SUCCESS;
 		}
 
-		client_fd = slurm_accept_msg_conn(obj->fd, &abort_client);
-		if (client_fd < 0) {
-			PMIXP_ERROR("slurm_accept_msg_conn: %m");
+		if (!(conn = slurm_accept_msg_conn(obj->fd, &abort_client))) {
+			PMIXP_ERROR("slurm_accept_conn: %m");
 			continue;
 		}
 		PMIXP_DEBUG("New abort client: %pA", &abort_client);
-		pmixp_abort_handle(client_fd);
-		close(client_fd);
+		pmixp_abort_handle(conn);
+		conn_g_destroy(conn, true);
 	}
 	return SLURM_SUCCESS;
 }
 
-static int _timer_conn_read(eio_obj_t *obj, List objs)
+static int _timer_conn_read(eio_obj_t *obj, list_t *objs)
 {
 	char *tmpbuf[32];
 	int shutdown;
@@ -207,7 +211,7 @@ static int _timer_conn_read(eio_obj_t *obj, List objs)
 	while (32 == pmixp_read_buf(obj->fd, tmpbuf, 32, &shutdown, false))
 		;
 	if (shutdown) {
-		PMIXP_ERROR("readin from timer fd, shouldn't happen");
+		PMIXP_ERROR("read-in from timer fd, shouldn't happen");
 		obj->shutdown = true;
 	}
 
@@ -309,7 +313,6 @@ static void *_agent_thread(void *unused)
 	eio_handle_mainloop(_io_handle);
 
 	PMIXP_DEBUG("agent thread exit");
-	eio_handle_destroy(_io_handle);
 
 	return NULL;
 }
@@ -351,17 +354,47 @@ rwfail:
 static void *_pmix_abort_thread(void *args)
 {
 	PMIXP_DEBUG("Start abort thread");
+
+	slurm_mutex_lock(&abort_mutex);
+	slurm_cond_signal(&abort_mutex_cond);
+	slurm_mutex_unlock(&abort_mutex);
+
 	eio_handle_mainloop(_abort_handle);
 	PMIXP_DEBUG("Abort thread exit");
 	return NULL;
 }
 
+/* Must be called inside locks */
+static void _abort_agent_cleanup(void)
+{
+	if (_abort_tid) {
+		eio_signal_shutdown(_abort_handle);
+		slurm_thread_join(_abort_tid);
+	}
+	/* Close FDs and free structure */
+	if (_abort_handle) {
+		eio_handle_destroy(_abort_handle);
+		_abort_handle = NULL;
+	}
+}
+
 int pmixp_abort_agent_start(char ***env)
 {
-	int abort_server_socket = -1;
+	int abort_server_socket = -1, rc = SLURM_SUCCESS;
 	slurm_addr_t abort_server;
 	eio_obj_t *obj;
 	uint16_t *ports;
+
+	slurm_mutex_lock(&abort_mutex);
+	/*
+	 * Only the 1st thread to reach pmixp_abort_agent_start will try to
+	 * spawn the agent.
+	 * If it fails, we keep increasing the counter to prevent from
+	 * subsequent threads to initialize again.
+	 */
+	_abort_agent_start_count++;
+	if (_abort_agent_start_count != 1)
+		goto done;
 
 	if ((ports = slurm_get_srun_port_range()))
 		abort_server_socket = slurm_init_msg_engine_ports(ports);
@@ -369,7 +402,8 @@ int pmixp_abort_agent_start(char ***env)
 		abort_server_socket = slurm_init_msg_engine_port(0);
 	if (abort_server_socket < 0) {
 		PMIXP_ERROR("slurm_init_msg_engine_port() failed: %m");
-		return SLURM_ERROR;
+		rc = SLURM_ERROR;
+		goto done;
 	}
 
 	memset(&abort_server, 0, sizeof(slurm_addr_t));
@@ -377,7 +411,8 @@ int pmixp_abort_agent_start(char ***env)
 	if (slurm_get_stream_addr(abort_server_socket, &abort_server)) {
 		PMIXP_ERROR("slurm_get_stream_addr() failed: %m");
 		close(abort_server_socket);
-		return SLURM_ERROR;
+		rc = SLURM_ERROR;
+		goto done;
 	}
 	PMIXP_DEBUG("Abort agent port: %d", slurm_get_port(&abort_server));
 	setenvf(env, PMIXP_SLURM_ABORT_AGENT_PORT, "%d",
@@ -388,20 +423,76 @@ int pmixp_abort_agent_start(char ***env)
 	eio_new_initial_obj(_abort_handle, obj);
 	slurm_thread_create(&_abort_tid, _pmix_abort_thread, NULL);
 
-	return SLURM_SUCCESS;
+	/* wait for the abort EIO thread to initialize */
+	slurm_cond_wait(&abort_mutex_cond, &abort_mutex);
+
+done:
+	/* If start failed, 1st thread will clean here */
+	if ((_abort_agent_start_count == 1) && (rc != SLURM_SUCCESS))
+		_abort_agent_cleanup();
+	slurm_mutex_unlock(&abort_mutex);
+	return rc;
 }
 
 int pmixp_abort_agent_stop(void)
 {
-	if (_abort_tid) {
-		eio_signal_shutdown(_abort_handle);
-		slurm_thread_join(_abort_tid);
+	int rc;
+
+	slurm_mutex_lock(&abort_mutex);
+
+	_abort_agent_start_count--;
+
+	/* Wait for abort code to be ready. */
+	if (_abort_agent_start_count) {
+		slurm_cond_wait(&abort_mutex_cond, &abort_mutex);
+	} else {
+		_abort_agent_cleanup();
+		/*
+		 * Signal the other threads to let them know rc has now a valid
+		 * value.
+		 */
+		slurm_cond_broadcast(&abort_mutex_cond);
 	}
-	return pmixp_abort_code_get();
+	rc = pmixp_abort_code_get();
+	slurm_mutex_unlock(&abort_mutex);
+
+	return rc;
+}
+
+/* Must be called inside locks */
+static int _agent_cleanup(void)
+{
+	int rc = SLURM_SUCCESS;
+	char c = 1;
+
+	if (_agent_tid) {
+		eio_signal_shutdown(_io_handle);
+		/* wait for the agent thread to stop */
+		slurm_thread_join(_agent_tid);
+	}
+	/* Close FDs and free structure */
+	if(_io_handle) {
+		eio_handle_destroy(_io_handle);
+		_io_handle = NULL;
+	}
+
+	if (_timer_tid) {
+		/* cancel timer */
+		if (write(timer_data.stop_out, &c, 1) == -1)
+			rc = SLURM_ERROR;
+		slurm_thread_join(_timer_tid);
+
+		/* close timer fds */
+		_shutdown_timeout_fds();
+	}
+
+	return rc;
 }
 
 int pmixp_agent_start(void)
 {
+	int rc = SLURM_SUCCESS;
+
 	slurm_mutex_lock(&agent_mutex);
 
 	_setup_timeout_fds();
@@ -415,8 +506,8 @@ int pmixp_agent_start(void)
 	/* Establish the early direct connection */
 	if (pmixp_info_srv_direct_conn_early()) {
 		if (pmixp_server_direct_conn_early()) {
-			slurm_mutex_unlock(&agent_mutex);
-			return SLURM_ERROR;
+			rc = SLURM_ERROR;
+			goto done;
 		}
 	}
 	/* Check if a ping-pong run was requested by user
@@ -443,33 +534,17 @@ int pmixp_agent_start(void)
 	PMIXP_DEBUG("timer thread started: tid = %lu",
 		    (unsigned long) _timer_tid);
 
+done:
+	if (rc != SLURM_SUCCESS)
+		_agent_cleanup();
 	slurm_mutex_unlock(&agent_mutex);
-	return SLURM_SUCCESS;
+	return rc;
 }
 
 int pmixp_agent_stop(void)
 {
-	int rc = SLURM_SUCCESS;
-	char c = 1;
+	int rc;
 
-	slurm_mutex_lock(&agent_mutex);
-
-	if (_agent_tid) {
-		eio_signal_shutdown(_io_handle);
-		/* wait for the agent thread to stop */
-		slurm_thread_join(_agent_tid);
-	}
-
-	if (_timer_tid) {
-		/* cancel timer */
-		if (write(timer_data.stop_out, &c, 1) == -1)
-			rc = SLURM_ERROR;
-		slurm_thread_join(_timer_tid);
-
-		/* close timer fds */
-		_shutdown_timeout_fds();
-	}
-
-	slurm_mutex_unlock(&agent_mutex);
+	rc = _agent_cleanup();
 	return rc;
 }

@@ -210,7 +210,7 @@ static int _next_month(cron_entry_t *entry, struct tm *tm)
 		months_to_advance++;
 	}
 
-	/* Loop around to begining of the year if needed */
+	/* Loop around to beginning of the year if needed */
 	for (int i = 0; i < tm->tm_mon; i++) {
 		if (bit_test(entry->month, i + 1))
 			goto found;
@@ -254,7 +254,7 @@ static int _next_day_of_week(cron_entry_t *entry, struct tm *tm)
 		days_to_advance++;
 	}
 
-	/* Loop around to begining of the week if needed */
+	/* Loop around to beginning of the week if needed */
 	for (int i = 0; i < tm->tm_wday; i++) {
 		if (bit_test(entry->day_of_week, i))
 			return days_to_advance;
@@ -469,7 +469,6 @@ extern int unpack_cron_entry(void **entry_ptr, uint16_t protocol_version,
 			     buf_t *buffer)
 {
 	uint8_t set;
-	uint32_t uint32_tmp;
 	cron_entry_t *entry = NULL;
 
 	xassert(entry_ptr);
@@ -489,7 +488,7 @@ extern int unpack_cron_entry(void **entry_ptr, uint16_t protocol_version,
 		unpack_bit_str_hex(&entry->day_of_month, buffer);
 		unpack_bit_str_hex(&entry->month, buffer);
 		unpack_bit_str_hex(&entry->day_of_week, buffer);
-		safe_unpackstr_xmalloc(&entry->cronspec, &uint32_tmp, buffer);
+		safe_unpackstr(&entry->cronspec, buffer);
 		/* command is not packed, only in struct for parsing */
 		safe_unpack32(&entry->line_start, buffer);
 		safe_unpack32(&entry->line_end, buffer);

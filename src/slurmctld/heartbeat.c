@@ -42,6 +42,7 @@
 #include <sys/types.h>
 
 #include "src/common/fd.h"
+#include "src/common/threadpool.h"
 #include "src/common/xstring.h"
 #include "src/slurmctld/heartbeat.h"
 #include "src/slurmctld/slurmctld.h"
@@ -130,11 +131,9 @@ static void *_heartbeat_thread(void *no_data)
 		}
 
 		/* shuffle files around */
-		(void) unlink(reg_file);
-		if (link(new_file, reg_file))
-			debug("%s: unable to create link for %s -> %s, %m",
+		if (rename(new_file, reg_file))
+			debug("%s: unable to rename %s -> %s, %m",
 			      __func__, new_file, reg_file);
-		(void) unlink(new_file);
 
 delay:
 		xfree(reg_file);

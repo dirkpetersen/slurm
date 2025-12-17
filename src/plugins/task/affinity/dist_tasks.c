@@ -168,32 +168,20 @@ void batch_bind(batch_job_launch_msg_t *req)
 {
 	bitstr_t *hw_map;
 	int task_cnt = 0;
-
-#ifdef HAVE_FRONT_END
-{
-	/* Since the front-end nodes are a shared resource, we limit each job
-	 * to one CPU based upon monotonically increasing sequence number */
-	static int last_id = 0;
-	hw_map  = (bitstr_t *) bit_alloc(conf->block_map_size);
-	bit_set(hw_map, ((last_id++) % conf->block_map_size));
-	task_cnt = 1;
-}
-#else
-{
 	uint16_t sockets = 0, cores = 0, threads = 0;
+
 	hw_map = _get_avail_map(req->cred, &sockets, &cores, &threads);
 	if (hw_map)
 		task_cnt = bit_set_count(hw_map);
-}
-#endif
+
 	if (task_cnt) {
 		req->cpu_bind_type = CPU_BIND_MASK;
 		if (slurm_conf.task_plugin_param & CPU_BIND_VERBOSE)
 			req->cpu_bind_type |= CPU_BIND_VERBOSE;
 		xfree(req->cpu_bind);
 		req->cpu_bind = (char *)bit_fmt_hexmask(hw_map);
-		info("job %u CPU input mask for node: %s",
-		     req->job_id, req->cpu_bind);
+		info("%pI CPU input mask for node: %s",
+		     &req->step_id, req->cpu_bind);
 		/* translate abstract masks to actual hardware layout */
 		_lllp_map_abstract_masks(1, &hw_map);
 #ifdef HAVE_NUMA
@@ -203,11 +191,10 @@ void batch_bind(batch_job_launch_msg_t *req)
 #endif
 		xfree(req->cpu_bind);
 		req->cpu_bind = (char *)bit_fmt_hexmask(hw_map);
-		info("job %u CPU final HW mask for node: %s",
-		     req->job_id, req->cpu_bind);
+		info("%pI CPU final HW mask for node: %s",
+		     &req->step_id, req->cpu_bind);
 	} else {
-		error("job %u allocated no CPUs",
-		      req->job_id);
+		error("%pI allocated no CPUs", &req->step_id);
 	}
 	FREE_NULL_BITMAP(hw_map);
 }
@@ -391,7 +378,8 @@ extern int lllp_distribution(launch_tasks_request_msg_t *req, uint32_t node_id,
 	if (only_one_thread_per_core)
 		req->cpu_bind_type |= CPU_BIND_ONE_THREAD_PER_CORE;
 
-	if (req->cpu_bind_type & bind_mode) {
+	if ((req->cpu_bind_type & bind_mode) &&
+	    (req->step_id.step_id != SLURM_INTERACTIVE_STEP)) {
 		/* Explicit step binding specified by user */
 		char *avail_mask = _alloc_mask(req,
 					       &whole_nodes,  &whole_sockets,
@@ -530,7 +518,8 @@ extern int lllp_distribution(launch_tasks_request_msg_t *req, uint32_t node_id,
 	case SLURM_DIST_BLOCK:
 	case SLURM_DIST_CYCLIC:
 	case SLURM_DIST_UNKNOWN:
-		if (slurm_conf.select_type_param & CR_CORE_DEFAULT_DIST_BLOCK) {
+		if (slurm_conf.select_type_param &
+		    SELECT_CORE_DEFAULT_DIST_BLOCK) {
 			debug2("JobId=%u will use lllp_block because of SelectTypeParameters",
 			       req->step_id.job_id);
 			rc = _task_layout_lllp_block(req, node_id, &masks);
@@ -781,8 +770,8 @@ static bitstr_t *_get_avail_map(slurm_cred_t *cred, uint16_t *hw_sockets,
 	       sockets, cores, *hw_sockets, *hw_cores, *hw_threads);
 
 	num_cores = MIN((sockets * cores), ((*hw_sockets)*(*hw_cores)));
-	req_map = (bitstr_t *) bit_alloc(num_cores);
-	hw_map  = (bitstr_t *) bit_alloc(conf->block_map_size);
+	req_map = bit_alloc(num_cores);
+	hw_map = bit_alloc(conf->block_map_size);
 
 	/* Transfer core_bitmap data to local req_map.
 	 * The MOD function handles the case where fewer processes
@@ -1025,11 +1014,11 @@ static int _task_layout_lllp_cyclic(launch_tasks_request_msg_t *req,
 	}
 
 	pu_per_core = hw_threads;
-	core_tasks = xmalloc(sizeof(int) * hw_sockets * hw_cores);
-	core_threads = xmalloc(sizeof(int) * hw_sockets * hw_cores);
-	socket_last_pu = xmalloc(hw_sockets * sizeof(int));
+	core_tasks = xcalloc(hw_sockets * hw_cores, sizeof(int));
+	core_threads = xcalloc(hw_sockets * hw_cores, sizeof(int));
+	socket_last_pu = xcalloc(hw_sockets, sizeof(int));
 
-	*masks_p = xmalloc(max_tasks * sizeof(bitstr_t*));
+	*masks_p = xcalloc(max_tasks, sizeof(bitstr_t *));
 	masks = *masks_p;
 
 	size = bit_size(avail_map);
@@ -1239,14 +1228,14 @@ static int _task_layout_lllp_block(launch_tasks_request_msg_t *req,
 	}
 	size = bit_size(avail_map);
 
-	*masks_p = xmalloc(max_tasks * sizeof(bitstr_t*));
+	*masks_p = xcalloc(max_tasks, sizeof(bitstr_t *));
 	masks = *masks_p;
 
 	pu_per_core = hw_threads;
-	core_tasks = xmalloc(sizeof(int) * hw_sockets * hw_cores);
-	core_threads = xmalloc(sizeof(int) * hw_sockets * hw_cores);
+	core_tasks = xcalloc(hw_sockets * hw_cores, sizeof(int));
+	core_threads = xcalloc(hw_sockets * hw_cores, sizeof(int));
 	pu_per_socket = hw_cores * hw_threads;
-	socket_tasks = xmalloc(sizeof(int) * hw_sockets);
+	socket_tasks = xcalloc(hw_sockets, sizeof(int));
 
 	/* block distribution with oversubsciption */
 	c = 0;
@@ -1346,8 +1335,7 @@ static bitstr_t *_lllp_map_abstract_mask(bitstr_t *bitmask)
 {
     	int i, bit;
 	int num_bits = bit_size(bitmask);
-	bitstr_t *newmask = NULL;
-	newmask = (bitstr_t *) bit_alloc(num_bits);
+	bitstr_t *newmask = bit_alloc(num_bits);
 
 	/* remap to physical machine */
 	for (i = 0; i < num_bits; i++) {

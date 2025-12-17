@@ -46,48 +46,19 @@
 #include "src/slurmd/slurmstepd/slurmstepd_job.h"
 #include "kill_tree.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobcomp" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobcomp/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-const char plugin_name[]      = "Process tracking via linux /proc";
-const char plugin_type[]      = "proctrack/linuxproc";
+/* Required Slurm plugin symbols: */
+const char plugin_name[] = "Process tracking via linux /proc";
+const char plugin_type[] = "proctrack/linuxproc";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
-
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
-extern int init ( void )
+extern int init(void)
 {
 	return SLURM_SUCCESS;
 }
 
-extern int fini ( void )
+extern void fini(void)
 {
-	return SLURM_SUCCESS;
+	return;
 }
 
 /*
@@ -139,6 +110,12 @@ proctrack_p_wait(uint64_t cont_id)
 	}
 
 	return proctrack_p_destroy(cont_id);
+}
+
+extern int proctrack_p_wait_for_any_task(int *status, bool block,
+					 struct rusage *rusage)
+{
+	return ESLURM_NOT_SUPPORTED;
 }
 
 extern int

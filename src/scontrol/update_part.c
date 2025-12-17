@@ -465,6 +465,9 @@ scontrol_parse_part_options (int argc, char **argv, int *update_cnt_ptr,
 		else if (!xstrncasecmp(tag, "JobDefaults", MAX(taglen, 4))) {
 			part_msg_ptr->job_defaults_str = val;
 			(*update_cnt_ptr)++;
+		} else if (!xstrncasecmp(tag, "Topology", MAX(taglen, 4))) {
+			part_msg_ptr->topology_name = val;
+			(*update_cnt_ptr)++;
 		}
 		else if (!xstrncasecmp(tag, "TresBillingWeights",
 				       MAX(taglen, 1))) {
@@ -517,7 +520,7 @@ scontrol_update_part (int argc, char **argv)
 
 	if (slurm_update_partition(&part_msg)) {
 		exit_code = 1;
-		return slurm_get_errno ();
+		return errno;
 	} else
 		return SLURM_SUCCESS;
 }
@@ -563,7 +566,7 @@ scontrol_create_part (int argc, char **argv)
 	if (slurm_create_partition(&part_msg)) {
 		exit_code = 1;
 		slurm_perror("Error creating the partition");
-		return slurm_get_errno ();
+		return errno;
 	} else
 		return SLURM_SUCCESS;
 }

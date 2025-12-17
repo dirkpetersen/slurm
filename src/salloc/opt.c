@@ -190,6 +190,7 @@ env_vars_t env_vars[] = {
   { "SALLOC_CLUSTER_CONSTRAINT", LONG_OPT_CLUSTER_CONSTRAINT },
   { "SALLOC_CLUSTERS", 'M' },
   { "SLURM_CLUSTERS", 'M' },
+  { "SALLOC_CONSOLIDATE_SEGMENTS", LONG_OPT_CONSOLIDATE_SEGMENTS },
   { "SALLOC_CONTAINER", LONG_OPT_CONTAINER },
   { "SALLOC_CONTAINER_ID", LONG_OPT_CONTAINER_ID },
   { "SALLOC_CONSTRAINT", 'C' },
@@ -225,8 +226,10 @@ env_vars_t env_vars[] = {
   { "SALLOC_QOS", 'q' },
   { "SALLOC_REQ_SWITCH", LONG_OPT_SWITCH_REQ },
   { "SALLOC_RESERVATION", LONG_OPT_RESERVATION },
+  { "SALLOC_SEGMENT_SIZE", LONG_OPT_SEGMENT_SIZE },
   { "SALLOC_SIGNAL", LONG_OPT_SIGNAL },
   { "SALLOC_SPREAD_JOB", LONG_OPT_SPREAD_JOB },
+  { "SALLOC_SPREAD_SEGMENTS", LONG_OPT_SPREAD_SEGMENTS },
   { "SALLOC_THREAD_SPEC", LONG_OPT_THREAD_SPEC },
   { "SALLOC_THREADS_PER_CORE", LONG_OPT_THREADSPERCORE },
   { "SALLOC_TIMELIMIT", 't' },
@@ -446,7 +449,7 @@ static bool _opt_verify(void)
 	if (opt.exclude && !_valid_node_list(&opt.exclude))
 		exit(error_exit);
 
-	if (opt.nodelist && !opt.nodes_set) {
+	if (opt.nodelist && !opt.nodes_set && !xstrchr(opt.nodelist, '{')) {
 		hl = hostlist_create(opt.nodelist);
 		if (!hl)
 			fatal("Invalid node list specified");
@@ -458,6 +461,10 @@ static bool _opt_verify(void)
 
 	if (opt.cpus_set && (opt.pn_min_cpus < opt.cpus_per_task))
 		opt.pn_min_cpus = opt.cpus_per_task;
+
+	/* Set the env var so that the spawned srun can set it */
+	if (opt.oom_kill_step != NO_VAL16 && !getenv("SLURM_OOM_KILL_STEP"))
+		setenvf(NULL, "SLURM_OOM_KILL_STEP", "%u", opt.oom_kill_step);
 
 	if ((saopt.no_shell == false) && (opt.argc == 0))
 		_salloc_default_command(&opt.argc, &opt.argv);
@@ -557,7 +564,8 @@ static bool _opt_verify(void)
 	/* set up the proc and node counts based on the arbitrary list
 	   of nodes */
 	if (((opt.distribution & SLURM_DIST_STATE_BASE) == SLURM_DIST_ARBITRARY)
-	    && (!opt.nodes_set || !opt.ntasks_set)) {
+	    && (!opt.nodes_set || !opt.ntasks_set)
+	    && !xstrchr(opt.nodelist, '{')) {
 		FREE_NULL_HOSTLIST(hl);
 		hl = hostlist_create(opt.nodelist);
 		if (!hl)
@@ -589,10 +597,6 @@ static bool _opt_verify(void)
 			setenvf(NULL, "SLURM_MEM_BIND", "%s", tmp);
 		}
 		xfree(tmp);
-	}
-	if (opt.mem_bind_type && (getenv("SLURM_MEM_BIND_SORT") == NULL) &&
-	    (opt.mem_bind_type & MEM_BIND_SORT)) {
-		setenvf(NULL, "SLURM_MEM_BIND_SORT", "sort");
 	}
 
 	if (opt.mem_bind_type && (getenv("SLURM_MEM_BIND_VERBOSE") == NULL)) {
@@ -673,7 +677,7 @@ extern char *spank_get_job_env(const char *name)
 
 	if ((name == NULL) || (name[0] == '\0') ||
 	    (strchr(name, (int)'=') != NULL)) {
-		slurm_seterrno(EINVAL);
+		errno = EINVAL;
 		return NULL;
 	}
 
@@ -699,7 +703,7 @@ extern int   spank_set_job_env(const char *name, const char *value,
 
 	if ((name == NULL) || (name[0] == '\0') ||
 	    (strchr(name, (int)'=') != NULL)) {
-		slurm_seterrno(EINVAL);
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -733,7 +737,7 @@ extern int   spank_unset_job_env(const char *name)
 
 	if ((name == NULL) || (name[0] == '\0') ||
 	    (strchr(name, (int)'=') != NULL)) {
-		slurm_seterrno(EINVAL);
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -779,6 +783,7 @@ static void _usage(void)
 "              [--account=name] [--dependency=type:jobid[+time]] [--comment=name]\n"
 "              [--mail-type=type] [--mail-user=user] [--nice[=value]]\n"
 "              [--bell] [--no-bell] [--kill-command[=signal]] [--spread-job]\n"
+"              [--spread-segments]\n"
 "              [--nodefile=file] [--nodelist=hosts] [--exclude=hosts]\n"
 "              [--network=type] [--mem-per-cpu=MB] [--qos=qos]\n"
 "              [--mem-bind=...] [--reservation=name] [--mcs-label=mcs]\n"
@@ -791,6 +796,7 @@ static void _usage(void)
 "              [--cpus-per-gpu=n] [--gpus=n] [--gpu-bind=...] [--gpu-freq=...]\n"
 "              [--gpus-per-node=n] [--gpus-per-socket=n] [--gpus-per-task=n]\n"
 "              [--mem-per-gpu=MB] [--tres-bind=...] [--tres-per-task=list]\n"
+"              [--oom-kill-step[=0|1]]\n"
 "              [command [args...]]\n");
 }
 
@@ -818,7 +824,7 @@ static void _help(void)
 "                              this deadline (start > (deadline - time[-min]))\n"
 "  -D, --chdir=path            change working directory\n"
 "      --get-user-env          used by Moab.  See srun man page.\n"
-"      --gres=list             required generic resources\n"
+"      --gres=list             required generic resources per node\n"
 "      --gres-flags=opts       flags related to GRES management\n"
 "  -H, --hold                  submit job in held state\n"
 "  -I, --immediate[=secs]      exit if resources not available in \"secs\"\n"
@@ -841,6 +847,7 @@ static void _help(void)
 "      --no-bell               do NOT ring the terminal bell\n"
 "      --ntasks-per-node=n     number of tasks to invoke on each node\n"
 "  -N, --nodes=N               number of nodes on which to run (N = min[-max])\n"
+"      --oom-kill-step[=0|1]   set the OOMKillStep behaviour\n"
 "  -O, --overcommit            overcommit resources\n"
 "      --power=flags           power management options\n"
 "      --priority=value        set the priority of the job to value\n"
@@ -854,6 +861,7 @@ static void _help(void)
 "  -s, --oversubscribe         oversubscribe resources with other jobs\n"
 "      --signal=[R:]num[@time] send signal when time limit within time seconds\n"
 "      --spread-job            spread job across as many nodes as possible\n"
+"      --spread-segments       spread job segments across separate base blocks\n"
 "      --switches=max-switches{@max-time-to-wait}\n"
 "                              Optimum switches and max time to wait for optimum\n"
 "  -S, --core-spec=cores       count of reserved cores\n"
@@ -898,7 +906,7 @@ static void _help(void)
 "      --sockets-per-node=S    number of sockets per node to allocate\n"
 "      --cores-per-socket=C    number of cores per socket to allocate\n"
 "      --threads-per-core=T    number of threads per core to allocate\n"
-"  -B  --extra-node-info=S[:C[:T]]  combine request of sockets per node,\n"
+"  -B, --extra-node-info=S[:C[:T]]  combine request of sockets per node,\n"
 "                              cores per socket and threads per core.\n"
 "                              Specify an asterisk (*) as a placeholder,\n"
 "                              a minimum value, or a min-max range.\n"

@@ -40,27 +40,35 @@
 
 #include "src/common/xstring.h"
 
-static void _topo_add_dist(uint32_t *dist, int inx)
+static void _topo_add_dist(uint32_t *dist, int inx, tree_context_t *ctx)
 {
-	for (int i = 0; i < switch_record_cnt; i++) {
-		if (switch_record_table[inx].switches_dist[i] == INFINITE ||
+	for (int i = 0; i < ctx->switch_count; i++) {
+		if (ctx->switch_table[inx].switches_dist[i] == INFINITE ||
 		    dist[i] == INFINITE) {
 			dist[i] = INFINITE;
 		} else {
-			dist[i] += switch_record_table[inx].switches_dist[i];
+			dist[i] += ctx->switch_table[inx].switches_dist[i];
 		}
 	}
 }
 
+/*
+ * returns 1 if switch "i" is better fit
+ * returns -1 if switch "j" is better fit
+ * returns 0 if there is no better fit
+ */
 static int _topo_compare_switches(int i, int j, int rem_nodes,
 				  int *switch_node_cnt, int rem_cpus,
-				  uint32_t *switch_cpu_cnt)
+				  uint32_t *switch_cpu_cnt, bool *i_fit_out,
+				  tree_context_t *ctx)
 {
 	while (1) {
 		bool i_fit = ((switch_node_cnt[i] >= rem_nodes) &&
-			      (switch_cpu_cnt[i] >= rem_cpus));
+			      ((int) switch_cpu_cnt[i] >= rem_cpus));
 		bool j_fit = ((switch_node_cnt[j] >= rem_nodes) &&
-			      (switch_cpu_cnt[j] >= rem_cpus));
+			      ((int) switch_cpu_cnt[j] >= rem_cpus));
+		*i_fit_out = i_fit;
+
 		if (i_fit && j_fit) {
 			if (switch_node_cnt[i] < switch_node_cnt[j])
 				return 1;
@@ -73,12 +81,12 @@ static int _topo_compare_switches(int i, int j, int rem_nodes,
 			return -1;
 		}
 
-		if (((switch_record_table[i].parent != i) ||
-		     (switch_record_table[j].parent != j)) &&
-		    (switch_record_table[i].parent !=
-		     switch_record_table[j].parent)) {
-			i = switch_record_table[i].parent;
-			j = switch_record_table[j].parent;
+		if (((ctx->switch_table[i].parent != i) ||
+		     (ctx->switch_table[j].parent != j)) &&
+		    (ctx->switch_table[i].parent !=
+		     ctx->switch_table[j].parent)) {
+			i = ctx->switch_table[i].parent;
+			j = ctx->switch_table[j].parent;
 			continue;
 		}
 
@@ -89,9 +97,9 @@ static int _topo_compare_switches(int i, int j, int rem_nodes,
 		return 1;
 	if (switch_node_cnt[i] < switch_node_cnt[j])
 		return -1;
-	if (switch_record_table[i].level < switch_record_table[j].level)
+	if (ctx->switch_table[i].level < ctx->switch_table[j].level)
 		return 1;
-	if (switch_record_table[i].level > switch_record_table[j].level)
+	if (ctx->switch_table[i].level > ctx->switch_table[j].level)
 		return -1;
 	return 0;
 
@@ -99,9 +107,11 @@ static int _topo_compare_switches(int i, int j, int rem_nodes,
 
 static void _topo_choose_best_switch(uint32_t *dist, int *switch_node_cnt,
 				     int rem_nodes, uint32_t *switch_cpu_cnt,
-				     int rem_cpus, int i, int *best_switch)
+				     int rem_cpus, int i, int *best_switch,
+				     tree_context_t *ctx)
 {
 	int tcs = 0;
+	bool i_fit = false;
 
 	if (*best_switch == -1 || dist[i] == INFINITE || !switch_node_cnt[i]) {
 		/*
@@ -113,8 +123,9 @@ static void _topo_choose_best_switch(uint32_t *dist, int *switch_node_cnt,
 	}
 
 	tcs = _topo_compare_switches(i, *best_switch, rem_nodes,
-				     switch_node_cnt, rem_cpus, switch_cpu_cnt);
-	if (((dist[i] < dist[*best_switch]) && (tcs >= 0)) ||
+				     switch_node_cnt, rem_cpus, switch_cpu_cnt,
+				     &i_fit, ctx);
+	if (((dist[i] < dist[*best_switch]) && i_fit) ||
 	    ((dist[i] == dist[*best_switch]) && (tcs > 0))) {
 		/*
 		 * If closer and fit request OR
@@ -130,19 +141,18 @@ static void _topo_choose_best_switch(uint32_t *dist, int *switch_node_cnt,
  */
 static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 {
-	List      *switch_gres = NULL;		/* available GRES on switch */
+	list_t **switch_gres = NULL;		/* available GRES on switch */
 	bitstr_t **switch_node_bitmap = NULL;	/* nodes on this switch */
 	int       *switch_node_cnt = NULL;	/* total nodes on switch */
 	int       *switch_required = NULL;	/* set if has required node */
-	bitstr_t  *avail_nodes_bitmap = NULL;	/* nodes on any switch */
 	bitstr_t  *req_nodes_bitmap   = NULL;	/* required node bitmap */
 	bitstr_t  *req2_nodes_bitmap  = NULL;	/* required+lowest prio nodes */
 	bitstr_t  *best_nodes_bitmap  = NULL;	/* required+low prio nodes */
 	int i, j, rc = SLURM_SUCCESS;
 	int best_cpu_cnt = 0, best_node_cnt = 0, req_node_cnt = 0;
-	List best_gres = NULL;
+	list_t *best_gres = NULL;
 	switch_record_t *switch_ptr;
-	List node_weight_list = NULL;
+	list_t *node_weight_list = NULL;
 	topo_weight_info_t *nw = NULL;
 	list_itr_t *iter;
 	node_record_t *node_ptr;
@@ -161,6 +171,7 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 	uint32_t min_nodes = topo_eval->min_nodes;
 	uint32_t req_nodes = topo_eval->req_nodes;
 	uint64_t maxtasks;
+	tree_context_t *ctx = topo_eval->tctx->plugin_ctx;
 
 	topo_eval->avail_cpus = 0;
 
@@ -194,7 +205,7 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 				   topo_eval->node_map)) {
 			info("%pJ requires nodes which are not currently available",
 			      job_ptr);
-			rc = SLURM_ERROR;
+			rc = ESLURM_BREAK_EVAL;
 			goto fini;
 		}
 
@@ -202,14 +213,14 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 		if (req_node_cnt == 0) {
 			info("%pJ required node list has no nodes",
 			      job_ptr);
-			rc = SLURM_ERROR;
+			rc = ESLURM_BREAK_EVAL;
 			goto fini;
 		}
 		if (req_node_cnt > topo_eval->max_nodes) {
 			info("%pJ requires more nodes than currently available (%u>%u)",
 			      job_ptr, req_node_cnt,
 			      topo_eval->max_nodes);
-			rc = SLURM_ERROR;
+			rc = ESLURM_BREAK_EVAL;
 			goto fini;
 		}
 		req_nodes_bitmap = bit_copy(job_ptr->details->req_node_bitmap);
@@ -222,7 +233,7 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 	if (!bit_set_count(topo_eval->node_map)) {
 		debug("%pJ node_map is empty",
 		      job_ptr);
-		rc = SLURM_ERROR;
+		rc = ESLURM_BREAK_EVAL;
 		goto fini;
 	}
 	avail_cpu_per_node = xcalloc(node_record_count, sizeof(uint16_t));
@@ -239,7 +250,7 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 			if (topo_eval->avail_cpus == 0) {
 				log_flag(SELECT_TYPE, "%pJ insufficient resources on required node",
 				       job_ptr);
-				rc = SLURM_ERROR;
+				rc = ESLURM_BREAK_EVAL;
 				goto fini;
 			}
 			avail_cpu_per_node[i] = topo_eval->avail_cpus;
@@ -273,7 +284,7 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 			goto fini;
 		}
 		if (topo_eval->max_nodes <= 0) {
-			rc = SLURM_ERROR;
+			rc = ESLURM_BREAK_EVAL;
 			log_flag(SELECT_TYPE, "%pJ requires nodes exceed maximum node limit",
 				 job_ptr);
 			goto fini;
@@ -291,25 +302,25 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 	 * Identify the highest level switch to be used.
 	 * Note that nodes can be on multiple non-overlapping switches.
 	 */
-	switch_gres        = xcalloc(switch_record_cnt, sizeof(List));
-	switch_node_bitmap = xcalloc(switch_record_cnt, sizeof(bitstr_t *));
-	switch_node_cnt    = xcalloc(switch_record_cnt, sizeof(int));
-	switch_required    = xcalloc(switch_record_cnt, sizeof(int));
+	switch_gres = xcalloc(ctx->switch_count, sizeof(list_t *));
+	switch_node_bitmap = xcalloc(ctx->switch_count, sizeof(bitstr_t *));
+	switch_node_cnt = xcalloc(ctx->switch_count, sizeof(int));
+	switch_required = xcalloc(ctx->switch_count, sizeof(int));
 
 	if (!req_nodes_bitmap)
 		nw = list_peek(node_weight_list);
-	for (i = 0, switch_ptr = switch_record_table; i < switch_record_cnt;
+	for (i = 0, switch_ptr = ctx->switch_table; i < ctx->switch_count;
 	     i++, switch_ptr++) {
 		switch_node_bitmap[i] = bit_copy(switch_ptr->node_bitmap);
 		if (req_nodes_bitmap &&
 		    bit_overlap_any(req_nodes_bitmap, switch_node_bitmap[i])) {
 			switch_required[i] = 1;
-			if (switch_record_table[i].level == 0) {
+			if (ctx->switch_table[i].level == 0) {
 				leaf_switch_count++;
 			}
 			if ((top_switch_inx == -1) ||
-			    (switch_record_table[i].level >
-			     switch_record_table[top_switch_inx].level)) {
+			    (ctx->switch_table[i].level >
+			     ctx->switch_table[top_switch_inx].level)) {
 				top_switch_inx = i;
 			}
 		}
@@ -318,8 +329,8 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 				     eval_nodes_topo_node_find,
 				     switch_node_bitmap[i]))) {
 			if ((top_switch_inx == -1) ||
-			    (switch_record_table[i].level >
-			     switch_record_table[top_switch_inx].level)) {
+			    (ctx->switch_table[i].level >
+			     ctx->switch_table[top_switch_inx].level)) {
 				top_switch_inx = i;
 			}
 		}
@@ -333,15 +344,15 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 	if (top_switch_inx == -1) {
 		error("%pJ unable to identify top level switch",
 		       job_ptr);
-		rc = SLURM_ERROR;
+		rc = ESLURM_REQUESTED_TOPO_CONFIG_UNAVAILABLE;
 		goto fini;
 	}
 
-	/* Check that all specificly required nodes are on shared network */
+	/* Check that all specifically required nodes are on shared network */
 	if (req_nodes_bitmap &&
 	    !bit_super_set(req_nodes_bitmap,
 			   switch_node_bitmap[top_switch_inx])) {
-		rc = SLURM_ERROR;
+		rc = ESLURM_REQUESTED_TOPO_CONFIG_UNAVAILABLE;
 		info("%pJ requires nodes that do not have shared network",
 		     job_ptr);
 		goto fini;
@@ -351,7 +362,7 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 	 * Remove nodes from consideration that can not be reached from this
 	 * top level switch
 	 */
-	for (i = 0; i < switch_record_cnt; i++) {
+	for (i = 0; i < ctx->switch_count; i++) {
 		if (top_switch_inx != i) {
 			  bit_and(switch_node_bitmap[i],
 				  switch_node_bitmap[top_switch_inx]);
@@ -433,7 +444,7 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 	if (!sufficient) {
 		log_flag(SELECT_TYPE, "insufficient resources currently available for %pJ",
 		      job_ptr);
-		rc = SLURM_ERROR;
+		rc = ESLURM_BREAK_EVAL;
 		goto fini;
 	}
 
@@ -463,21 +474,21 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 			rem_max_cpus -= topo_eval->avail_cpus;
 		}
 
-		for (i = 0, switch_ptr = switch_record_table;
-		     i < switch_record_cnt; i++, switch_ptr++) {
+		for (i = 0, switch_ptr = ctx->switch_table;
+		     i < ctx->switch_count; i++, switch_ptr++) {
 			if (switch_required[i])
 				continue;
 			if (bit_overlap_any(req2_nodes_bitmap,
 					    switch_node_bitmap[i])) {
 				switch_required[i] = 1;
-				if (switch_record_table[i].level == 0) {
+				if (ctx->switch_table[i].level == 0) {
 					leaf_switch_count++;
 				}
 			}
 		}
 		bit_or(topo_eval->node_map, req2_nodes_bitmap);
 		if (topo_eval->max_nodes <= 0) {
-			rc = SLURM_ERROR;
+			rc = ESLURM_RETRY_EVAL_HINT;
 			log_flag(SELECT_TYPE, "%pJ reached maximum node limit",
 				 job_ptr);
 			goto fini;
@@ -496,40 +507,30 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 
 	/*
 	 * Construct a set of switch array entries.
-	 * Use the same indexes as switch_record_table in slurmctld.
+	 * Use the same indexes as ctx->switch_table in slurmctld.
 	 */
 	bit_or(best_nodes_bitmap, topo_eval->node_map);
-	avail_nodes_bitmap = bit_alloc(node_record_count);
-	for (i = 0, switch_ptr = switch_record_table; i < switch_record_cnt;
+	for (i = 0, switch_ptr = ctx->switch_table; i < ctx->switch_count;
 	     i++, switch_ptr++) {
 		bit_and(switch_node_bitmap[i], best_nodes_bitmap);
-		bit_or(avail_nodes_bitmap, switch_node_bitmap[i]);
 		switch_node_cnt[i] = bit_set_count(switch_node_bitmap[i]);
 	}
 
 	if (slurm_conf.debug_flags & DEBUG_FLAG_SELECT_TYPE) {
-		for (i = 0; i < switch_record_cnt; i++) {
+		for (i = 0; i < ctx->switch_count; i++) {
 			char *node_names = NULL;
 			if (switch_node_cnt[i]) {
 				node_names =
 					bitmap2node_name(switch_node_bitmap[i]);
 			}
 			info("switch=%s level=%d nodes=%u:%s required:%u speed:%u",
-			     switch_record_table[i].name,
-			     switch_record_table[i].level,
+			     ctx->switch_table[i].name,
+			     ctx->switch_table[i].level,
 			     switch_node_cnt[i], node_names,
 			     switch_required[i],
-			     switch_record_table[i].link_speed);
+			     ctx->switch_table[i].link_speed);
 			xfree(node_names);
 		}
-	}
-
-	if (req_nodes_bitmap &&
-	    (!bit_super_set(req_nodes_bitmap, avail_nodes_bitmap))) {
-		info("%pJ requires nodes not available on any switch",
-		     job_ptr);
-		rc = SLURM_ERROR;
-		goto fini;
 	}
 
 	/*
@@ -538,8 +539,8 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 	 */
 	if (leaf_switch_count == 0) {
 		int best_switch_inx = -1;
-		for (i = 0; i < switch_record_cnt; i++) {
-			if (switch_record_table[i].level != 0)
+		for (i = 0; i < ctx->switch_count; i++) {
+			if (ctx->switch_table[i].level != 0)
 				continue;
 			if ((best_switch_inx == -1) ||
 			    (switch_node_cnt[i] >
@@ -560,9 +561,9 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 		best_cpu_cnt = 0;
 		best_node_cnt = 0;
 		FREE_NULL_LIST(best_gres);
-		for (i = 0; i < switch_record_cnt; i++) {
+		for (i = 0; i < ctx->switch_count; i++) {
 			if (!switch_required[i] || !switch_node_bitmap[i] ||
-			    (switch_record_table[i].level != 0))
+			    (ctx->switch_table[i].level != 0))
 				continue;
 			for (j = 0; next_node_bitmap(switch_node_bitmap[i], &j);
 			     j++) {
@@ -589,7 +590,7 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 			sufficient = gres_sched_sufficient(
 				job_ptr->gres_list_req, best_gres);
 		}
-		if (sufficient && (i < switch_record_cnt)) {
+		if (sufficient && (i < ctx->switch_count)) {
 			/* Complete request using this one leaf switch */
 			for (j = 0; next_node_bitmap(switch_node_bitmap[i], &j);
 			     j++) {
@@ -619,7 +620,7 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 					goto fini;
 				}
 				if (topo_eval->max_nodes <= 0) {
-					rc = SLURM_ERROR;
+					rc = ESLURM_RETRY_EVAL_HINT;
 					log_flag(SELECT_TYPE, "%pJ reached maximum node limit",
 						 job_ptr);
 					goto fini;
@@ -637,9 +638,9 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 		if (prev_rem_nodes == rem_nodes)
 			break;	/* Stalled */
 		prev_rem_nodes = rem_nodes;
-		for (i = 0; i < switch_record_cnt; i++) {
+		for (i = 0; i < ctx->switch_count; i++) {
 			if (!switch_node_bitmap[i] ||
-			    (switch_record_table[i].level != 0))
+			    (ctx->switch_table[i].level != 0))
 				continue;
 			for (j = 0; next_node_bitmap(switch_node_bitmap[i], &j);
 			     j++) {
@@ -668,7 +669,7 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 					goto fini;
 				}
 				if (topo_eval->max_nodes <= 0) {
-					rc = SLURM_ERROR;
+					rc = ESLURM_RETRY_EVAL_HINT;
 					log_flag(SELECT_TYPE, "%pJ reached maximum node limit",
 						 job_ptr);
 					goto fini;
@@ -683,7 +684,7 @@ static int _eval_nodes_dfly(topology_eval_t *topo_eval)
 		rc = SLURM_SUCCESS;
 		goto fini;
 	}
-	rc = SLURM_ERROR;
+	rc = ESLURM_RETRY_EVAL_HINT;
 
 fini:
 	if (rc == SLURM_SUCCESS)
@@ -695,9 +696,9 @@ fini:
 		leaf_switch_count = 0;
 
 		/* count up leaf switches */
-		for (i = 0, switch_ptr = switch_record_table;
-		     i < switch_record_cnt; i++, switch_ptr++) {
-			if (switch_record_table[i].level != 0)
+		for (i = 0, switch_ptr = ctx->switch_table;
+		     i < ctx->switch_count; i++, switch_ptr++) {
+			if (ctx->switch_table[i].level != 0)
 				continue;
 			if (bit_overlap_any(switch_node_bitmap[i], topo_eval->node_map))
 				leaf_switch_count++;
@@ -722,20 +723,35 @@ fini:
 
 	FREE_NULL_LIST(best_gres);
 	FREE_NULL_LIST(node_weight_list);
-	FREE_NULL_BITMAP(avail_nodes_bitmap);
 	FREE_NULL_BITMAP(req_nodes_bitmap);
 	FREE_NULL_BITMAP(req2_nodes_bitmap);
 	FREE_NULL_BITMAP(best_nodes_bitmap);
 	xfree(avail_cpu_per_node);
 	xfree(switch_gres);
 	if (switch_node_bitmap) {
-		for (i = 0; i < switch_record_cnt; i++)
+		for (i = 0; i < ctx->switch_count; i++)
 			FREE_NULL_BITMAP(switch_node_bitmap[i]);
 		xfree(switch_node_bitmap);
 	}
 	xfree(switch_node_cnt);
 	xfree(switch_required);
 	return rc;
+}
+
+static void _decrement_node_cnt(int num_nodes_taken, int switch_index,
+				int *switch_node_cnt, tree_context_t *ctx)
+{
+	for (int i = switch_index; i >= 0; i = ctx->switch_table[i].parent) {
+		if (switch_node_cnt[i] <= num_nodes_taken) {
+			switch_node_cnt[i] = 0;
+		} else {
+			switch_node_cnt[i] -= num_nodes_taken;
+		}
+
+		/* end once we've reached root switch */
+		if (ctx->switch_table[i].parent == SWITCH_NO_PARENT)
+			break;
+	}
 }
 
 /* Allocate resources to job using a minimal leaf switch count */
@@ -747,21 +763,20 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 	int       *switch_node_cnt = NULL;	/* total nodes on switch */
 	int       *switch_required = NULL;	/* set if has required node */
 	int *req_switch_required = NULL;
-	bitstr_t  *avail_nodes_bitmap = NULL;	/* nodes on any switch */
 	bitstr_t  *req_nodes_bitmap   = NULL;	/* required node bitmap */
 	bitstr_t  *req2_nodes_bitmap  = NULL;	/* required+lowest prio nodes */
 	bitstr_t  *best_nodes_bitmap  = NULL;	/* required+low prio nodes */
 	bitstr_t *start_node_map = NULL;
 	int i, j, rc = SLURM_SUCCESS;
 	int best_cpu_cnt, best_node_cnt, req_node_cnt = 0;
-	List best_gres = NULL;
+	list_t *best_gres = NULL;
 	switch_record_t *switch_ptr;
-	List node_weight_list = NULL;
+	list_t *node_weight_list = NULL;
 	topo_weight_info_t *nw = NULL;
 	list_itr_t *iter;
 	node_record_t *node_ptr;
-	int64_t rem_max_cpus, start_rem_max_cpus;
-	int rem_cpus, start_rem_cpus, rem_nodes; /* remaining resources desired */
+	int64_t rem_max_cpus, start_rem_max_cpus = 0;
+	int rem_cpus, start_rem_cpus = 0, rem_nodes; /* remaining resources desired */
 	int min_rem_nodes;	/* remaining resources desired */
 	job_record_t *job_ptr = topo_eval->job_ptr;
 	job_details_t *details_ptr = job_ptr->details;
@@ -777,6 +792,7 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 	uint32_t req_nodes = topo_eval->req_nodes;
 	uint32_t org_max_nodes = topo_eval->max_nodes;
 	uint64_t maxtasks;
+	tree_context_t *ctx = topo_eval->tctx->plugin_ctx;
 
 	topo_eval->avail_cpus = 0;
 
@@ -805,7 +821,7 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 				   topo_eval->node_map)) {
 			info("%pJ requires nodes which are not currently available",
 			      job_ptr);
-			rc = SLURM_ERROR;
+			rc = ESLURM_BREAK_EVAL;
 			goto fini;
 		}
 
@@ -813,14 +829,14 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 		if (req_node_cnt == 0) {
 			info("%pJ required node list has no nodes",
 			      job_ptr);
-			rc = SLURM_ERROR;
+			rc = ESLURM_BREAK_EVAL;
 			goto fini;
 		}
 		if (req_node_cnt > topo_eval->max_nodes) {
 			info("%pJ requires more nodes than currently available (%u>%u)",
 			      job_ptr, req_node_cnt,
 			      topo_eval->max_nodes);
-			rc = SLURM_ERROR;
+			rc = ESLURM_BREAK_EVAL;
 			goto fini;
 		}
 		req_nodes_bitmap = job_ptr->details->req_node_bitmap;
@@ -833,7 +849,7 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 	if (!bit_set_count(topo_eval->node_map)) {
 		debug("%pJ node_map is empty",
 		      job_ptr);
-		rc = SLURM_ERROR;
+		rc = ESLURM_BREAK_EVAL;
 		goto fini;
 	}
 	avail_cpu_per_node = xcalloc(node_record_count, sizeof(uint16_t));
@@ -851,7 +867,7 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 			if (topo_eval->avail_cpus == 0) {
 				debug2("%pJ insufficient resources on required node",
 				       job_ptr);
-				rc = SLURM_ERROR;
+				rc = ESLURM_BREAK_EVAL;
 				goto fini;
 			}
 			avail_cpu_per_node[i] = topo_eval->avail_cpus;
@@ -885,14 +901,15 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 	 * Identify the highest level switch to be used.
 	 * Note that nodes can be on multiple non-overlapping switches.
 	 */
-	switch_cpu_cnt = xcalloc(switch_record_cnt, sizeof(uint32_t));
-	switch_node_bitmap = xcalloc(switch_record_cnt, sizeof(bitstr_t *));
-	start_switch_node_bitmap = xcalloc(switch_record_cnt, sizeof(bitstr_t *));
-	switch_node_cnt    = xcalloc(switch_record_cnt, sizeof(int));
-	switch_required    = xcalloc(switch_record_cnt, sizeof(int));
-	req_switch_required = xcalloc(switch_record_cnt, sizeof(int));
+	switch_cpu_cnt = xcalloc(ctx->switch_count, sizeof(uint32_t));
+	switch_node_bitmap = xcalloc(ctx->switch_count, sizeof(bitstr_t *));
+	start_switch_node_bitmap =
+		xcalloc(ctx->switch_count, sizeof(bitstr_t *));
+	switch_node_cnt = xcalloc(ctx->switch_count, sizeof(int));
+	switch_required = xcalloc(ctx->switch_count, sizeof(int));
+	req_switch_required = xcalloc(ctx->switch_count, sizeof(int));
 
-	for (i = 0, switch_ptr = switch_record_table; i < switch_record_cnt;
+	for (i = 0, switch_ptr = ctx->switch_table; i < ctx->switch_count;
 	     i++, switch_ptr++) {
 		uint32_t switch_cpus = 0;
 		switch_node_bitmap[i] = bit_copy(switch_ptr->node_bitmap);
@@ -911,8 +928,8 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 		    bit_overlap_any(req_nodes_bitmap, switch_node_bitmap[i])) {
 			switch_required[i] = 1;
 			if ((top_switch_inx == -1) ||
-			    (switch_record_table[i].level >
-			     switch_record_table[top_switch_inx].level)) {
+			    (ctx->switch_table[i].level >
+			     ctx->switch_table[top_switch_inx].level)) {
 				top_switch_inx = i;
 			}
 		}
@@ -925,8 +942,8 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 					  eval_nodes_topo_node_find,
 				    switch_node_bitmap[i]))) {
 			if ((top_switch_inx == -1) ||
-			    ((switch_record_table[i].level >=
-			      switch_record_table[top_switch_inx].level) &&
+			    ((ctx->switch_table[i].level >=
+			      ctx->switch_table[top_switch_inx].level) &&
 			     (nw->weight <= top_switch_lowest_weight))) {
 				top_switch_inx = i;
 				top_switch_lowest_weight = nw->weight;
@@ -947,15 +964,15 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 	if (top_switch_inx == -1) {
 		log_flag(SELECT_TYPE, "%pJ unable to identify top level switch",
 			 job_ptr);
-		rc = SLURM_ERROR;
+		rc = ESLURM_REQUESTED_TOPO_CONFIG_UNAVAILABLE;
 		goto fini;
 	}
 
-	/* Check that all specificly required nodes are on shared network */
+	/* Check that all specifically required nodes are on shared network */
 	if (req_nodes_bitmap &&
 	    !bit_super_set(req_nodes_bitmap,
 			   switch_node_bitmap[top_switch_inx])) {
-		rc = SLURM_ERROR;
+		rc = ESLURM_REQUESTED_TOPO_CONFIG_UNAVAILABLE;
 		info("%pJ requires nodes that do not have shared network",
 		     job_ptr);
 		goto fini;
@@ -965,7 +982,7 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 	 * Remove nodes from consideration that can not be reached from this
 	 * top level switch.
 	 */
-	for (i = 0; i < switch_record_cnt; i++) {
+	for (i = 0; i < ctx->switch_count; i++) {
 		if (top_switch_inx != i) {
 			  bit_and(switch_node_bitmap[i],
 				  switch_node_bitmap[top_switch_inx]);
@@ -983,7 +1000,7 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 			goto fini;
 		}
 		if (topo_eval->max_nodes <= 0) {
-			rc = SLURM_ERROR;
+			rc = ESLURM_REQUESTED_TOPO_CONFIG_UNAVAILABLE;
 			log_flag(SELECT_TYPE, "%pJ requires nodes exceed maximum node limit",
 				 job_ptr);
 			goto fini;
@@ -992,8 +1009,8 @@ static int _eval_nodes_topo(topology_eval_t *topo_eval)
 
 	start_node_map = bit_copy(topo_eval->node_map);
 	memcpy(req_switch_required, switch_required,
-	       switch_record_cnt * sizeof(int));
-	for (i = 0; i < switch_record_cnt; i++)
+	       ctx->switch_count * sizeof(int));
+	for (i = 0; i < ctx->switch_count; i++)
 		start_switch_node_bitmap[i] = bit_copy(switch_node_bitmap[i]);
 
 try_again:
@@ -1089,7 +1106,9 @@ try_again:
 	if (!sufficient) {
 		log_flag(SELECT_TYPE, "insufficient resources currently available for %pJ",
 		      job_ptr);
-		rc = SLURM_ERROR;
+		bit_copybits(topo_eval->node_map,
+			     switch_node_bitmap[top_switch_inx]);
+		rc = ESLURM_RETRY_EVAL;
 		goto fini;
 	}
 
@@ -1119,8 +1138,8 @@ try_again:
 			rem_max_cpus -= topo_eval->avail_cpus;
 		}
 
-		for (i = 0, switch_ptr = switch_record_table;
-		     i < switch_record_cnt; i++, switch_ptr++) {
+		for (i = 0, switch_ptr = ctx->switch_table;
+		     i < ctx->switch_count; i++, switch_ptr++) {
 			if (switch_required[i])
 				continue;
 			if (bit_overlap_any(req2_nodes_bitmap,
@@ -1141,7 +1160,7 @@ try_again:
 			goto fini;
 		}
 		if (topo_eval->max_nodes <= 0) {
-			rc = SLURM_ERROR;
+			rc = ESLURM_RETRY_EVAL_HINT;
 			log_flag(SELECT_TYPE, "%pJ reached maximum node limit",
 				 job_ptr);
 			goto fini;
@@ -1150,39 +1169,38 @@ try_again:
 
 	/*
 	 * Construct a set of switch array entries.
-	 * Use the same indexes as switch_record_table in slurmctld.
+	 * Use the same indexes as ctx->switch_table in slurmctld.
 	 */
 	bit_or(best_nodes_bitmap, topo_eval->node_map);
-	avail_nodes_bitmap = bit_alloc(node_record_count);
-	for (i = 0, switch_ptr = switch_record_table; i < switch_record_cnt;
+	for (i = 0, switch_ptr = ctx->switch_table; i < ctx->switch_count;
 	     i++, switch_ptr++) {
 		bit_and(switch_node_bitmap[i], best_nodes_bitmap);
-		bit_or(avail_nodes_bitmap, switch_node_bitmap[i]);
 		switch_node_cnt[i] = bit_set_count(switch_node_bitmap[i]);
 	}
 
 	if (slurm_conf.debug_flags & DEBUG_FLAG_SELECT_TYPE) {
-		for (i = 0; i < switch_record_cnt; i++) {
+		for (i = 0; i < ctx->switch_count; i++) {
 			char *node_names = NULL;
 			if (switch_node_cnt[i]) {
 				node_names =
 					bitmap2node_name(switch_node_bitmap[i]);
 			}
 			info("switch=%s level=%d nodes=%u:%s required:%u speed:%u",
-			     switch_record_table[i].name,
-			     switch_record_table[i].level,
+			     ctx->switch_table[i].name,
+			     ctx->switch_table[i].level,
 			     switch_node_cnt[i], node_names,
 			     switch_required[i],
-			     switch_record_table[i].link_speed);
+			     ctx->switch_table[i].link_speed);
 			xfree(node_names);
 		}
 	}
 
 	/* Add additional resources for already required leaf switches */
 	if (req_nodes_bitmap || req2_nodes_bitmap) {
-		for (i = 0; i < switch_record_cnt; i++) {
+		int num_nodes_taken = 0;
+		for (i = 0; i < ctx->switch_count; i++) {
 			if (!switch_required[i] || !switch_node_bitmap[i] ||
-			    (switch_record_table[i].level != 0))
+			    (ctx->switch_table[i].level != 0))
 				continue;
 			for (j = 0; next_node_bitmap(switch_node_bitmap[i], &j);
 			     j++) {
@@ -1197,6 +1215,7 @@ try_again:
 					avail_cpu_per_node[j] = 0;
 					continue;
 				}
+				num_nodes_taken++;
 				rem_nodes--;
 				min_rem_nodes--;
 				topo_eval->max_nodes--;
@@ -1210,37 +1229,49 @@ try_again:
 					rc = SLURM_SUCCESS;
 					goto fini;
 				}
+
+				if (topo_eval->max_nodes <= 0) {
+					rc = ESLURM_RETRY_EVAL_HINT;
+					log_flag(SELECT_TYPE,
+						 "%pJ reached maximum node limit",
+						 job_ptr);
+					goto fini;
+				}
 			}
+
+			_decrement_node_cnt(num_nodes_taken, i, switch_node_cnt,
+					    ctx);
 		}
 	}
 
-	switches_dist = xcalloc(switch_record_cnt, sizeof(uint32_t));
+	switches_dist = xcalloc(ctx->switch_count, sizeof(uint32_t));
 
-	for (i = 0; i < switch_record_cnt; i++) {
+	for (i = 0; i < ctx->switch_count; i++) {
 		if (switch_required[i])
-			_topo_add_dist(switches_dist, i);
+			_topo_add_dist(switches_dist, i, ctx);
 	}
 	/* Add additional resources as required from additional leaf switches */
 	prev_rem_nodes = rem_nodes + 1;
 	while (1) {
 		int best_switch_inx = -1;
+
 		if (prev_rem_nodes == rem_nodes)
 			break; 	/* Stalled */
 		prev_rem_nodes = rem_nodes;
 
-		for (i = 0; i < switch_record_cnt; i++) {
+		for (i = 0; i < ctx->switch_count; i++) {
 			if (switch_required[i] || !switch_node_bitmap[i] ||
-			    (switch_record_table[i].level != 0))
+			    (ctx->switch_table[i].level != 0))
 				continue;
 			_topo_choose_best_switch(switches_dist, switch_node_cnt,
 						 rem_nodes, switch_cpu_cnt,
-						 rem_cpus, i, &best_switch_inx);
-
+						 rem_cpus, i, &best_switch_inx,
+						 ctx);
 		}
 		if (best_switch_inx == -1)
 			break;
 
-		_topo_add_dist(switches_dist, best_switch_inx);
+		_topo_add_dist(switches_dist, best_switch_inx, ctx);
 		/*
 		 * NOTE: Ideally we would add nodes in order of resource
 		 * availability rather than in order of bitmap position, but
@@ -1274,7 +1305,17 @@ try_again:
 				rc = SLURM_SUCCESS;
 				goto fini;
 			}
+
+			if (topo_eval->max_nodes <= 0) {
+				rc = ESLURM_RETRY_EVAL_HINT;
+				log_flag(SELECT_TYPE,
+					 "%pJ reached maximum node limit",
+					 job_ptr);
+				goto fini;
+			}
 		}
+		_decrement_node_cnt(switch_node_cnt[best_switch_inx],
+				    best_switch_inx, switch_node_cnt, ctx);
 		switch_node_cnt[best_switch_inx] = 0;	/* Used all */
 	}
 	if ((min_rem_nodes <= 0) && (rem_cpus <= 0) &&
@@ -1283,7 +1324,7 @@ try_again:
 		rc = SLURM_SUCCESS;
 		goto fini;
 	}
-	rc = SLURM_ERROR;
+	rc = ESLURM_RETRY_EVAL_HINT;
 
 fini:
 	if (rc == SLURM_SUCCESS)
@@ -1293,9 +1334,9 @@ fini:
 		int leaf_switch_count = 0;
 
 		/* Count up leaf switches. */
-		for (i = 0, switch_ptr = switch_record_table;
-		     i < switch_record_cnt; i++, switch_ptr++) {
-			if (switch_record_table[i].level != 0)
+		for (i = 0, switch_ptr = ctx->switch_table;
+		     i < ctx->switch_count; i++, switch_ptr++) {
+			if (ctx->switch_table[i].level != 0)
 				continue;
 			if (bit_overlap_any(switch_node_bitmap[i], topo_eval->node_map))
 				leaf_switch_count++;
@@ -1323,14 +1364,13 @@ fini:
 				xfree(switches_dist);
 				bit_copybits(topo_eval->node_map, start_node_map);
 				memcpy(switch_required, req_switch_required,
-				       switch_record_cnt * sizeof(int));
+				       ctx->switch_count * sizeof(int));
 				memset(avail_cpu_per_node, 0,
 				       node_record_count * sizeof(uint16_t));
-				for (i = 0; i < switch_record_cnt; i++)
+				for (i = 0; i < ctx->switch_count; i++)
 					bit_copybits(
 						switch_node_bitmap[i],
 						start_switch_node_bitmap[i]);
-				FREE_NULL_BITMAP(avail_nodes_bitmap);
 				FREE_NULL_BITMAP(req2_nodes_bitmap);
 				FREE_NULL_BITMAP(best_nodes_bitmap);
 				FREE_NULL_LIST(best_gres);
@@ -1349,19 +1389,18 @@ fini:
 
 	FREE_NULL_LIST(best_gres);
 	FREE_NULL_LIST(node_weight_list);
-	FREE_NULL_BITMAP(avail_nodes_bitmap);
 	FREE_NULL_BITMAP(req2_nodes_bitmap);
 	FREE_NULL_BITMAP(best_nodes_bitmap);
 	FREE_NULL_BITMAP(start_node_map);
 	xfree(avail_cpu_per_node);
 	xfree(switch_cpu_cnt);
 	if (switch_node_bitmap) {
-		for (i = 0; i < switch_record_cnt; i++)
+		for (i = 0; i < ctx->switch_count; i++)
 			FREE_NULL_BITMAP(switch_node_bitmap[i]);
 		xfree(switch_node_bitmap);
 	}
 	if (start_switch_node_bitmap) {
-		for (i = 0; i < switch_record_cnt; i++)
+		for (i = 0; i < ctx->switch_count; i++)
 			FREE_NULL_BITMAP(start_switch_node_bitmap[i]);
 		xfree(start_switch_node_bitmap);
 	}
@@ -1390,8 +1429,8 @@ extern int eval_nodes_tree(topology_eval_t *topo_eval)
 		set = true;
 	}
 
-	xassert(switch_record_cnt);
-	xassert(switch_record_table);
+	xassert(((tree_context_t *) topo_eval->tctx->plugin_ctx)->switch_count);
+	xassert(((tree_context_t *) topo_eval->tctx->plugin_ctx)->switch_table);
 
 	if (!details_ptr->contiguous &&
 	    ((topo_optional == false) || topo_eval->job_ptr->req_switch)) {

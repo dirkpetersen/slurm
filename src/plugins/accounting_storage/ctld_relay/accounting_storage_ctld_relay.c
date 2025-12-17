@@ -45,11 +45,12 @@
 #include <sys/types.h>
 
 #include "slurm/slurm_errno.h"
-
 #include "src/common/slurm_xlator.h"
+
 #include "src/common/list.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/slurmdbd_defs.h"
+#include "src/common/threadpool.h"
 
 #include "src/interfaces/accounting_storage.h"
 
@@ -65,31 +66,7 @@ extern slurm_conf_t slurm_conf __attribute__((weak_import));
 slurm_conf_t slurm_conf;
 #endif
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobacct" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobacct/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Accounting storage CTLD Relay plugin";
 const char plugin_type[] = "accounting_storage/ctld_relay";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -101,6 +78,9 @@ char *assoc_month_table = NULL;
 char *cluster_day_table = NULL;
 char *cluster_hour_table = NULL;
 char *cluster_month_table = NULL;
+char *qos_day_table = NULL;
+char *qos_hour_table = NULL;
+char *qos_month_table = NULL;
 char *wckey_day_table = NULL;
 char *wckey_hour_table = NULL;
 char *wckey_month_table = NULL;
@@ -141,8 +121,17 @@ static void *_agent_thread(void *data)
 			persist_msg_t persist_msg = {0};
 
 			set_buf_offset(buffer, 0);
-			slurm_persist_msg_unpack(&persist_conn, &persist_msg,
-						 buffer);
+			if (slurm_persist_msg_unpack(&persist_conn,
+						     &persist_msg, buffer) !=
+			    SLURM_SUCCESS) {
+				/* This should never happen, we packed it */
+				error("%s: Failed to unpack persist msg, can't send '%s' to controller.",
+				      __func__,
+				      rpc_num2string(REQUEST_DBD_RELAY));
+				slurmdbd_free_msg(&persist_msg);
+				FREE_NULL_BUFFER(buffer);
+				continue;
+			}
 
 			slurm_msg_t_init(&msg);
 			msg.msg_type = REQUEST_DBD_RELAY;
@@ -172,11 +161,7 @@ static void _agent_append(buf_t *buffer)
 	slurm_cond_signal(&agent_cond);
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
-extern int init ( void )
+extern int init(void)
 {
 	agent_list = list_create(NULL);
 
@@ -187,7 +172,7 @@ extern int init ( void )
 	return SLURM_SUCCESS;
 }
 
-extern int fini ( void )
+extern void fini(void)
 {
 	agent_shutdown = true;
 
@@ -198,8 +183,6 @@ extern int fini ( void )
 	slurm_thread_join(agent_thread_id);
 
 	FREE_NULL_LIST(agent_list);
-
-	return SLURM_SUCCESS;
 }
 
 extern void *acct_storage_p_get_connection(
@@ -220,7 +203,7 @@ extern int acct_storage_p_commit(void *db_conn, bool commit)
 }
 
 extern int acct_storage_p_add_users(void *db_conn, uint32_t uid,
-				    List user_list)
+				    list_t *user_list)
 {
 	return SLURM_SUCCESS;
 }
@@ -233,14 +216,14 @@ extern char *acct_storage_p_add_users_cond(void *db_conn, uint32_t uid,
 }
 
 extern int acct_storage_p_add_coord(void *db_conn, uint32_t uid,
-				    List acct_list,
+				    list_t *acct_list,
 				    slurmdb_user_cond_t *user_cond)
 {
 	return SLURM_SUCCESS;
 }
 
 extern int acct_storage_p_add_accts(void *db_conn, uint32_t uid,
-				    List acct_list)
+				    list_t *acct_list)
 {
 	return SLURM_SUCCESS;
 }
@@ -253,43 +236,43 @@ extern char *acct_storage_p_add_accts_cond(void *db_conn, uint32_t uid,
 }
 
 extern int acct_storage_p_add_clusters(void *db_conn, uint32_t uid,
-				       List cluster_list)
+				       list_t *cluster_list)
 {
 	return SLURM_SUCCESS;
 }
 
 extern int acct_storage_p_add_federations(void *db_conn, uint32_t uid,
-					  List federation_list)
+					  list_t *federation_list)
 {
 	return SLURM_SUCCESS;
 }
 
 extern int acct_storage_p_add_tres(void *db_conn,
-				   uint32_t uid, List tres_list_in)
+				   uint32_t uid, list_t *tres_list_in)
 {
 	return SLURM_SUCCESS;
 }
 
 extern int acct_storage_p_add_assocs(void *db_conn, uint32_t uid,
-				     List assoc_list)
+				     list_t *assoc_list)
 {
 	return SLURM_SUCCESS;
 }
 
 extern int acct_storage_p_add_qos(void *db_conn, uint32_t uid,
-				  List qos_list)
+				  list_t *qos_list)
 {
 	return SLURM_SUCCESS;
 }
 
 extern int acct_storage_p_add_res(void *db_conn, uint32_t uid,
-				  List res_list)
+				  list_t *res_list)
 {
 	return SLURM_SUCCESS;
 }
 
 extern int acct_storage_p_add_wckeys(void *db_conn, uint32_t uid,
-				     List wckey_list)
+				     list_t *wckey_list)
 {
 	return SLURM_SUCCESS;
 }
@@ -300,28 +283,28 @@ extern int acct_storage_p_add_reservation(void *db_conn,
 	return SLURM_SUCCESS;
 }
 
-extern List acct_storage_p_modify_users(void *db_conn, uint32_t uid,
-					slurmdb_user_cond_t *user_cond,
-					slurmdb_user_rec_t *user)
+extern list_t *acct_storage_p_modify_users(void *db_conn, uint32_t uid,
+					   slurmdb_user_cond_t *user_cond,
+					   slurmdb_user_rec_t *user)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_modify_accts(void *db_conn, uint32_t uid,
-					slurmdb_account_cond_t *acct_cond,
-					slurmdb_account_rec_t *acct)
+extern list_t *acct_storage_p_modify_accts(void *db_conn, uint32_t uid,
+					   slurmdb_account_cond_t *acct_cond,
+					   slurmdb_account_rec_t *acct)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_modify_clusters(void *db_conn, uint32_t uid,
-					   slurmdb_cluster_cond_t *cluster_cond,
-					   slurmdb_cluster_rec_t *cluster)
+extern list_t *acct_storage_p_modify_clusters(void *db_conn, uint32_t uid,
+					      slurmdb_cluster_cond_t *cluster_cond,
+					      slurmdb_cluster_rec_t *cluster)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_modify_assocs(
+extern list_t *acct_storage_p_modify_assocs(
 	void *db_conn, uint32_t uid,
 	slurmdb_assoc_cond_t *assoc_cond,
 	slurmdb_assoc_rec_t *assoc)
@@ -329,7 +312,7 @@ extern List acct_storage_p_modify_assocs(
 	return NULL;
 }
 
-extern List acct_storage_p_modify_federations(
+extern list_t *acct_storage_p_modify_federations(
 	void *db_conn, uint32_t uid,
 	slurmdb_federation_cond_t *fed_cond,
 	slurmdb_federation_rec_t *fed)
@@ -337,30 +320,30 @@ extern List acct_storage_p_modify_federations(
 	return NULL;
 }
 
-extern List acct_storage_p_modify_job(void *db_conn, uint32_t uid,
-				      slurmdb_job_cond_t *job_cond,
-				      slurmdb_job_rec_t *job)
+extern list_t *acct_storage_p_modify_job(void *db_conn, uint32_t uid,
+					 slurmdb_job_cond_t *job_cond,
+					 slurmdb_job_rec_t *job)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_modify_qos(void *db_conn, uint32_t uid,
-				      slurmdb_qos_cond_t *qos_cond,
-				      slurmdb_qos_rec_t *qos)
+extern list_t *acct_storage_p_modify_qos(void *db_conn, uint32_t uid,
+					 slurmdb_qos_cond_t *qos_cond,
+					 slurmdb_qos_rec_t *qos)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_modify_res(void *db_conn, uint32_t uid,
-				      slurmdb_res_cond_t *res_cond,
-				      slurmdb_res_rec_t *res)
+extern list_t *acct_storage_p_modify_res(void *db_conn, uint32_t uid,
+					 slurmdb_res_cond_t *res_cond,
+					 slurmdb_res_rec_t *res)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_modify_wckeys(void *db_conn, uint32_t uid,
-					 slurmdb_wckey_cond_t *wckey_cond,
-					 slurmdb_wckey_rec_t *wckey)
+extern list_t *acct_storage_p_modify_wckeys(void *db_conn, uint32_t uid,
+					    slurmdb_wckey_cond_t *wckey_cond,
+					    slurmdb_wckey_rec_t *wckey)
 {
 	return NULL;
 }
@@ -371,60 +354,60 @@ extern int acct_storage_p_modify_reservation(void *db_conn,
 	return SLURM_SUCCESS;
 }
 
-extern List acct_storage_p_remove_users(void *db_conn, uint32_t uid,
-					slurmdb_user_cond_t *user_cond)
+extern list_t *acct_storage_p_remove_users(void *db_conn, uint32_t uid,
+					   slurmdb_user_cond_t *user_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_remove_coord(void *db_conn, uint32_t uid,
-					List acct_list,
-					slurmdb_user_cond_t *user_cond)
+extern list_t *acct_storage_p_remove_coord(void *db_conn, uint32_t uid,
+					   list_t *acct_list,
+					   slurmdb_user_cond_t *user_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_remove_accts(void *db_conn, uint32_t uid,
-					slurmdb_account_cond_t *acct_cond)
+extern list_t *acct_storage_p_remove_accts(void *db_conn, uint32_t uid,
+					   slurmdb_account_cond_t *acct_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_remove_clusters(void *db_conn, uint32_t uid,
-					   slurmdb_account_cond_t *cluster_cond)
+extern list_t *acct_storage_p_remove_clusters(void *db_conn, uint32_t uid,
+					      slurmdb_account_cond_t *cluster_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_remove_assocs(
+extern list_t *acct_storage_p_remove_assocs(
 	void *db_conn, uint32_t uid,
 	slurmdb_assoc_cond_t *assoc_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_remove_federations(
+extern list_t *acct_storage_p_remove_federations(
 	void *db_conn, uint32_t uid,
 	slurmdb_federation_cond_t *fed_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_remove_qos(
+extern list_t *acct_storage_p_remove_qos(
 	void *db_conn, uint32_t uid,
 	slurmdb_qos_cond_t *qos_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_remove_res(
+extern list_t *acct_storage_p_remove_res(
 	void *db_conn, uint32_t uid,
 	slurmdb_res_cond_t *res_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_remove_wckeys(
+extern list_t *acct_storage_p_remove_wckeys(
 	void *db_conn, uint32_t uid,
 	slurmdb_wckey_cond_t *wckey_cond)
 {
@@ -437,93 +420,93 @@ extern int acct_storage_p_remove_reservation(void *db_conn,
 	return SLURM_SUCCESS;
 }
 
-extern List acct_storage_p_get_users(void *db_conn, uid_t uid,
-				     slurmdb_user_cond_t *user_cond)
+extern list_t *acct_storage_p_get_users(void *db_conn, uid_t uid,
+					slurmdb_user_cond_t *user_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_accts(void *db_conn, uid_t uid,
-				     slurmdb_account_cond_t *acct_cond)
+extern list_t *acct_storage_p_get_accts(void *db_conn, uid_t uid,
+					slurmdb_account_cond_t *acct_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_clusters(void *db_conn, uid_t uid,
-					slurmdb_cluster_cond_t *cluster_cond)
+extern list_t *acct_storage_p_get_clusters(void *db_conn, uid_t uid,
+					   slurmdb_cluster_cond_t *cluster_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_federations(void *db_conn, uid_t uid,
-					   slurmdb_federation_cond_t *fed_cond)
+extern list_t *acct_storage_p_get_federations(void *db_conn, uid_t uid,
+					      slurmdb_federation_cond_t *fed_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_config(void *db_conn, char *config_name)
+extern list_t *acct_storage_p_get_config(void *db_conn, char *config_name)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_tres(void *db_conn, uid_t uid,
-				    slurmdb_tres_cond_t *tres_cond)
+extern list_t *acct_storage_p_get_tres(void *db_conn, uid_t uid,
+				       slurmdb_tres_cond_t *tres_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_assocs(
+extern list_t *acct_storage_p_get_assocs(
 	void *db_conn, uid_t uid, slurmdb_assoc_cond_t *assoc_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_events(void *db_conn, uint32_t uid,
-				      slurmdb_event_cond_t *event_cond)
+extern list_t *acct_storage_p_get_events(void *db_conn, uint32_t uid,
+					 slurmdb_event_cond_t *event_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_instances(void *db_conn,
-					 uint32_t uid,
-					 slurmdb_instance_cond_t *instance_cond)
+extern list_t *acct_storage_p_get_instances(
+	void *db_conn, uint32_t uid,
+	slurmdb_instance_cond_t *instance_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_problems(void *db_conn, uid_t uid,
-					slurmdb_assoc_cond_t *assoc_cond)
+extern list_t *acct_storage_p_get_problems(void *db_conn, uid_t uid,
+					   slurmdb_assoc_cond_t *assoc_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_qos(void *db_conn, uid_t uid,
-				   slurmdb_qos_cond_t *qos_cond)
+extern list_t *acct_storage_p_get_qos(void *db_conn, uid_t uid,
+				      slurmdb_qos_cond_t *qos_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_res(void *db_conn, uid_t uid,
-				   slurmdb_res_cond_t *res_cond)
+extern list_t *acct_storage_p_get_res(void *db_conn, uid_t uid,
+				      slurmdb_res_cond_t *res_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_wckeys(void *db_conn, uid_t uid,
-				      slurmdb_wckey_cond_t *wckey_cond)
+extern list_t *acct_storage_p_get_wckeys(void *db_conn, uid_t uid,
+					 slurmdb_wckey_cond_t *wckey_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_reservations(
+extern list_t *acct_storage_p_get_reservations(
 	void *db_conn, uid_t uid,
 	slurmdb_reservation_cond_t *resv_cond)
 {
 	return NULL;
 }
 
-extern List acct_storage_p_get_txn(void *db_conn, uid_t uid,
-				   slurmdb_txn_cond_t *txn_cond)
+extern list_t *acct_storage_p_get_txn(void *db_conn, uid_t uid,
+				      slurmdb_txn_cond_t *txn_cond)
 {
 	return NULL;
 }
@@ -538,13 +521,13 @@ extern int acct_storage_p_get_usage(void *db_conn, uid_t uid,
 extern int acct_storage_p_roll_usage(void *db_conn,
 				     time_t sent_start, time_t sent_end,
 				     uint16_t archive_data,
-				     List *rollup_stats_list_in)
+				     list_t **rollup_stats_list_in)
 {
 	return SLURM_SUCCESS;
 }
 
 extern int acct_storage_p_fix_runaway_jobs(void *db_conn, uint32_t uid,
-					   List jobs)
+					   list_t *jobs)
 {
 	return SLURM_SUCCESS;
 }
@@ -678,11 +661,11 @@ extern int jobacct_storage_p_suspend(void *db_conn, job_record_t *job_ptr)
 
 /*
  * get info from the storage
- * returns List of job_rec_t *
- * note List needs to be freed when called
+ * returns list of job_rec_t *
+ * note list needs to be freed when called
  */
-extern List jobacct_storage_p_get_jobs_cond(void *db_conn, uid_t uid,
-					    slurmdb_job_cond_t *job_cond)
+extern list_t *jobacct_storage_p_get_jobs_cond(void *db_conn, uid_t uid,
+					       slurmdb_job_cond_t *job_cond)
 {
 	return NULL;
 }
@@ -707,7 +690,7 @@ extern int jobacct_storage_p_archive_load(void *db_conn,
 }
 
 extern int acct_storage_p_update_shares_used(void *db_conn,
-					     List shares_used)
+					     list_t *shares_used)
 {
 	return SLURM_SUCCESS;
 }
@@ -719,12 +702,6 @@ extern int acct_storage_p_flush_jobs_on_cluster(void *db_conn,
 }
 
 extern int acct_storage_p_reconfig(void *db_conn, bool dbd)
-{
-	return SLURM_SUCCESS;
-}
-
-extern int acct_storage_p_reset_lft_rgt(void *db_conn, uid_t uid,
-					List cluster_list)
 {
 	return SLURM_SUCCESS;
 }

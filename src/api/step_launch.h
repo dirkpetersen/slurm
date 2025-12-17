@@ -55,7 +55,7 @@
 struct step_launch_state {
 	/* This lock protects tasks_started, tasks_exited, node_io_error,
 	   io_deadline, abort, and abort_action_taken.  The main thread
-	   blocks on cond, waking when a tast starts or exits, or the abort
+	   blocks on cond, waking when a task starts or exits, or the abort
 	   flag is set. */
 	pthread_mutex_t lock;
 	pthread_cond_t cond;
@@ -105,12 +105,6 @@ typedef struct step_launch_state step_launch_state_t;
  * Create a launch state structure for a specified step context, "ctx".
  */
 struct step_launch_state * step_launch_state_create(slurm_step_ctx_t *ctx);
-
-/*
- * If a steps size has changed update the launch_state structure for a
- * specified step context, "ctx".
- */
-void step_launch_state_alter(slurm_step_ctx_t *ctx);
 
 /*
  * Free the memory associated with the a launch state structure.

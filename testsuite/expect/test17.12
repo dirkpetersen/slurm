@@ -51,6 +51,11 @@ proc cleanup {} {
 #
 # Prerequisites
 #
+if {[param_contains [get_config_param "SlurmctldParameters"] "enable_stepmgr"] && \
+    [package vcompare [get_version] "25.11.0"] < 0 } {
+	skip "Ticket 23611: In 25.11 we fixed some issues with stepmgr that were leading to random failures in this test."
+}
+
 if {![is_super_user] || [get_config_param "NodeFeaturesPlugins"] ne "(null)"} {
 	skip "Test needs super user and not NodeFeaturesPlugins"
 }
@@ -266,9 +271,6 @@ testproc test_constrain 3 "$feat4&\[$feat1|$feat0\]" [list]
 # Special testprocs
 #
 # Specific test for batch host
-if {[get_config_param "FrontendName"] ne "MISSING"} {
-	skip_following_testprocs "Test incompatible with front-end"
-}
 testproc test_constrain_batch 3 "$feat0|$feat3" $feat3 [list $nodes(3)]
 run_following_testprocs
 

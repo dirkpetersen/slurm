@@ -64,7 +64,7 @@ typedef struct part_record {
 	int allow_uids_cnt;	/* count of allowed user IDs */
 	char *allow_qos;	/* comma delimited list of qos,
 				 * NULL indicates all */
-	bitstr_t *allow_qos_bitstr; /* (DON'T PACK) assocaited with
+	bitstr_t *allow_qos_bitstr; /* (DON'T PACK) associated with
 				 * char *allow_qos but used internally */
 	char *alternate; 	/* name of alternate partition */
 	double *billing_weights;    /* array of TRES billing weights */
@@ -81,7 +81,7 @@ typedef struct part_record {
 				 * char *deny_qos but used internallly */
 	uint32_t flags;		/* see PART_FLAG_* in slurm.h */
 	uint32_t grace_time;	/* default preempt grace time in seconds */
-	List job_defaults_list;	/* List of job_defaults_t elements */
+	list_t *job_defaults_list; /* List of job_defaults_t elements */
 	uint32_t max_cpus_per_node; /* maximum allocated CPUs per node */
 	uint32_t max_cpus_per_socket; /*maximum allocated CPUs per socket */
 	uint64_t max_mem_per_cpu; /* maximum MB memory per allocated CPU */
@@ -121,6 +121,8 @@ typedef struct part_record {
 	uint32_t max_cpu_cnt;	/* max # of cpus on a node in the partition */
 	uint32_t max_core_cnt;	/* max # of cores on a node in the partition */
 	uint16_t cr_type;	/* Custom CR values for partition (if supported by select plugin) */
+	int topology_idx; /* index of topology context */
+	char *topology_name;
 	uint64_t *tres_cnt;	/* array of total TRES in partition. NO_PACK */
 	char     *tres_fmt_str;	/* str of configured TRES in partition */
 	bf_part_data_t *bf_data;/* backfill data, NO PACK */

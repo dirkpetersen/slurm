@@ -1,8 +1,7 @@
 /*****************************************************************************\
  *  stepmgr.h - manage the job step information of slurm
  *****************************************************************************
- *  Copyright (C) 2024 SchedMD LLC.
- *  Written by Brian Christiansen <brian@schedmd.com>
+ *  Copyright (C) SchedMD LLC.
  *
  *  This file is part of Slurm, a resource management program.
  *  For details, see <https://slurm.schedmd.com/>.
@@ -37,7 +36,6 @@
 #ifndef _SLURM_STEP_MGR_H
 #define _SLURM_STEP_MGR_H
 
-#include "src/common/front_end.h"
 #include "src/common/id_util.h"
 #include "src/common/job_record.h"
 #include "src/common/node_conf.h"
@@ -45,18 +43,16 @@
 
 typedef struct {
 	void *acct_db_conn;
-	list_t *active_feature_list;
 	list_t *job_list;
 	time_t *last_job_update;
 	bitstr_t *up_node_bitmap;
 
 	void (*job_config_fini)(job_record_t *job_ptr);
+	job_record_t *(*find_job)(const slurm_step_id_t *step_id);
 	job_record_t *(*find_job_record)(uint32_t job_id);
 	job_record_t *(*find_job_array_rec)(uint32_t array_job_id,
 					    uint32_t array_task_id);
 	void (*agent_queue_request)(agent_arg_t *agent_arg_ptr);
-
-	front_end_record_t *(*find_front_end_record)(char *name);
 } stepmgr_ops_t;
 
 extern stepmgr_ops_t *stepmgr_ops;
@@ -101,7 +97,7 @@ extern int step_create(job_record_t *job_ptr,
 
 /*
  * step_layout_create - creates a step_layout according to the inputs.
- * IN step_ptr - step having tasks layed out
+ * IN step_ptr - step having tasks laid out
  * IN step_node_list - node list of hosts in step
  * IN node_count - count of nodes in step allocation
  * IN num_tasks - number of tasks in step
@@ -194,15 +190,7 @@ extern slurm_node_alias_addrs_t *build_alias_addrs(job_record_t *job_ptr);
  */
 extern int job_get_node_inx(char *node_name, bitstr_t *node_bitmap);
 
-/*
- * list_find_feature - find an entry in the feature list, see list.h for
- *	documentation
- * IN key - is feature name or NULL for all features
- * RET 1 if found, 0 otherwise
- */
-extern int list_find_feature(void *feature_entry, void *key);
-
-extern int step_create_from_msg(slurm_msg_t *msg,
+extern int step_create_from_msg(slurm_msg_t *msg, int slurmd_fd,
 				void (*lock_func)(bool lock),
 				void (*fail_lock_func)(bool lock));
 
@@ -231,7 +219,6 @@ extern int stepmgr_get_step_layouts(job_record_t *job_ptr,
 extern int stepmgr_get_job_sbcast_cred_msg(
 	job_record_t *job_ptr,
 	slurm_step_id_t *step_id,
-	char *hetjob_nodelist,
 	uint16_t protocol_version,
 	job_sbcast_cred_msg_t **out_sbcast_cred_msg);
 

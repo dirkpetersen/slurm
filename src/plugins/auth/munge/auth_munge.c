@@ -64,35 +64,13 @@
 #define RETRY_COUNT		20
 #define RETRY_USEC		100000
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Munge authentication plugin";
 const char plugin_type[] = "auth/munge";
-const uint32_t plugin_id = AUTH_PLUGIN_MUNGE;
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
+/* Required for auth plugins: */
+const uint32_t plugin_id = AUTH_PLUGIN_MUNGE;
 const bool hash_enable = true;
 
 static int bad_cred_test = -1;
@@ -116,6 +94,9 @@ typedef struct {
 
 extern auth_credential_t *auth_p_create(char *opts, uid_t r_uid, void *data,
 					int dlen);
+extern auth_credential_t *auth_p_cred_generate(const char *token,
+					       const char *username, uid_t uid,
+					       gid_t gid);
 extern void auth_p_destroy(auth_credential_t *cred);
 
 /* Static prototypes */
@@ -126,7 +107,7 @@ static void _print_cred(munge_ctx_t ctx);
 /*
  *  Munge plugin initialization
  */
-int init(void)
+extern int init(void)
 {
 	int rc = SLURM_SUCCESS;
 	char *fail_test_env = getenv("SLURM_MUNGE_AUTH_FAIL_TEST");
@@ -161,9 +142,9 @@ int init(void)
 	return rc;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
-	return SLURM_SUCCESS;
+	return;
 }
 
 /*
@@ -227,7 +208,7 @@ auth_credential_t *auth_p_create(char *opts, uid_t r_uid, void *data, int dlen)
 	/*
 	 *  Temporarily block SIGALARM to avoid misleading
 	 *    "Munged communication error" from libmunge if we
-	 *    happen to time out the connection in this secion of
+	 *    happen to time out the connection in this section of
 	 *    code. FreeBSD needs this cast.
 	 */
 	ohandler = xsignal(SIGALRM, (SigFunc *)SIG_BLOCK);
@@ -246,7 +227,7 @@ again:
 		error("Munge encode failed: %s", munge_ctx_strerror(ctx));
 		xfree(cred);
 		cred = NULL;
-		slurm_seterrno(ESLURM_AUTH_CRED_INVALID);
+		errno = ESLURM_AUTH_CRED_INVALID;
 	} else if ((bad_cred_test > 0) && cred->m_str) {
 		/*
 		 * Avoid changing the trailing ':' character, or any of the
@@ -297,7 +278,7 @@ int auth_p_verify(auth_credential_t *c, char *opts)
 	char *socket;
 
 	if (!c) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return SLURM_ERROR;
 	}
 
@@ -344,7 +325,7 @@ extern void auth_p_get_ids(auth_credential_t *cred, uid_t *uid, gid_t *gid)
  */
 char *auth_p_get_host(auth_credential_t *cred)
 {
-	slurm_addr_t addr;
+	slurm_addr_t addr = { 0 };
 	struct sockaddr_in *sin = (struct sockaddr_in *) &addr;
 	char *hostname = NULL, *dot_ptr = NULL;
 
@@ -354,7 +335,7 @@ char *auth_p_get_host(auth_credential_t *cred)
 		 * the calling path did not verify the credential first.
 		 */
 		xassert(!cred);
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return NULL;
 	}
 
@@ -377,8 +358,7 @@ char *auth_p_get_host(auth_credential_t *cred)
 	 * which will never resolve successfully. So don't even bother trying.
 	 */
 	if (sin->sin_addr.s_addr != 0) {
-		hostname = xgetnameinfo((struct sockaddr *) &addr,
-					sizeof(addr));
+		hostname = xgetnameinfo(&addr);
 		/*
 		 * The NI_NOFQDN flag was used here previously, but did not work
 		 * as desired if the primary domain did not match on both sides.
@@ -409,7 +389,7 @@ extern int auth_p_get_data(auth_credential_t *cred, char **data, uint32_t *len)
 		 * the calling path did not verify the credential first.
 		 */
 		xassert(!cred);
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return SLURM_ERROR;
 	}
 
@@ -429,7 +409,7 @@ extern int auth_p_get_data(auth_credential_t *cred, char **data, uint32_t *len)
 extern void *auth_p_get_identity(auth_credential_t *cred)
 {
 	if (!cred) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return NULL;
 	}
 
@@ -443,7 +423,7 @@ extern void *auth_p_get_identity(auth_credential_t *cred)
 int auth_p_pack(auth_credential_t *cred, buf_t *buf, uint16_t protocol_version)
 {
 	if (!cred || !buf) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return SLURM_ERROR;
 	}
 
@@ -466,33 +446,33 @@ int auth_p_pack(auth_credential_t *cred, buf_t *buf, uint16_t protocol_version)
  */
 auth_credential_t *auth_p_unpack(buf_t *buf, uint16_t protocol_version)
 {
+	char *token = NULL;
 	auth_credential_t *cred = NULL;
-	uint32_t size;
 
 	if (!buf) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return NULL;
 	}
 
 	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		/* Allocate and initialize credential. */
-		cred = xmalloc(sizeof(*cred));
-		cred->magic = MUNGE_MAGIC;
-		cred->verified = false;
-		cred->m_xstr = true;
-
-		safe_unpackstr_xmalloc(&cred->m_str, &size, buf);
+		safe_unpackstr(&token, buf);
 	} else {
 		error("%s: unknown protocol version %u",
 		      __func__, protocol_version);
 		goto unpack_error;
 	}
 
+	/* Allocate and initialize credential. */
+	cred = auth_p_cred_generate(token, NULL, SLURM_AUTH_NOBODY,
+				    SLURM_AUTH_NOBODY);
+	xassert(!cred->verified);
+	xfree(token);
 	return cred;
 
 unpack_error:
-	slurm_seterrno(ESLURM_AUTH_UNPACK);
+	errno = ESLURM_AUTH_UNPACK;
 	auth_p_destroy(cred);
+	xfree(token);
 	return NULL;
 }
 
@@ -556,7 +536,7 @@ again:
 			_print_cred(ctx);
 			if (err == EMUNGE_CRED_REWOUND)
 				error("Check for out of sync clocks");
-			slurm_seterrno(ESLURM_AUTH_CRED_INVALID);
+			errno = ESLURM_AUTH_CRED_INVALID;
 			goto done;
 #ifdef MULTIPLE_SLURMD
 		}
@@ -645,4 +625,35 @@ void auth_p_thread_clear(void)
 char *auth_p_token_generate(const char *username, int lifespan)
 {
 	return NULL;
+}
+
+extern int auth_p_get_reconfig_fd(void)
+{
+	return -1;
+}
+
+extern auth_credential_t *auth_p_cred_generate(const char *token,
+					       const char *username, uid_t uid,
+					       gid_t gid)
+
+{
+	auth_credential_t *cred = NULL;
+
+	if (!token || !token[0]) {
+		error("%s: required token not provided", __func__);
+		errno = ESLURM_AUTH_CRED_INVALID;
+		return NULL;
+	}
+
+	/* Allocate a new credential. */
+	cred = xmalloc(sizeof(*cred));
+	*cred = (auth_credential_t) {
+		.magic = MUNGE_MAGIC,
+		.m_xstr = true,
+		.m_str = xstrdup(token),
+		.uid = uid,
+		.gid = gid,
+	};
+
+	return cred;
 }

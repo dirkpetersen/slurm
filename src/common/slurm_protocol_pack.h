@@ -82,7 +82,7 @@ extern int unpack_header(header_t *header, buf_t *buffer);
  *			automatically updated
  * RET 0 or error code
  */
-extern int pack_msg(slurm_msg_t const *msg, buf_t *buffer);
+extern int pack_msg(slurm_msg_t *msg, buf_t *buffer);
 
 /*
  * unpacks a generic slurm protocol message body
@@ -97,24 +97,25 @@ extern void packstr_with_version(void *object, uint16_t protocol_version,
 				 buf_t *buffer);
 extern int unpackstr_with_version(void **object, uint16_t protocol_version,
 				  buf_t *buffer);
-extern int slurm_pack_list(List send_list,
+extern int slurm_pack_list(list_t *send_list,
 			   void (*pack_function) (void *object,
 						  uint16_t rpc_version,
 						  buf_t *buffer),
 			   buf_t *buffer, uint16_t protocol_version);
-extern int slurm_pack_list_until(List send_list, pack_function_t pack_function,
+extern int slurm_pack_list_until(list_t *send_list,
+				 pack_function_t pack_function,
 				 buf_t *buffer, uint32_t max_buf_size,
 				 uint16_t protocol_version);
-extern int slurm_unpack_list(List *recv_list,
+extern int slurm_unpack_list(list_t **recv_list,
 			     int (*unpack_function) (void **object,
 						     uint16_t protocol_version,
 						     buf_t *buffer),
 			     void (*destroy_function) (void *object),
 			     buf_t *buffer, uint16_t protocol_version);
 
-extern void pack_dep_list(List dep_list, buf_t *buffer,
+extern void pack_dep_list(list_t *dep_list, buf_t *buffer,
 			  uint16_t protocol_version);
-extern int unpack_dep_list(List *dep_list, buf_t *buffer,
+extern int unpack_dep_list(list_t **dep_list, buf_t *buffer,
 			   uint16_t protocol_version);
 
 extern void pack_multi_core_data(multi_core_data_t *multi_core, buf_t *buffer,
@@ -122,17 +123,13 @@ extern void pack_multi_core_data(multi_core_data_t *multi_core, buf_t *buffer,
 extern int unpack_multi_core_data(multi_core_data_t **multi_core, buf_t *buffer,
 				  uint16_t protocol_version);
 
-extern void pack_config_response_msg(config_response_msg_t *msg,
-				     buf_t *buffer, uint16_t protocol_version);
-extern int unpack_config_response_msg(config_response_msg_t **msg_ptr,
-				      buf_t *buffer, uint16_t protocol_version);
+extern void pack_config_response_msg(const slurm_msg_t *smsg, buf_t *buffer);
+extern int unpack_config_response_msg(slurm_msg_t *smsg, buf_t *buffer);
 
 extern void pack_step_id(slurm_step_id_t *msg, buf_t *buffer,
 			 uint16_t protocol_version);
 extern int unpack_step_id_members(slurm_step_id_t *msg, buf_t *buffer,
 				  uint16_t protocol_version);
-extern int unpack_step_id(slurm_step_id_t **msg_ptr, buf_t *buffer,
-			  uint16_t protocol_version);
 
 extern void slurm_pack_selected_step(void *in, uint16_t protocol_version,
 				     buf_t *buffer);

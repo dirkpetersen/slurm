@@ -65,19 +65,24 @@
 
 /* Other useful includes */
 #include "slurm/slurm_errno.h"
+
 #include "src/common/eio.h"
 #include "src/common/fd.h"
 #include "src/common/log.h"
 #include "src/common/net.h"
 #include "src/common/read_config.h"
-#include "src/interfaces/mpi.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/strlcpy.h"
+#include "src/common/threadpool.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
-#include "src/slurmd/slurmstepd/slurmstepd_job.h"
+
+#include "src/interfaces/mpi.h"
+
 #include "src/plugins/mpi/pmix/mapping.h"
+
+#include "src/slurmd/slurmstepd/slurmstepd_job.h"
 
 /* ----------------------------------------------------------
  * Slurm environment that influence us:
@@ -106,7 +111,7 @@
 #define PMIXP_TIMEOUT_DEFAULT 300
 
 /* setup path to the temp directory for usock files for:
- * - inter-stepd comunication;
+ * - inter-stepd communication;
  * - libpmix - client communication
  */
 #define PMIXP_TMPDIR_SRV "SLURM_PMIX_SRV_TMPDIR"
@@ -120,6 +125,10 @@
  * part of libPMIx */
 #define PMIXP_DEBUG_LIB "SLURM_PMIX_SRV_DEBUG"
 #define PMIXP_DIRECT_CONN_EARLY "SLURM_PMIX_DIRECT_CONN_EARLY"
+
+/* Following pmix_jobinfo_t flags. */
+#define PMIXP_FLAG_TRUSTED_CLI_TMPDIR SLURM_BIT(0) /* Trusted cli_tmpdir */
+#define PMIXP_FLAG_TRUSTED_LIB_TMPDIR SLURM_BIT(1) /* Trusted lib_tmpdir */
 
 /* ----------------------------------------------------------
  * This is libPMIx variable that we need to control it
@@ -164,7 +173,7 @@
 #define PMIXP_CPERF_LITER "SLURM_PMIX_COLL_PERF_ITER_LARGE"
 /* The bound after which message is considered large */
 #define PMIXP_CPERF_BOUND "SLURM_PMIX_COLL_PERF_LARGE_PWR2"
-/* The prefered fence type, values:[auto|tree|ring] */
+/* The preferred fence type, values:[auto|tree|ring] */
 #define PMIXP_COLL_FENCE "SLURM_PMIX_FENCE"
 #define SLURM_PMIXP_FENCE_BARRIER "SLURM_PMIX_FENCE_BARRIER"
 
@@ -200,7 +209,7 @@ typedef struct {
 } pmixp_p2p_data_t;
 
 /*
- * pmix_nspace_t did not exist before pmix v3 this is how it has been definied
+ * pmix_nspace_t did not exist before pmix v3 this is how it has been defined
  * in pmix_common.h since then.
  */
 #ifndef pmix_nspace_t
@@ -218,6 +227,7 @@ typedef struct {
 	bool direct_samearch;
 	char *env;
 	bool fence_barrier;
+	bool share_topology;
 	uint32_t timeout;
 	char *ucx_netdevices;
 	char *ucx_tls;

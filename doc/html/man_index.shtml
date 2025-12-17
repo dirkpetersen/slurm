@@ -72,10 +72,10 @@ Documentation for other versions of Slurm is distributed with the code</b></p>
 <tr><td><a href="job_container.conf.html">job_container.conf</a></td>
 	<td>Slurm configuration file for configuring the tmpfs job container
 	plugin.</td></tr>
-<tr><td><a href="knl.conf.html">knl.conf</a></td>
-	<td>Slurm configuration file for Intel Knights Landing management.</td></tr>
 <tr><td><a href="mpi.conf.html">mpi.conf</a></td>
 	<td>Slurm configuration file to allow the configuration of MPI plugins.</td></tr>
+<tr><td><a href="namespace.yaml.html">namespace.yaml</a></td>
+	<td>Slurm configuration file for the namespace/linux plugin.</td></tr>
 <tr><td><a href="oci.conf.html">oci.conf</a></td>
 	<td>Slurm configuration file for OCI Containers.</td></tr>
 <tr><td><a href="spank.html#SECTION_CONFIGURATION">plugstack.conf</a></td>
@@ -86,6 +86,8 @@ Documentation for other versions of Slurm is distributed with the code</b></p>
 	<td>Slurm Database Daemon (SlurmDBD) configuration file.</td></tr>
 <tr><td><a href="topology.conf.html">topology.conf</a></td>
 	<td>Slurm configuration file for defining the network topology.</td></tr>
+<tr><td><a href="topology.yaml.html">topology.yaml</a></td>
+	<td>Slurm configuration file for defining multiple network topologies.</td></tr>
 </table>
 
 <h2 id="daemons">Daemons and Other
@@ -106,7 +108,5 @@ Documentation for other versions of Slurm is distributed with the code</b></p>
 <tr><td><a href="spank.html">SPANK</a></td>
 	<td>Slurm Plug-in Architecture for Node and job (K)control.</td></tr>
 </table>
-
-<p style="text-align:center;">Last modified 10 July 2024</p>
 
 <!--#include virtual="footer.txt"-->

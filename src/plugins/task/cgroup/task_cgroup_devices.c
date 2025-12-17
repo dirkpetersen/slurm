@@ -39,7 +39,6 @@
 #define _GNU_SOURCE
 #include <glob.h>
 #include <limits.h>
-#include <sched.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -50,11 +49,9 @@
 #include "src/common/xstring.h"
 #include "src/interfaces/cgroup.h"
 #include "src/interfaces/gres.h"
-#include "src/slurmd/common/xcpuinfo.h"
+#include "src/interfaces/namespace.h"
 #include "src/slurmd/slurmd/slurmd.h"
 #include "src/slurmd/slurmstepd/slurmstepd_job.h"
-
-#include "task_cgroup.h"
 
 typedef struct handle_dev_args {
 	cgroup_level_t cgroup_type;
@@ -114,46 +111,26 @@ static int _handle_device_access(void *x, void *arg)
 
 extern int task_cgroup_devices_init(void)
 {
-	uint16_t cpunum;
-
-	/* initialize cpuinfo internal data */
-	if (xcpuinfo_init() != SLURM_SUCCESS)
-		return SLURM_ERROR;
-
-	if (get_procs(&cpunum) != 0) {
-		error("unable to get a number of CPU");
-		goto error;
-	}
-
 	if (cgroup_g_initialize(CG_DEVICES) != SLURM_SUCCESS) {
 		error("unable to create devices namespace");
-		goto error;
+		return SLURM_ERROR;
 	}
 
 	return SLURM_SUCCESS;
-
-error:
-	xcpuinfo_fini();
-	return SLURM_ERROR;
 }
 
 extern int task_cgroup_devices_fini(void)
 {
-	int rc;
-
-	rc = cgroup_g_step_destroy(CG_DEVICES);
-	xcpuinfo_fini();
-
-	return rc;
+	return cgroup_g_step_destroy(CG_DEVICES);
 }
 
 extern int task_cgroup_devices_create(stepd_step_rec_t *step)
 {
 	int rc = SLURM_SUCCESS;
 	pid_t pid;
-	List job_gres_list = step->job_gres_list;
-	List step_gres_list = step->step_gres_list;
-	List device_list = NULL;
+	list_t *job_gres_list = step->job_gres_list;
+	list_t *step_gres_list = step->step_gres_list;
+	list_t *device_list = NULL;
 	handle_dev_args_t handle_args;
 
 	if (is_first_task) {
@@ -161,6 +138,15 @@ extern int task_cgroup_devices_create(stepd_step_rec_t *step)
 		if (cgroup_g_step_create(CG_DEVICES, step) != SLURM_SUCCESS)
 			return SLURM_ERROR;
 		is_first_task = false;
+	}
+
+	/*
+	 * If we cannot do bpf calls because we are in a user namespace and we
+	 * do not have a BPF token.
+	 */
+	if (!namespace_g_can_bpf(step) && cgroup_g_bpf_get_token() <= 0) {
+		log_flag(CGROUP, "Skipping job and step device constrain as we are in a user namespace without a BPF token available");
+		goto bpf_unavailable;
 	}
 
 	/* Allow or deny access to devices according to job GRES permissions. */
@@ -178,7 +164,12 @@ extern int task_cgroup_devices_create(stepd_step_rec_t *step)
 			rc = SLURM_ERROR;
 			goto fini;
 		}
-		cgroup_g_constrain_apply(CG_DEVICES, CG_LEVEL_JOB, NO_VAL);
+		if (cgroup_g_constrain_apply(CG_DEVICES, CG_LEVEL_JOB,
+					     NO_VAL) != SLURM_SUCCESS) {
+			error("Could not apply device constrain to job");
+			rc = SLURM_ERROR;
+			goto fini;
+		}
 	}
 
 	if ((step->step_id.step_id != SLURM_BATCH_SCRIPT) &&
@@ -204,11 +195,16 @@ extern int task_cgroup_devices_create(stepd_step_rec_t *step)
 				rc = SLURM_ERROR;
 				goto fini;
 			}
-			cgroup_g_constrain_apply(CG_DEVICES, CG_LEVEL_STEP,
-						 NO_VAL);
+			if (cgroup_g_constrain_apply(CG_DEVICES, CG_LEVEL_STEP,
+						     NO_VAL) != SLURM_SUCCESS) {
+				error("Could not apply device constrain to step");
+				rc = SLURM_ERROR;
+				goto fini;
+			}
 		}
 	}
 
+bpf_unavailable:
 	/* attach the slurmstepd to the step devices cgroup */
 	pid = getpid();
 	rc = cgroup_g_step_addto(CG_DEVICES, &pid, 1);
@@ -228,7 +224,7 @@ extern int task_cgroup_devices_constrain(stepd_step_rec_t *step,
 					 uint32_t node_tid,
 					 uint32_t global_tid)
 {
-	List device_list = NULL;
+	list_t *device_list = NULL;
 	handle_dev_args_t handle_args;
 
 	/*
@@ -242,6 +238,15 @@ extern int task_cgroup_devices_constrain(stepd_step_rec_t *step,
 	    (step->step_id.step_id == SLURM_INTERACTIVE_STEP) ||
 	    (step->flags & LAUNCH_EXT_LAUNCHER))
 		return SLURM_SUCCESS;
+	/*
+	 * If we cannot do bpf calls because we are in a user namespace and we
+	 * do not have a BPF token.
+	 */
+	if (!namespace_g_can_bpf(step) && cgroup_g_bpf_get_token() <= 0) {
+		log_flag(CGROUP,"Skipping task %d device constrain as we are in a user namespace without a BPF token available",
+			 global_tid);
+		return SLURM_SUCCESS;
+	}
 
 	/*
 	 * Apply gres constrains by getting the allowed devices for this task
@@ -262,7 +267,12 @@ extern int task_cgroup_devices_constrain(stepd_step_rec_t *step,
 		if (tmp < 0)
 			return SLURM_ERROR;
 
-		cgroup_g_constrain_apply(CG_DEVICES, CG_LEVEL_TASK, global_tid);
+		if (cgroup_g_constrain_apply(CG_DEVICES, CG_LEVEL_TASK,
+					     global_tid) != SLURM_SUCCESS) {
+			error("Could not apply device constrain to task %u",
+			      global_tid);
+			return SLURM_ERROR;
+		}
 	}
 
 	return SLURM_SUCCESS;

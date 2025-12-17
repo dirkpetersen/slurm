@@ -38,12 +38,12 @@
 
 #include <poll.h>
 
-#include "src/common/xmalloc.h"
-#include "src/common/slurm_protocol_defs.h"
 #include "src/common/fd.h"
 #include "src/common/log.h"
 #include "src/common/net.h"
+#include "src/common/slurm_protocol_defs.h"
 #include "src/common/slurmdbd_defs.h"
+#include "src/common/xmalloc.h"
 
 #include "src/slurmdbd/backup.h"
 
@@ -62,7 +62,6 @@ extern void run_dbd_backup(void)
 	slurmdbd_conn.rem_host = slurmdbd_conf->dbd_addr;
 	slurmdbd_conn.rem_port = slurmdbd_conf->dbd_port;
 	slurmdbd_conn.cluster_name = "backup_slurmdbd";
-	slurmdbd_conn.fd = -1;
 	slurmdbd_conn.shutdown = &shutdown_time;
 	// Prevent constant reconnection tries from filling up the error logs
 	slurmdbd_conn.flags |= PERSIST_FLAG_SUPPRESS_ERR;

@@ -117,7 +117,7 @@ extern openapi_type_t openapi_type_format_to_type(openapi_type_format_t format);
 #define OPENAPI_REF_TAG "$ref"
 
 /*
- * Generate formated path string from relative path
+ * Generate formatted path string from relative path
  * IN/OUT str_ptr - ptr to path string to set/replace
  * IN relative_path - data list with each component of relative path
  * RET ptr to path string (to allow jit generation for logging)
@@ -140,6 +140,12 @@ extern data_t *openapi_fork_rel_path_list(data_t *relative_path, int index);
  * RET SLURM_SUCCESS or error
  */
 extern int openapi_append_rel_path(data_t *relative_path, const char *sub_path);
+
+/* For list_for_each() to emit error() message for openapi_resp_error_t */
+extern int openapi_error_log_foreach(void *x, void *arg);
+
+/* For list_for_each() to emit warning() message for openapi_resp_warning_t */
+extern int openapi_warn_log_foreach(void *x, void *arg);
 
 typedef struct {
 	struct {
@@ -334,6 +340,27 @@ typedef struct {
 } openapi_job_info_query_t;
 
 typedef struct {
+	OPENAPI_RESP_STRUCT_META_FIELD;
+	OPENAPI_RESP_STRUCT_ERRORS_FIELD;
+	OPENAPI_RESP_STRUCT_WARNINGS_FIELD;
+	list_t *listjobs_list;
+} openapi_resp_listjobs_info_t;
+
+typedef struct {
+	OPENAPI_RESP_STRUCT_META_FIELD;
+	OPENAPI_RESP_STRUCT_ERRORS_FIELD;
+	OPENAPI_RESP_STRUCT_WARNINGS_FIELD;
+	list_t *listpids_list;
+} openapi_resp_listpids_info_t;
+
+typedef struct {
+	OPENAPI_RESP_STRUCT_META_FIELD;
+	OPENAPI_RESP_STRUCT_ERRORS_FIELD;
+	OPENAPI_RESP_STRUCT_WARNINGS_FIELD;
+	list_t *liststeps_list;
+} openapi_resp_liststeps_info_t;
+
+typedef struct {
 	char *node_name;
 } openapi_node_param_t;
 
@@ -386,6 +413,11 @@ typedef struct {
 	time_t last_update;
 } openapi_resp_reserve_info_msg_t;
 
+/* Struct required to wrap list in an object */
+typedef struct {
+	list_t *reservations;
+} openapi_reservation_mod_request_t;
+
 /* mirrors license_info_msg_t */
 typedef struct {
 	OPENAPI_RESP_STRUCT_META_FIELD;
@@ -422,5 +454,13 @@ typedef struct {
 typedef struct {
 	list_t *job_id_list; /* list of slurm_selected_step_t* */
 } openapi_job_state_query_t;
+
+typedef struct {
+	OPENAPI_RESP_STRUCT_META_FIELD;
+	OPENAPI_RESP_STRUCT_ERRORS_FIELD;
+	OPENAPI_RESP_STRUCT_WARNINGS_FIELD;
+	list_t *job_id_list; /* list of slurm_selected_step_t* */
+	slurmdb_job_rec_t *job_rec;
+} openapi_job_modify_req_t;
 
 #endif /* SLURM_OPENAPI_H */

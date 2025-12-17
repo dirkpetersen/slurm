@@ -37,11 +37,13 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
 \*****************************************************************************/
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "src/common/log.h"
+#include "src/common/pack.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/slurm_protocol_util.h"
@@ -49,65 +51,6 @@
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/slurmdbd/read_config.h"
-
-/*
- * check_header_version checks to see that the specified header was sent
- * from a node running the same version of the protocol as the current node
- * IN header - the message header received
- * RET - Slurm error code
- */
-int check_header_version(header_t * header)
-{
-	uint16_t check_version = SLURM_PROTOCOL_VERSION;
-
-	if (working_cluster_rec)
-		check_version = working_cluster_rec->rpc_version;
-
-	if (slurmdbd_conf) {
-		if ((header->version != SLURM_PROTOCOL_VERSION)     &&
-		    (header->version != SLURM_ONE_BACK_PROTOCOL_VERSION) &&
-		    (header->version != SLURM_TWO_BACK_PROTOCOL_VERSION) &&
-		    (header->version != SLURM_MIN_PROTOCOL_VERSION)) {
-			debug("unsupported RPC version %hu msg type %s(%u)",
-			      header->version, rpc_num2string(header->msg_type),
-			      header->msg_type);
-			slurm_seterrno_ret(SLURM_PROTOCOL_VERSION_ERROR);
-		}
-	} else if (header->version != check_version) {
-		switch (header->msg_type) {
-		case REQUEST_LAUNCH_TASKS:
-		case RESPONSE_LAUNCH_TASKS:
-			if (working_cluster_rec) {
-				/* Disable job step creation/launch
-				 * between major releases. Other RPCs
-				 * should all be supported. */
-				debug("unsupported RPC type %hu",
-				      header->msg_type);
-				slurm_seterrno_ret(
-					SLURM_PROTOCOL_VERSION_ERROR);
-				break;
-			}
-		default:
-			if ((header->version != SLURM_PROTOCOL_VERSION)     &&
-			    (header->version !=
-			     SLURM_ONE_BACK_PROTOCOL_VERSION) &&
-			    (header->version !=
-			     SLURM_TWO_BACK_PROTOCOL_VERSION) &&
-			    (header->version != SLURM_MIN_PROTOCOL_VERSION)) {
-				debug("Unsupported RPC version %hu "
-				      "msg type %s(%u)", header->version,
-				      rpc_num2string(header->msg_type),
-				      header->msg_type);
-				slurm_seterrno_ret(
-					SLURM_PROTOCOL_VERSION_ERROR);
-			}
-			break;
-
-		}
-	}
-
-	return SLURM_SUCCESS;
-}
 
 /*
  * init_header - simple function to create a header, always insuring that
@@ -118,24 +61,9 @@ int check_header_version(header_t * header)
  */
 void init_header(header_t *header, slurm_msg_t *msg, uint16_t flags)
 {
-	memset(header, 0, sizeof(header_t));
-	/* Since the slurmdbd could talk to a host of different
-	   versions of slurm this needs to be kept current when the
-	   protocol version changes. */
-	if (msg->protocol_version != NO_VAL16)
-		header->version = msg->protocol_version;
-	else if (working_cluster_rec)
-		msg->protocol_version = header->version =
-			working_cluster_rec->rpc_version;
-	else if ((msg->msg_type == ACCOUNTING_UPDATE_MSG) ||
-	         (msg->msg_type == ACCOUNTING_FIRST_REG)) {
-		uint16_t rpc_version =
-			((accounting_update_msg_t *)msg->data)->rpc_version;
-		msg->protocol_version = header->version = rpc_version;
-	} else
-		msg->protocol_version = header->version =
-			SLURM_PROTOCOL_VERSION;
+	xassert(msg->protocol_version && (msg->protocol_version != NO_VAL16));
 
+	memset(header, 0, sizeof(header_t));
 	header->flags = flags;
 	header->msg_type = msg->msg_type;
 	header->body_length = 0;	/* over-written later */
@@ -146,6 +74,7 @@ void init_header(header_t *header, slurm_msg_t *msg, uint16_t flags)
 		header->ret_cnt = 0;
 	header->ret_list = msg->ret_list;
 	header->orig_addr = msg->orig_addr;
+	header->version = msg->protocol_version;
 }
 
 /*
@@ -186,4 +115,47 @@ void slurm_set_port(slurm_addr_t *addr, uint16_t port)
 bool slurm_addr_is_unspec(slurm_addr_t *addr)
 {
 	return (addr->ss_family == AF_UNSPEC);
+}
+
+static bool is_valid_version(uint16_t version)
+{
+	return (version == SLURM_PROTOCOL_VERSION) ||
+	       (version == SLURM_ONE_BACK_PROTOCOL_VERSION) ||
+	       (version == SLURM_TWO_BACK_PROTOCOL_VERSION) ||
+	       (version == SLURM_MIN_PROTOCOL_VERSION);
+}
+
+extern rpc_fingerprint_t rpc_fingerprint(const buf_t *buffer)
+{
+	const size_t bytes = size_buf(buffer);
+	const void *data = get_buf_data(buffer);
+	uint32_t msglen;
+	uint16_t version;
+
+	if (bytes < (sizeof(msglen) + (2 * sizeof(version))))
+		return RPC_FINGERPRINT_NEED_MORE_BYTES;
+
+	msglen = ntohl(*(uint32_t *) data);
+
+	if (msglen > MAX_MSG_SIZE)
+		return RPC_FINGERPRINT_NOT_FOUND;
+	/* Header is at least this big */
+	if (msglen < sizeof(uint32_t) * 3)
+		return RPC_FINGERPRINT_NOT_FOUND;
+
+	version = ntohs(*(uint16_t *) (data + sizeof(msglen)));
+
+	if (!is_valid_version(version)) {
+		/*
+		 * Check if this is a slurmdbd RPC with version after msg_type
+		 * before rejecting
+		 */
+		version = ntohs(*(uint16_t *) (data + sizeof(msglen) +
+					       sizeof(version)));
+
+		if (!is_valid_version(version))
+			return RPC_FINGERPRINT_NOT_FOUND;
+	}
+
+	return RPC_FINGERPRINT_FOUND;
 }

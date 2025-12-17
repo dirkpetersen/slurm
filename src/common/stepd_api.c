@@ -48,11 +48,9 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 #include "src/common/fd.h"
@@ -60,15 +58,18 @@
 #include "src/common/macros.h"
 #include "src/common/pack.h"
 #include "src/common/read_config.h"
-#include "src/interfaces/auth.h"
-#include "src/interfaces/cred.h"
-#include "src/interfaces/jobacct_gather.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/stepd_api.h"
 #include "src/common/strlcpy.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xregex.h"
 #include "src/common/xstring.h"
+
+#include "src/interfaces/auth.h"
+#include "src/interfaces/cgroup.h"
+#include "src/interfaces/conn.h"
+#include "src/interfaces/cred.h"
+#include "src/interfaces/jobacct_gather.h"
 
 strong_alias(stepd_available, slurm_stepd_available);
 strong_alias(stepd_connect, slurm_stepd_connect);
@@ -82,6 +83,7 @@ strong_alias(xfree_struct_group_array, slurm_xfree_struct_group_array);
 strong_alias(stepd_gethostbyname, slurm_stepd_gethostbyname);
 strong_alias(xfree_struct_hostent, slurm_xfree_struct_hostent);
 strong_alias(stepd_get_namespace_fd, slurm_stepd_get_namespace_fd);
+strong_alias(stepd_get_namespace_fds, slurm_stepd_get_namespace_fds);
 
 /*
  * Should be called when a connect() to a socket returns ECONNREFUSED.
@@ -127,11 +129,15 @@ _handle_stray_socket(const char *socket_name)
 	}
 }
 
-static void _handle_stray_script(const char *directory, uint32_t job_id)
+static void _handle_stray_script(const char *directory,
+				 slurm_step_id_t *step_id)
 {
 	char *dir_path = NULL, *file_path = NULL;
 
-	xstrfmtcat(dir_path, "%s/job%05u", directory, job_id);
+	if (step_id->step_id != SLURM_BATCH_SCRIPT)
+		return;
+
+	xstrfmtcat(dir_path, "%s/job%05u", directory, step_id->job_id);
 	xstrfmtcat(file_path, "%s/slurm_script", dir_path);
 	info("%s: Purging vestigial job script %s", __func__, file_path);
 	(void) unlink(file_path);
@@ -146,53 +152,25 @@ _step_connect(const char *directory, const char *nodename,
 	      slurm_step_id_t *step_id)
 {
 	int fd;
-	int len;
-	struct sockaddr_un addr;
+	int rc;
 	char *name = NULL, *pos = NULL;
-	uint32_t stepid = step_id->step_id;
 
-	xstrfmtcatat(name, &pos, "%s/%s_%u.%u",
-		     directory, nodename, step_id->job_id, stepid);
+	xstrfmtcatat(name, &pos, "%s/%s_%u.%u", directory, nodename,
+		     step_id->job_id, step_id->step_id);
 	if (step_id->step_het_comp != NO_VAL)
 		xstrfmtcatat(name, &pos, ".%u", step_id->step_het_comp);
 
-	/*
-	 * If socket name would be truncated, emit error and exit
-	 */
-	if (strlen(name) >= sizeof(addr.sun_path)) {
-		error("%s: Unix socket path '%s' is too long. (%ld > %ld)",
-		      __func__, name, (long int)(strlen(name) + 1),
-		      (long int)sizeof(addr.sun_path));
-		xfree(name);
-		return -1;
-	}
-
-	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
-		error("%s: socket() failed for %s: %m",
-		      __func__, name);
-		xfree(name);
-		return -1;
-	}
-
-	memset(&addr, 0, sizeof(addr));
-	addr.sun_family = AF_UNIX;
-	strlcpy(addr.sun_path, name, sizeof(addr.sun_path));
-	len = strlen(addr.sun_path) + 1 + sizeof(addr.sun_family);
-
-	if (connect(fd, (struct sockaddr *) &addr, len) < 0) {
+	if ((rc = slurm_open_unix_stream(name, 0, &fd))) {
 		/* Can indicate race condition at step termination */
-		debug("%s: connect() failed for %s: %m",
-		      __func__, name);
+		debug("%s: failed for %s: %s",
+		      __func__, name, slurm_strerror(rc));
 		if (errno == ECONNREFUSED && running_in_slurmd()) {
 			_handle_stray_socket(name);
-
-			if (step_id->step_id == SLURM_BATCH_SCRIPT)
-				_handle_stray_script(directory,
-						     step_id->job_id);
+			_handle_stray_script(directory, step_id);
 		}
 
 		xfree(name);
-		close(fd);
+		fd_close(&fd);
 		return -1;
 	}
 
@@ -229,7 +207,7 @@ _guess_nodename(void)
 }
 
 /*
- * Connect to a slurmstepd proccess by way of its unix domain socket.
+ * Connect to a slurmstepd process by way of its unix domain socket.
  *
  * Both "directory" and "nodename" may be null, in which case stepd_connect
  * will attempt to determine them on its own.  If you are using multiple
@@ -278,12 +256,22 @@ extern int stepd_connect(const char *directory, const char *nodename,
 	return fd;
 
 rwfail:
-	close(fd);
+	fd_close(&fd);
 fail1:
 	xfree(local_nodename);
 	return fd;
 }
 
+extern sluid_t stepd_sluid(int fd, uint16_t protocol_version)
+{
+	int req = REQUEST_SLUID;
+	sluid_t sluid = 0;
+
+	safe_write(fd, &req, sizeof(int));
+	safe_read(fd, &sluid, sizeof(sluid_t));
+rwfail:
+	return sluid;
+}
 
 /*
  * Retrieve a job step's current state.
@@ -378,17 +366,159 @@ extern int stepd_get_namespace_fd(int fd, uint16_t protocol_version)
 	/*
 	 * Receive the file descriptor of the namespace to be joined if valid fd
 	 * is coming. Note that the number of ns_fd will not be the same
-	 * returned from receive_fd_over_pipe().  The number we got from the
+	 * returned from receive_fd_over_socket().  The number we got from the
 	 * safe_read was the fd on the sender which will be different on our
 	 * end.
 	 */
 	if (ns_fd > 0)
-		ns_fd = receive_fd_over_pipe(fd);
+		ns_fd = receive_fd_over_socket(fd);
 
 	return ns_fd;
 
 rwfail:
 	return -1;
+}
+
+/*
+ * Request to get required information to enter the namespace of a job.
+ *
+ * On success returns number of elements in the fd_map list and populates the
+ * list.
+ * Returns SLURM_ERROR on failure
+ */
+extern int stepd_get_namespace_fds(int fd, list_t *fd_map,
+				   uint16_t protocol_version)
+{
+	int req = REQUEST_GET_NS_FDS;
+	unsigned int fd_count = 0;
+
+	xassert(fd_map);
+
+	debug("entering %s", __func__);
+	safe_write(fd, &req, sizeof(req));
+
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
+		safe_read(fd, &fd_count, sizeof(fd_count));
+		if (fd_count == 0)
+			return fd_count;
+
+		for (int i = 0; i < fd_count; i++) {
+			ns_fd_map_t *tmp_map = xmalloc(sizeof(*tmp_map));
+			safe_read(fd, &tmp_map->type, sizeof(tmp_map->type));
+			tmp_map->fd = receive_fd_over_socket(fd);
+			list_append(fd_map, tmp_map);
+			tmp_map = NULL;
+		}
+	} else {
+		error("%s: bad protocol version %hu",
+		      __func__, protocol_version);
+		goto rwfail;
+	}
+
+	return fd_count;
+
+rwfail:
+	list_destroy(fd_map);
+	return SLURM_ERROR;
+}
+
+/*
+ * Retrieves the BPF token fd from the connected socket, this socket needs to be
+ * connected to the external slurmstepd as it is the only one capable of
+ * providing it.
+ *
+ * Return SLURM_ERROR on failure and the BPF token fd on success.
+ */
+extern int stepd_get_bpf_token(int fd, uint16_t protocol_version)
+{
+	int req = REQUEST_GET_BPF_TOKEN;
+	int token_fd = -1, bpf_fd = -1;
+	int rc;
+
+#ifndef HAVE_BPF_TOKENS
+	error("Cannot request a BPF token as slurm is not compiled with support for it");
+	return SLURM_ERROR;
+#endif
+
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
+		safe_write(fd, &req, sizeof(req));
+
+		/*
+		 * Receive rc that indicates whether token needs to be
+		 * generated or not.
+		 */
+		safe_read(fd, &rc, sizeof(rc));
+		if (rc == SLURM_ERROR) {
+			error("Contacted a non-external step");
+			goto rwfail;
+		}
+
+		if (rc == 0) { /* BPF token is generated */
+			/* Receive bpf token fd */
+			token_fd = receive_fd_over_socket(fd);
+			if (token_fd < 0) {
+				error("Problems receiving the BPF token fd");
+				goto rwfail;
+			}
+		} else { /* Generate BPF token */
+
+			/* Call fsopen for "bpf" */
+			bpf_fd = cgroup_g_bpf_fsopen();
+			if (bpf_fd < 0) {
+				rc = SLURM_ERROR;
+				safe_write(fd, &rc, sizeof(int));
+				error("bpf fsopen failure");
+				goto rwfail;
+			}
+
+			/* Send rc for fsopen and the fd itself */
+			rc = SLURM_SUCCESS;
+			safe_write(fd, &rc, sizeof(int));
+			send_fd_over_socket(fd, bpf_fd);
+
+			/* Receive rc indicating fsconfig success */
+			safe_read(fd, &rc, sizeof(rc));
+			if (rc != SLURM_SUCCESS) {
+				error("bpf fsconfig failure");
+				goto rwfail;
+			}
+
+			/* BPF token generation */
+			token_fd = cgroup_g_bpf_create_token(bpf_fd);
+			if (token_fd == SLURM_ERROR) {
+				rc = SLURM_ERROR;
+				safe_write(fd, &rc, sizeof(int));
+				goto rwfail;
+			}
+
+			/* Send RC for token create as well as the token fd */
+			rc = SLURM_SUCCESS;
+			safe_write(fd, &rc, sizeof(int));
+			send_fd_over_socket(fd, token_fd);
+
+			/* This indicates proper token fd receive */
+			safe_read(fd, &rc, sizeof(rc));
+			if (rc != SLURM_SUCCESS) {
+				error("Problems sending the bpf token fd");
+				goto rwfail;
+			}
+		}
+	} else {
+		error("%s: bad protocol version %hu",
+		      __func__, protocol_version);
+		goto rwfail;
+	}
+
+	if (bpf_fd >= 0)
+		close(bpf_fd);
+	return token_fd;
+
+rwfail:
+	if (bpf_fd >= 0)
+		close(bpf_fd);
+	if (token_fd >= 0)
+		close(token_fd);
+	return SLURM_ERROR;
 }
 
 /*
@@ -398,14 +528,33 @@ rwfail:
  * resp->gtids, resp->ntasks, and resp->executable.
  */
 extern int stepd_attach(int fd, uint16_t protocol_version, slurm_addr_t *ioaddr,
-			slurm_addr_t *respaddr, char *io_key, uid_t uid,
-			reattach_tasks_response_msg_t *resp)
+			slurm_addr_t *respaddr, char *cert, char *io_key,
+			uid_t uid, reattach_tasks_response_msg_t *resp)
 {
 	int req = REQUEST_ATTACH;
 	uint32_t io_key_len = strlen(io_key) + 1;
+	uint32_t cert_len;
 	int rc = SLURM_SUCCESS;
 
-	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
+	if (protocol_version >= SLURM_25_05_PROTOCOL_VERSION) {
+		safe_write(fd, &req, sizeof(int)); /* needs to be first */
+
+		if (cert) {
+			cert_len = strlen(cert) + 1;
+			safe_write(fd, &cert_len, sizeof(uint32_t));
+			safe_write(fd, cert, cert_len);
+		} else {
+			cert_len = 0;
+			safe_write(fd, &cert_len, sizeof(uint32_t));
+		}
+
+		safe_write(fd, ioaddr, sizeof(slurm_addr_t));
+		safe_write(fd, respaddr, sizeof(slurm_addr_t));
+		safe_write(fd, &io_key_len, sizeof(uint32_t));
+		safe_write(fd, io_key, io_key_len);
+		safe_write(fd, &uid, sizeof(uid_t));
+		safe_write(fd, &protocol_version, sizeof(uint16_t));
+	} else if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
 		safe_write(fd, &req, sizeof(int));
 		safe_write(fd, ioaddr, sizeof(slurm_addr_t));
 		safe_write(fd, respaddr, sizeof(slurm_addr_t));
@@ -490,6 +639,7 @@ _sockname_regex(regex_t *re, const char *filename, slurm_step_id_t *step_id)
 	int rc;
 
 	xassert(step_id);
+	*step_id = SLURM_STEP_ID_INITIALIZER;
 
 	memset(pmatch, 0, sizeof(regmatch_t)*nmatch);
 	if ((rc = regexec(re, filename, nmatch, pmatch, 0))) {
@@ -513,8 +663,7 @@ _sockname_regex(regex_t *re, const char *filename, slurm_step_id_t *step_id)
 		match = xstrndup(filename + pmatch[3].rm_so, my_size);
 		step_id->step_het_comp = slurm_atoul(match);
 		xfree(match);
-	} else
-		step_id->step_het_comp = NO_VAL;
+	}
 
 	return 0;
 }
@@ -582,7 +731,7 @@ extern list_t *stepd_available(const char *directory, const char *nodename)
 			loc = xmalloc(sizeof(step_loc_t));
 			loc->directory = xstrdup(directory);
 			loc->nodename = xstrdup(nodename);
-			memcpy(&loc->step_id, &step_id, sizeof(loc->step_id));
+			loc->step_id = step_id;
 			list_append(l, (void *)loc);
 		}
 	}
@@ -1006,19 +1155,9 @@ stepd_suspend(int fd, uint16_t protocol_version,
 	int rc = 0;
 	int errnum = 0;
 
-	if (protocol_version >= SLURM_23_11_PROTOCOL_VERSION) {
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
 		if (phase == 0) {
 			safe_write(fd, &req, sizeof(int));
-		} else {
-			/* Receive the return code and errno */
-			safe_read(fd, &rc, sizeof(int));
-			safe_read(fd, &errnum, sizeof(int));
-			errno = errnum;
-		}
-	} else if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		if (phase == 0) {
-			safe_write(fd, &req, sizeof(int));
-			safe_write(fd, NO_VAL16, sizeof(uint16_t));
 		} else {
 			/* Receive the return code and errno */
 			safe_read(fd, &rc, sizeof(int));
@@ -1048,19 +1187,9 @@ stepd_resume(int fd, uint16_t protocol_version,
 	int rc = 0;
 	int errnum = 0;
 
-	if (protocol_version >= SLURM_23_11_PROTOCOL_VERSION) {
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
 		if (phase == 0) {
 			safe_write(fd, &req, sizeof(int));
-		} else {
-			/* Receive the return code and errno */
-			safe_read(fd, &rc, sizeof(int));
-			safe_read(fd, &errnum, sizeof(int));
-			errno = errnum;
-		}
-	} else if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		if (phase == 0) {
-			safe_write(fd, &req, sizeof(int));
-			safe_write(fd, NO_VAL16, sizeof(uint16_t));
 		} else {
 			/* Receive the return code and errno */
 			safe_read(fd, &rc, sizeof(int));
@@ -1082,7 +1211,7 @@ extern int stepd_reconfig(int fd, uint16_t protocol_version, buf_t *reconf)
 
 	safe_write(fd, &req, sizeof(int));
 
-	if (protocol_version >= SLURM_23_11_PROTOCOL_VERSION) {
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
 		int len = 0;
 		if (reconf) {
 			len = get_buf_offset(reconf);
@@ -1147,38 +1276,13 @@ stepd_completion(int fd, uint16_t protocol_version, step_complete_msg_t *sent)
 	debug("Entering stepd_completion for %ps, range_first = %d, range_last = %d",
 	      &sent->step_id, sent->range_first, sent->range_last);
 
-	if (protocol_version >= SLURM_24_05_PROTOCOL_VERSION) {
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
 		safe_write(fd, &req, sizeof(int));
 		safe_write(fd, &sent->range_first, sizeof(int));
 		safe_write(fd, &sent->range_last, sizeof(int));
 		safe_write(fd, &sent->step_rc, sizeof(int));
 		safe_write(fd, &sent->step_id.step_id, sizeof(uint32_t));
 		safe_write(fd, &sent->send_to_stepmgr, sizeof(bool));
-
-		/*
-		 * We must not use setinfo over a pipe with slurmstepd here
-		 * Indeed, slurmd does a large use of getinfo over a pipe
-		 * with slurmstepd and doing the reverse can result in
-		 * a deadlock scenario with slurmstepd :
-		 * slurmd(lockforread,write)/slurmstepd(write,lockforread)
-		 * Do pack/unpack instead to be sure of independances of
-		 * slurmd and slurmstepd
-		 */
-		jobacctinfo_pack(sent->jobacct, protocol_version,
-				 PROTOCOL_TYPE_SLURM, buffer);
-		len = get_buf_offset(buffer);
-		safe_write(fd, &len, sizeof(int));
-		safe_write(fd, get_buf_data(buffer), len);
-		FREE_NULL_BUFFER(buffer);
-
-		/* Receive the return code and errno */
-		safe_read(fd, &rc, sizeof(int));
-		safe_read(fd, &errnum, sizeof(int));
-	} else if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		safe_write(fd, &req, sizeof(int));
-		safe_write(fd, &sent->range_first, sizeof(int));
-		safe_write(fd, &sent->range_last, sizeof(int));
-		safe_write(fd, &sent->step_rc, sizeof(int));
 
 		/*
 		 * We must not use setinfo over a pipe with slurmstepd here
@@ -1339,25 +1443,14 @@ rwfail:
 	return SLURM_ERROR;
 }
 
-/*
- * Get the memory limits of the step
- * Returns uid of the running step if successful.  On error returns -1.
- */
-extern int stepd_get_mem_limits(int fd, uint16_t protocol_version,
-				slurmstepd_mem_info_t *stepd_mem_info)
+extern int stepd_get_mem_limit(int fd, uint16_t protocol_version,
+			       uint64_t *job_mem_limit)
 {
 	int req = REQUEST_STEP_MEM_LIMITS;
 
-	xassert(stepd_mem_info);
-	memset(stepd_mem_info, 0, sizeof(slurmstepd_mem_info_t));
+	safe_write(fd, &req, sizeof(int));
 
-	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		safe_write(fd, &req, sizeof(int));
-
-		safe_read(fd, &stepd_mem_info->job_mem_limit, sizeof(uint32_t));
-		safe_read(fd, &stepd_mem_info->step_mem_limit,
-			  sizeof(uint32_t));
-	}
+	safe_read(fd, &job_mem_limit, sizeof(uint64_t));
 
 	return SLURM_SUCCESS;
 rwfail:
@@ -1416,7 +1509,7 @@ extern int stepd_relay_msg(int fd, slurm_msg_t *msg, uint16_t protocol_version)
 	buf_size = get_buf_offset(msg->buffer) - msg->body_offset;
 
 	safe_write(fd, &msg->protocol_version, sizeof(uint16_t));
-	send_fd_over_pipe(fd, msg->conn_fd);
+	send_fd_over_socket(fd, conn_g_get_fd(msg->conn));
 	safe_write(fd, &buf_size, sizeof(uint32_t));
 	safe_write(fd, &msg->buffer->head[msg->body_offset], buf_size);
 

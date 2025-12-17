@@ -41,15 +41,8 @@
 
 #include <inttypes.h>
 
+#include "src/common/pack.h"
 #include "src/common/slurm_protocol_defs.h"
-
-/*
- * check_header_version checks to see that the specified header was sent
- * from a node running the same version of the protocol as the current node
- * IN header - the message header received
- * RET - Slurm error code
- */
-extern int check_header_version(header_t * header);
 
 /*
  * init_header - simple function to create a header, always insuring that
@@ -78,5 +71,20 @@ extern void slurm_set_port(slurm_addr_t *addr, uint16_t port);
 
 /* Check if slurm_addr_t has an unspecified address type */
 extern bool slurm_addr_is_unspec(slurm_addr_t *addr);
+
+typedef enum {
+	RPC_FINGERPRINT_INVALID = 0,
+	RPC_FINGERPRINT_FOUND,
+	RPC_FINGERPRINT_NOT_FOUND,
+	RPC_FINGERPRINT_NEED_MORE_BYTES,
+	RPC_FINGERPRINT_INVALID_MAX,
+} rpc_fingerprint_t;
+
+/*
+ * Fingerprint buffer for RPC
+ * IN buffer - buffer to check
+ * RET fingerprinting status
+ */
+extern rpc_fingerprint_t rpc_fingerprint(const buf_t *buffer);
 
 #endif /* !_SLURM_PROTOCOL_UTIL_H */

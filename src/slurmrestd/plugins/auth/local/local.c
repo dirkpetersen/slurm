@@ -54,43 +54,23 @@
 
 #include "src/common/data.h"
 #include "src/common/log.h"
-#include "src/interfaces/auth.h"
+#include "src/common/slurm_protocol_defs.h"
 #include "src/common/uid.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 
+#include "src/interfaces/auth.h"
+
 #include "src/slurmrestd/rest_auth.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "select" for Slurm node selection) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load select plugins if the plugin_type string has a
- * prefix of "select/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "REST auth/local";
 const char plugin_type[] = "rest_auth/local";
-const uint32_t plugin_id = 101;
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
+/* Required for rest_auth plugins: */
+const uint32_t plugin_id = 101;
 
 extern int slurm_rest_auth_p_apply(rest_auth_context_t *context);
 
@@ -134,15 +114,16 @@ static int _auth_socket(on_http_request_args_t *args,
 			const char *header_user_name)
 {
 	int rc;
-	const char *name = conmgr_fd_get_name(args->context->con);
-	uid_t cred_uid;
-	gid_t cred_gid;
-	pid_t cred_pid;
+	const char *name = args->name;
+	conmgr_fd_t *con = conmgr_fd_get_ref(args->con);
+	uid_t cred_uid = SLURM_AUTH_NOBODY;
+	gid_t cred_gid = SLURM_AUTH_NOBODY;
+	pid_t cred_pid = 0;
 
 	xassert(!ctxt->user_name);
 
-	if ((rc = conmgr_get_fd_auth_creds(args->context->con, &cred_uid,
-					   &cred_gid, &cred_pid))) {
+	if ((rc = conmgr_get_fd_auth_creds(con, &cred_uid, &cred_gid,
+					   &cred_pid))) {
 		/* socket may be remote, local auth doesn't apply */
 		debug("%s: [%s] unable to get socket ownership: %s",
 		      __func__, name, slurm_strerror(rc));
@@ -245,14 +226,25 @@ extern int slurm_rest_auth_p_authenticate(on_http_request_args_t *args,
 	struct stat status = { 0 };
 	const char *header_user_name = find_http_header(args->headers,
 							HTTP_HEADER_USER_NAME);
-	const conmgr_fd_status_t cstatus =
-		conmgr_fd_get_status(args->context->con);
-	const int input_fd = conmgr_fd_get_input_fd(args->context->con);
-	const int output_fd = conmgr_fd_get_output_fd(args->context->con);
-	const char *name = conmgr_fd_get_name(args->context->con);
+	conmgr_fd_t *con = conmgr_fd_get_ref(args->con);
+	const conmgr_fd_status_t cstatus = conmgr_fd_get_status(con);
+	const char *name = args->name;
+	int rc = EINVAL, input_fd = -1, output_fd = -1;
 
 	xassert(!ctxt->user_name);
 
+	if ((rc = conmgr_con_get_input_fd(args->con, &input_fd))) {
+		debug3("%s: [%s] skipping auth local with invalid input_fd: %s",
+		       __func__, conmgr_con_get_name(args->con),
+		       slurm_strerror(rc));
+		return ESLURM_AUTH_SKIP;
+	}
+	if ((rc = conmgr_con_get_output_fd(args->con, &output_fd))) {
+		debug3("%s: [%s] skipping auth local with invalid output_fd: %s",
+		       __func__, conmgr_con_get_name(args->con),
+		       slurm_strerror(rc));
+		return ESLURM_AUTH_SKIP;
+	}
 	if ((input_fd < 0) || (output_fd < 0)) {
 		/* local auth requires there to be a valid fd */
 		debug3("%s: skipping auth local with invalid input_fd:%u output_fd:%u",
@@ -331,14 +323,11 @@ extern int slurm_rest_auth_p_authenticate(on_http_request_args_t *args,
 extern int slurm_rest_auth_p_apply(rest_auth_context_t *context)
 {
 	int rc;
-	char *user = uid_to_string_or_null(getuid());
 
 	xassert(((plugin_data_t *) context->plugin_data)->magic == MAGIC);
 	xassert(context->plugin_id == plugin_id);
 
 	rc = auth_g_thread_config(NULL, context->user_name);
-
-	xfree(user);
 
 	return rc;
 }

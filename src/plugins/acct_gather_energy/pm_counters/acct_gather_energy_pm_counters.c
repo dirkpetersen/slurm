@@ -44,32 +44,7 @@
 #include "src/common/slurm_xlator.h"
 #include "src/interfaces/acct_gather_energy.h"
 
-
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobacct" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobacct/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "AcctGatherEnergy pm_counters plugin";
 const char plugin_type[] = "acct_gather_energy/pm_counters";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -227,10 +202,6 @@ extern int acct_gather_energy_p_update_node_energy(void)
 	return rc;
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	/* put anything that requires the .conf being read in
@@ -240,21 +211,13 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
-	/*
-	 * We don't really want to destroy the the state, so those values
-	 * persist a reconfig. And if the process dies, this will be lost
-	 * anyway. So not freeing this variable is not really a leak.
-	 *
-	 * if (!running_in_slurmd_stepd())
-	 * 	return SLURM_SUCCESS;
-	 *
-	 * acct_gather_energy_destroy(local_energy);
-	 * local_energy = NULL;
-	 */
+	if (!running_in_slurmd_stepd())
+		return;
 
-	return SLURM_SUCCESS;
+	acct_gather_energy_destroy(local_energy);
+	local_energy = NULL;
 }
 
 extern int acct_gather_energy_p_get_data(enum acct_energy_type data_type,
@@ -359,7 +322,7 @@ extern void acct_gather_energy_p_conf_set(int context_id_in,
 	return;
 }
 
-extern void acct_gather_energy_p_conf_values(List *data)
+extern void acct_gather_energy_p_conf_values(list_t **data)
 {
 	return;
 }

@@ -33,11 +33,29 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
 \*****************************************************************************/
 
+#include "src/common/events.h"
+#include "src/common/list.h"
+#include "src/common/macros.h"
+#include "src/common/proc_args.h"
 #include "src/common/read_config.h"
 #include "src/common/xmalloc.h"
+#include "src/common/xstring.h"
 
 #include "src/conmgr/conmgr.h"
+#include "src/conmgr/delayed.h"
 #include "src/conmgr/mgr.h"
+#include "src/conmgr/signals.h"
+
+#define CTIME_STR_LEN 72
+
+#define MAGIC_LOG_WORK_ARGS 0xbaF9100a
+
+typedef struct {
+	int magic; /* MAGIC_LOG_WORK_ARGS */
+	const char *type;
+	int index;
+	probe_log_t *log;
+} log_work_args_t;
 
 static struct {
 	conmgr_work_status_t status;
@@ -50,16 +68,20 @@ static struct {
 };
 
 static struct {
-	conmgr_work_type_t type;
+	conmgr_work_sched_t type;
 	const char *string;
-} types[] = {
-	{ CONMGR_WORK_TYPE_INVALID, "INVALID" },
-	{ CONMGR_WORK_TYPE_CONNECTION_FIFO, "CONNECTION_FIFO" },
-	{ CONMGR_WORK_TYPE_CONNECTION_DELAY_FIFO, "DELAY_CONNECTION_FIFO" },
-	{ CONMGR_WORK_TYPE_CONNECTION_WRITE_COMPLETE,
-	  "CONNECTION_WRITE_COMPLETE" },
-	{ CONMGR_WORK_TYPE_FIFO, "FIFO" },
-	{ CONMGR_WORK_TYPE_TIME_DELAY_FIFO, "TIME_DELAY_FIFO" },
+} sched_types[] = {
+	{ CONMGR_WORK_SCHED_FIFO , "FIFO" },
+};
+
+static struct {
+	conmgr_work_depend_t type;
+	const char *string;
+} dep_types[] = {
+	{ CONMGR_WORK_DEP_NONE, "NONE" },
+	{ CONMGR_WORK_DEP_CON_WRITE_COMPLETE, "CONNECTION_WRITE_COMPLETE" },
+	{ CONMGR_WORK_DEP_TIME_DELAY, "TIME_DELAY" },
+	{ CONMGR_WORK_DEP_SIGNAL, "SIGNAL" },
 };
 
 extern const char *conmgr_work_status_string(conmgr_work_status_t status)
@@ -71,162 +93,304 @@ extern const char *conmgr_work_status_string(conmgr_work_status_t status)
 	fatal_abort("%s: invalid work status 0x%x", __func__, status);
 }
 
-extern const char *conmgr_work_type_string(conmgr_work_type_t type)
+extern char *conmgr_work_sched_string(conmgr_work_sched_t type)
 {
-	for (int i = 0; i < ARRAY_SIZE(types); i++)
-		if (types[i].type == type)
-			return types[i].string;
+	char *str = NULL, *at = NULL;
 
-	fatal_abort("%s: invalid work type 0x%x", __func__, type);
+	for (int i = 0; i < ARRAY_SIZE(sched_types); i++)
+		if ((sched_types[i].type & type) == sched_types[i].type)
+			xstrfmtcatat(str, &at, "%s%s", (str ? "|" : ""),
+				     sched_types[i].string);
+
+	if (str)
+		return str;
+
+	fatal_abort("%s: invalid work sched_type: 0x%x", __func__, type);
+}
+
+extern char *conmgr_work_depend_string(conmgr_work_depend_t type)
+{
+	char *str = NULL, *at = NULL;
+
+	for (int i = 0; i < ARRAY_SIZE(dep_types); i++)
+		if ((dep_types[i].type & type) == dep_types[i].type)
+			xstrfmtcatat(str, &at, "%s%s", (str ? "|" : ""),
+				     dep_types[i].string);
+
+	if (str)
+		return str;
+
+	fatal_abort("%s: invalid work depend_type: 0x%x", __func__, type);
+}
+
+static void _log_work(work_t *work, const char *caller, const char *fmt, ...)
+{
+	char *con_name = NULL, *depend = NULL, *sched = NULL, *fmtstr = NULL;
+	char *delay = NULL, *signal = NULL, *callback = NULL;
+	const char *status = NULL;
+
+	if (!(slurm_conf.debug_flags & DEBUG_FLAG_CONMGR))
+		return;
+
+	if (work->ref) {
+		conmgr_fd_t *con = fd_get_ref(work->ref);
+		xstrfmtcat(con_name, " [%s]", con->name);
+	}
+
+	if (work->callback.func)
+		xstrfmtcat(callback, "callback=%s(arg=0x%"PRIxPTR") ",
+			   work->callback.func_name,
+			   (uintptr_t) work->callback.arg);
+
+	status = conmgr_work_status_string(work->status);
+
+	if (work->control.depend_type & CONMGR_WORK_DEP_SIGNAL) {
+		char *signame = sig_num2name(work->control.on_signal_number);
+		xstrfmtcat(signal, " signal=%s[%d]",
+			   signame, work->control.on_signal_number);
+		xfree(signame);
+	}
+
+	delay = work_delayed_to_str(work);
+	depend = conmgr_work_depend_string(work->control.depend_type);
+	sched = conmgr_work_sched_string(work->control.schedule_type);
+
+	if (fmt) {
+		va_list ap;
+
+		va_start(ap, fmt);
+		fmtstr = vxstrfmt(fmt, ap);
+		va_end(ap);
+	}
+
+	log_flag(CONMGR, "%s->%s:%s work=0x%"PRIxPTR" status=%s %ssched=%s depend=%s%s%s%s%s%s",
+		 caller, __func__, (con_name ? con_name : ""), (uintptr_t) work,
+		 status,
+		 (callback ? callback : ""),
+		 sched, depend,
+		 (signal ? signal : ""),
+		 (delay ? " " : ""),
+		 (delay ? delay : ""),
+		 (fmtstr ? " -> " : ""),
+		 (fmtstr ? fmtstr : ""));
+
+	xfree(con_name);
+	xfree(depend);
+	xfree(sched);
+	xfree(delay);
+	xfree(signal);
+	xfree(callback);
+	xfree(fmtstr);
+}
+
+static work_t *_find_con_work(conmgr_fd_t *con, work_t *work)
+{
+	work_t *test = NULL, *next = NULL;
+
+	/* Only try running if in RUN status */
+	if (work->status != CONMGR_WORK_STATUS_RUN)
+		return NULL;
+
+	if (!con->work || list_is_empty(con->work))
+		return NULL;
+
+	if (!(test = list_peek(con->work)))
+		return NULL;
+
+	xassert(test->magic == MAGIC_WORK);
+	xassert(test->control.depend_type != CONMGR_WORK_DEP_INVALID);
+	xassert(test->ref->con == con);
+	xassert(test->status == CONMGR_WORK_STATUS_PENDING);
+
+	if (test->control.schedule_type != CONMGR_WORK_SCHED_FIFO)
+		return NULL;
+
+	/* Work must not have any dependencies that could require ordering */
+	if (test->control.depend_type != CONMGR_WORK_DEP_NONE)
+		return NULL;
+
+	next = list_pop(con->work);
+	xassert(next == test);
+
+	return next;
+}
+
+static work_t *_con_all_work_complete(conmgr_fd_t *con, work_t *work)
+{
+	work_t *next = NULL;
+	/*
+	 * All connection work has completed and we will call
+	 * handle_connection() to check the connection. In most cases,
+	 * handle_connection() will add more connection work which can be
+	 * executed next.
+	 */
+	con_unset_flag(con, FLAG_WORK_ACTIVE);
+
+	handle_connection(true, con);
+
+	if (!con_flag(con, FLAG_WORK_ACTIVE) &&
+	    (next = _find_con_work(con, work))) {
+		con_set_flag(con, FLAG_WORK_ACTIVE);
+		return next;
+	}
+
+	/*
+	 * No new eligible work was queued that can be run now, wake up watch to
+	 * see if other work can be done instead
+	 */
+	EVENT_SIGNAL(&mgr.watch_sleep);
+	return NULL;
+}
+
+static work_t *_on_con_work_complete(conmgr_fd_t *con, work_t *work)
+{
+	work_t *next = NULL;
+
+	slurm_mutex_lock(&mgr.mutex);
+	/* con may be xfree()ed any time once lock is released */
+
+	if ((next = _find_con_work(con, work)) ||
+	    (next = _con_all_work_complete(con, work)))
+		work->status = CONMGR_WORK_STATUS_RUN;
+
+	fd_free_ref(&work->ref);
+
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return next;
+}
+
+static work_t *_run_work(work_t *work)
+{
+	work_t *next = NULL;
+	conmgr_callback_args_t args = {
+		.status = work->status,
+	};
+
+	xassert(work->magic == MAGIC_WORK);
+
+	if (work->ref) {
+		CONMGR_CON_LINK(work->ref, args.ref);
+		xassert(args.ref->magic == MAGIC_CON_MGR_FD_REF);
+		args.con = fd_get_ref(work->ref);
+		xassert(args.con->magic == MAGIC_CON_MGR_FD);
+	}
+
+	_log_work(work, __func__, "BEGIN");
+
+	work->callback.func(args, work->callback.arg);
+
+	_log_work(work, __func__, "END");
+
+	if (args.con)
+		next = _on_con_work_complete(args.con, work);
+
+	CONMGR_CON_UNLINK(args.ref);
+	work->magic = ~MAGIC_WORK;
+	xfree(work);
+
+	return next;
+}
+
+extern void wrap_work(work_t *work)
+{
+	while ((work = _run_work(work)))
+		/* do nothing */;
 }
 
 /*
- * Wrap work requested to notify mgr when that work is complete
+ * Add work to mgr.work
+ * Single point to enqueue internal function callbacks
+ * NOTE: _handle_work_run() can add new entries to mgr.work
+ *
+ * IN work - pointer to work to run
+ * NOTE: never add a thread that will never return or conmgr_fini() will never
+ *	return either.
+ * NOTE: conmgr mutex must be held by caller
  */
-static void _wrap_work(void *x)
-{
-	work_t *work = x;
-	conmgr_fd_t *con = work->con;
-
-	log_flag(CONMGR, "%s: %s%s%sBEGIN work=0x%"PRIxPTR" %s@0x%"PRIxPTR" type=%s status=%s arg=0x%"PRIxPTR,
-		 __func__, (con ? "[" : ""), (con ? con->name : ""),
-		 (con ? "] " : ""), (uintptr_t) work, work->tag,
-		 (uintptr_t) work->func, conmgr_work_type_string(work->type),
-		 conmgr_work_status_string(work->status),
-		 (uintptr_t) work->arg);
-
-	switch (work->type) {
-	case CONMGR_WORK_TYPE_FIFO:
-	case CONMGR_WORK_TYPE_TIME_DELAY_FIFO:
-		xassert(!con);
-		work->func(NULL, work->type, work->status, work->tag,
-			   work->arg);
-		break;
-	case CONMGR_WORK_TYPE_CONNECTION_WRITE_COMPLETE:
-	case CONMGR_WORK_TYPE_CONNECTION_FIFO:
-	case CONMGR_WORK_TYPE_CONNECTION_DELAY_FIFO:
-		wrap_con_work(work, con);
-		break;
-	default:
-		fatal_abort("%s: invalid work type 0x%x", __func__, work->type);
-	}
-
-	log_flag(CONMGR, "%s: %s%s%sEND work=0x%"PRIxPTR" %s@0x%"PRIxPTR" type=%s status=%s arg=0x%"PRIxPTR,
-		 __func__, (con ? "[" : ""), (con ? con->name : ""),
-		 (con ? "] " : ""), (uintptr_t) work, work->tag,
-		 (uintptr_t) work->func, conmgr_work_type_string(work->type),
-		 conmgr_work_status_string(work->status),
-		 (uintptr_t) work->arg);
-
-	signal_change(false);
-
-	work->magic = ~MAGIC_WORK;
-	xfree(work);
-}
-
-/* Single point to queue internal function callback via workq. */
-extern void queue_func(bool locked, work_func_t func, void *arg,
-		       const char *tag)
-{
-	if (!locked)
-		slurm_mutex_lock(&mgr.mutex);
-
-	if (!mgr.quiesced) {
-		if (workq_add_work(func, arg, tag))
-			fatal_abort("%s: workq_add_work() failed", __func__);
-	} else {
-		/*
-		 * Defer all funcs until conmgr_run() as adding new connections
-		 * will call queue_func() including on_connection() callback
-		 * which is very surprising before conmgr is running and can
-		 * cause locking conflicts.
-		 */
-		deferred_func_t *df = xmalloc(sizeof(*df));
-		*df = (deferred_func_t) {
-			.magic = MAGIC_DEFERRED_FUNC,
-			.func = func,
-			.arg = arg,
-			.tag = tag,
-		};
-
-		list_append(mgr.deferred_funcs, df);
-	}
-
-	if (!locked)
-		slurm_mutex_unlock(&mgr.mutex);
-}
-
-/* mgr must be locked */
 static void _handle_work_run(work_t *work)
 {
-	queue_func(true, _wrap_work, work, work->tag);
+	xassert(work->magic == MAGIC_WORK);
+
+	_log_work(work, __func__, "Enqueueing work. work:%u",
+		  list_count(mgr.work));
+
+	/* add to work list and signal a thread if watch is active */
+	list_append(mgr.work, work);
+
+	if (!mgr.quiesce.active)
+		EVENT_SIGNAL(&mgr.worker_sleep);
 }
 
-/* mgr must be locked */
+/*
+ * Routes new pending work to the correct queue
+ * WARNING: conmgr.mutex must be locked by calling thread
+ * IN work - Work to route. Takes ownership.
+ */
 static void _handle_work_pending(work_t *work)
 {
-	conmgr_fd_t *con = work->con;
+	conmgr_fd_t *con = fd_get_ref(work->ref);
+	conmgr_work_depend_t depend = work->control.depend_type;
 
-	switch (work->type) {
-	case CONMGR_WORK_TYPE_CONNECTION_DELAY_FIFO:
-		if (!work->con)
-			fatal_abort("%s: CONMGR_WORK_TYPE_CONNECTION_DELAY_FIFO requires a connection",
-				    __func__);
-		/* fall through */
-	case CONMGR_WORK_TYPE_TIME_DELAY_FIFO:
-	{
-		update_last_time(true);
-		work->begin.seconds += mgr.last_time.tv_sec;
-		list_append(mgr.delayed_work, work);
-		update_timer(true);
-		break;
+	xassert(work->magic == MAGIC_WORK);
+	xassert(work->status == CONMGR_WORK_STATUS_PENDING);
+
+	if (depend & CONMGR_WORK_DEP_NONE) {
+		/* check for other flags being set too */
+		xassert(depend == CONMGR_WORK_DEP_NONE);
 	}
-	case CONMGR_WORK_TYPE_CONNECTION_FIFO:
-	{
-		if (!con)
-			fatal_abort("%s: CONMGR_WORK_TYPE_CONNECTION_FIFO requires a connection",
-				    __func__);
-		log_flag(CONMGR, "%s: [%s] work_active=%c queuing \"%s\" pending work: %u total",
-			 __func__, con->name, (con->work_active ? 'T' : 'F'),
-			 work->tag, list_count(con->work));
-		list_append(con->work, work);
-		break;
+
+	if (depend & CONMGR_WORK_DEP_TIME_DELAY) {
+		_log_work(work, __func__, "Enqueueing delayed work. delayed_work:%u",
+			  list_count(mgr.delayed_work));
+		add_work_delayed(work);
+		return;
 	}
-	case CONMGR_WORK_TYPE_CONNECTION_WRITE_COMPLETE:
-		if (!con)
-			fatal_abort("%s: CONMGR_WORK_TYPE_CONNECTION_FIFO requires a connection",
-				    __func__);
+
+	if (depend & CONMGR_WORK_DEP_CON_WRITE_COMPLETE) {
+		xassert(con);
+
+		if (slurm_conf.debug_flags & DEBUG_FLAG_CONMGR) {
+			char *flags = con_flags_string(con->flags);
+			_log_work(work, __func__, "Enqueueing connection write complete work. pending_writes=%u pending_write_complete_work:%u flags=%s",
+				  list_count(con->out),
+				  list_count(con->write_complete_work), flags);
+			xfree(flags);
+		}
+
 		list_append(con->write_complete_work, work);
-		break;
-	case CONMGR_WORK_TYPE_FIFO:
-		/* can be run now */
-		xassert(!con);
-		work->status = CONMGR_WORK_STATUS_RUN;
-		handle_work(true, work);
-		break;
-	case CONMGR_WORK_TYPE_INVALID:
-	case CONMGR_WORK_TYPE_MAX:
-		fatal("%s: invalid type", __func__);
+		return;
 	}
+
+	if (depend & CONMGR_WORK_DEP_SIGNAL) {
+		_log_work(work, __func__, "Enqueueing signal work");
+		add_work_signal(work);
+		return;
+	}
+
+	if (con) {
+		if (slurm_conf.debug_flags & DEBUG_FLAG_CONMGR) {
+			char *flags = con_flags_string(con->flags);
+			_log_work(work, __func__, "Enqueueing connection work. pending_work:%u flags=%s",
+				  list_count(con->work), flags);
+			xfree(flags);
+		}
+
+		list_append(con->work, work);
+
+		/* trigger watch() if there is a connection involved */
+		EVENT_SIGNAL(&mgr.watch_sleep);
+		return;
+	}
+
+	/* No dependency blocking work from running now */
+
+	work->status = CONMGR_WORK_STATUS_RUN;
+	handle_work(true, work);
 }
 
 extern void handle_work(bool locked, work_t *work)
 {
-	conmgr_fd_t *con = work->con;
-
-	if (con)
-		log_flag(CONMGR, "%s: [%s] work=0x%"PRIxPTR" status=%s type=%s func=%s@0x%"PRIxPTR,
-			 __func__, con->name, (uintptr_t) work,
-			conmgr_work_status_string(work->status),
-			conmgr_work_type_string(work->type),
-			work->tag, (uintptr_t) work->func);
-	else
-		log_flag(CONMGR, "%s: work=0x%"PRIxPTR" status=%s type=%s func=%s@0x%"PRIxPTR,
-			 __func__, (uintptr_t) work,
-			conmgr_work_status_string(work->status),
-			conmgr_work_type_string(work->type),
-			work->tag, (uintptr_t) work->func);
-
 	if (!locked)
 		slurm_mutex_lock(&mgr.mutex);
 
@@ -234,14 +398,10 @@ extern void handle_work(bool locked, work_t *work)
 	case CONMGR_WORK_STATUS_PENDING:
 		_handle_work_pending(work);
 		break;
+	case CONMGR_WORK_STATUS_CANCELLED:
+		/* fall through as cancelled work runs immediately */
 	case CONMGR_WORK_STATUS_RUN:
 		_handle_work_run(work);
-		break;
-	case CONMGR_WORK_STATUS_CANCELLED:
-		if (con)
-			list_append(con->work, work);
-		else
-			_handle_work_run(work);
 		break;
 	case CONMGR_WORK_STATUS_MAX:
 	case CONMGR_WORK_STATUS_INVALID:
@@ -249,47 +409,153 @@ extern void handle_work(bool locked, work_t *work)
 			    __func__, work->status);
 	}
 
-	signal_change(true);
+	if (!locked)
+		slurm_mutex_unlock(&mgr.mutex);
+}
+
+extern void work_mask_depend(work_t *work, conmgr_work_depend_t depend_mask)
+{
+	/*
+	 * Apply dependency mask but set NONE if the mask removes all bits and
+	 * skip applying mask if there are !NONE bits set currently.
+	 */
+	if (!depend_mask || (work->control.depend_type == CONMGR_WORK_DEP_NONE))
+		return;
+
+	xassert(~depend_mask != CONMGR_WORK_DEP_NONE);
+
+	if (!(work->control.depend_type & depend_mask))
+		work->control.depend_type = CONMGR_WORK_DEP_NONE;
+	else
+		work->control.depend_type &= depend_mask;
+}
+
+extern void add_work(bool locked, conmgr_fd_t *con, conmgr_callback_t callback,
+		     conmgr_work_control_t control,
+		     conmgr_work_depend_t depend_mask, const char *caller)
+{
+	work_t *work = xmalloc_nz(sizeof(*work));
+	*work = (work_t) {
+		.magic = MAGIC_WORK,
+		.status = CONMGR_WORK_STATUS_PENDING,
+		.callback = callback,
+		.control = control,
+	};
+
+	if (!locked)
+		slurm_mutex_lock(&mgr.mutex);
+
+	if (con)
+		fd_new_ref(con, &work->ref);
+
+	work_mask_depend(work, depend_mask);
+
+	handle_work(true, work);
 
 	if (!locked)
 		slurm_mutex_unlock(&mgr.mutex);
 }
 
-extern void add_work(bool locked, conmgr_fd_t *con, conmgr_work_func_t func,
-		     conmgr_work_type_t type, void *arg, const char *tag)
+extern void conmgr_add_work(conmgr_fd_t *con, conmgr_callback_t callback,
+			    conmgr_work_control_t control, const char *caller)
 {
-	work_t *work = xmalloc(sizeof(*work));
-	*work = (work_t) {
-		.magic = MAGIC_WORK,
-		.con = con,
-		.func = func,
-		.arg = arg,
-		.tag = tag,
-		.type = type,
-		.status = CONMGR_WORK_STATUS_PENDING,
+	add_work(false, con, callback, control, 0, caller);
+}
+
+extern size_t printf_work(const work_t *work, char *buffer, size_t len,
+			  bool include_connection)
+{
+	size_t wrote = 0;
+	char time_begin[CTIME_STR_LEN] = "n/a";
+	char *schedule_type = NULL, *depend_type = NULL;
+
+	if (work->control.schedule_type != CONMGR_WORK_SCHED_INVALID)
+		schedule_type =
+			conmgr_work_sched_string(work->control.schedule_type);
+	if (work->control.depend_type != CONMGR_WORK_DEP_INVALID)
+		depend_type =
+			conmgr_work_depend_string(work->control.depend_type);
+
+	xassert(work->magic == MAGIC_WORK);
+
+	if (work->control.depend_type & CONMGR_WORK_DEP_TIME_DELAY)
+		timespec_ctime(work->control.time_begin, true, time_begin,
+			       sizeof(time_begin));
+
+	wrote = snprintf(
+		buffer, len,
+		"%s%s%sstatus:%s callback:%s(0x%" PRIxPTR
+		") schedule_type=%s depend_type=%s time_begin:%s on_signal_number:%d",
+		((include_connection && work->ref) ? "[" : ""),
+		((include_connection && work->ref) ? work->ref->con->name : ""),
+		((include_connection && work->ref) ? "] " : ""),
+		conmgr_work_status_string(work->status),
+		work->callback.func_name, (uintptr_t) work->callback.arg,
+		schedule_type, depend_type, time_begin,
+		work->control.on_signal_number);
+
+	xfree(schedule_type);
+	xfree(depend_type);
+
+	return wrote;
+}
+
+static int _foreach_log_work(void *x, void *arg)
+{
+	const work_t *work = x;
+	log_work_args_t *args = arg;
+	probe_log_t *log = args->log;
+	char str[PRINTF_WORK_CHARS];
+
+	xassert(args->magic == MAGIC_LOG_WORK_ARGS);
+	xassert(work->magic == MAGIC_WORK);
+
+	printf_work(work, str, sizeof(str), true);
+
+	probe_log(log, "%s[%d]: %s", args->type, args->index, str);
+
+	args->index++;
+
+	return SLURM_SUCCESS;
+}
+
+/* Caller must hold mgr.mutex lock */
+static void _probe_verbose(probe_log_t *log)
+{
+	log_work_args_t args = {
+		.magic = MAGIC_LOG_WORK_ARGS,
+		.type = "delayed_work",
+		.log = log,
 	};
 
-	handle_work(locked, work);
+	probe_log(log, "work queues: work:%d delayed_work:%d",
+		  list_count(mgr.work), list_count(mgr.delayed_work));
+
+	(void) list_for_each_ro(mgr.delayed_work, _foreach_log_work, &args);
+
+	args.index = 0;
+	args.type = "work";
+
+	(void) list_for_each_ro(mgr.work, _foreach_log_work, &args);
 }
 
-extern void conmgr_add_work(conmgr_fd_t *con, conmgr_work_func_t func,
-			    conmgr_work_type_t type, void *arg,
-			    const char *tag)
+extern probe_status_t probe_work(probe_log_t *log)
 {
-	add_work(false, con, func, type, arg, tag);
-}
+	probe_status_t status = PROBE_RC_UNKNOWN;
 
-extern void requeue_deferred_funcs(void)
-{
-	deferred_func_t *df;
+	slurm_mutex_lock(&mgr.mutex);
 
-	if (mgr.quiesced)
-		return;
+	if (log)
+		_probe_verbose(log);
 
-	while ((df = list_pop(mgr.deferred_funcs))) {
-		queue_func(true, df->func, df->arg, df->tag);
-		xassert(df->magic == MAGIC_DEFERRED_FUNC);
-		df->magic = ~MAGIC_DEFERRED_FUNC;
-		xfree(df);
-	}
+	if (!mgr.initialized)
+		status = PROBE_RC_UNKNOWN;
+	else if (!mgr.work || !mgr.delayed_work)
+		status = PROBE_RC_DOWN;
+	else
+		status = PROBE_RC_READY;
+
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return status;
 }

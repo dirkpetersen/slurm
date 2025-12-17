@@ -39,7 +39,7 @@
 
 static int _set_cond(int *start, int argc, char **argv,
 		     slurmdb_tres_cond_t *tres_cond,
-		     List format_list)
+		     list_t *format_list)
 {
 	int i;
 	int set = 0;
@@ -53,15 +53,10 @@ static int _set_cond(int *start, int argc, char **argv,
 	}
 
 	for (i=(*start); i<argc; i++) {
-		end = parse_option_end(argv[i]);
-		if (!end)
-			command_len=strlen(argv[i]);
-		else {
-			command_len=end-1;
-			if (argv[i][end] == '=') {
-				end++;
-			}
-		}
+		int op_type;
+		end = parse_option_end(argv[i], &op_type, &command_len);
+		if (!common_verify_option_syntax(argv[i], op_type, false))
+			continue;
 
 		if (!xstrncasecmp(argv[i], "Set", MAX(command_len, 3))) {
 			i--;
@@ -122,11 +117,11 @@ static int _set_cond(int *start, int argc, char **argv,
  */
 int sacctmgr_list_tres(int argc, char **argv)
 {
-	List tres_list;
+	list_t *tres_list;
 	list_itr_t *itr;
 	list_itr_t *itr2;
-	List format_list = list_create(xfree_ptr);
-	List print_fields_list;
+	list_t *format_list = list_create(xfree_ptr);
+	list_t *print_fields_list;
 	slurmdb_tres_cond_t *tres_cond = xmalloc(sizeof(slurmdb_tres_cond_t));
 	slurmdb_tres_rec_t *tres;
 	int field_count, i;

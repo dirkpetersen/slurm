@@ -38,24 +38,38 @@
 
 #include "../common/common_topo.h"
 
+#define MAX_BLOCK_LEVELS 16
+
 typedef struct {
 	int level;
-	char *name;			/* switch name */
+	char *name;			/* block name */
 	bitstr_t *node_bitmap;		/* bitmap of all nodes descended from
 					 * this block */
 	char *nodes;			/* name if direct descendant nodes */
 	uint16_t block_index;
 } block_record_t;
 
-extern bitstr_t *blocks_nodes_bitmap;	/* nodes on any bblock */
-extern block_record_t *block_record_table;  /* ptr to block records */
-extern uint16_t bblock_node_cnt;
-extern bitstr_t *block_levels;
-extern int block_record_cnt;
+typedef struct {
+	bitstr_t *blocks_nodes_bitmap; /* nodes on any bblock */
+	block_record_t *block_record_table; /* ptr to block records */
+	uint16_t bblock_node_cnt;
+	bitstr_t *block_levels;
+	uint32_t block_sizes[MAX_BLOCK_LEVELS];
+	uint16_t block_sizes_cnt;
+	uint32_t blocks_nodes_cnt;
+	int block_count;
+	int ablock_count;
+} block_context_t;
+
+typedef struct {
+	list_t *segment_list; /* List of char *node_list */
+} topology_jobinfo_t;
 
 /* Free all memory associated with block_record_table structure */
-extern void block_record_table_destroy(void);
+extern void block_record_table_destroy(block_context_t *ctx);
 
-extern void block_record_validate(void);
+extern int block_record_validate(topology_ctx_t *tctx);
+
+extern void block_record_update_block_config(topology_ctx_t *tctx, int idx);
 
 #endif

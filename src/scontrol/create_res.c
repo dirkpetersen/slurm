@@ -37,8 +37,8 @@
 \*****************************************************************************/
 
 #include "src/common/proc_args.h"
+#include "src/common/slurm_protocol_defs.h"
 #include "src/scontrol/scontrol.h"
-#include "src/slurmctld/reservation.h"
 
 #define PLUS_MINUS(sign) (((sign == '+')) ? RESERVE_FLAG_DUR_PLUS : \
 			  ((sign == '-') ? RESERVE_FLAG_DUR_MINUS : 0))
@@ -109,6 +109,23 @@ static int _parse_res_options(int argc, char **argv, const char *msg,
 			} else {
 				resv_msg_ptr->accounts = val;
 			}
+		} else if (!xstrncasecmp(tag, "AllowedPartitions",
+					 MAX(taglen, 2))) {
+			if (resv_msg_ptr->allowed_parts) {
+				exit_code = 1;
+				error("Parameter %s specified more than once",
+				      argv[i]);
+				return SLURM_ERROR;
+			}
+			if (plus_minus) {
+				resv_msg_ptr->allowed_parts =
+					scontrol_process_plus_minus(plus_minus,
+								    val, false);
+				*res_free_flags |= RESV_FREE_STR_ALLOWED_PARTS;
+				plus_minus = '\0';
+			} else {
+				resv_msg_ptr->allowed_parts = val;
+			}
 		} else if (xstrncasecmp(tag, "Comment", MAX(taglen, 3)) == 0) {
 			if (resv_msg_ptr->comment) {
 				exit_code = 1;
@@ -167,6 +184,22 @@ static int _parse_res_options(int argc, char **argv, const char *msg,
 				resv_msg_ptr->users = val;
 			}
 
+		} else if (!xstrncasecmp(tag, "QOS", MAX(taglen, 1))) {
+			if (resv_msg_ptr->qos) {
+				exit_code = 1;
+				error("Parameter %s specified more than once",
+				      argv[i]);
+				return SLURM_ERROR;
+			}
+			if (plus_minus) {
+				resv_msg_ptr->qos =
+					scontrol_process_plus_minus(plus_minus,
+								    val, false);
+				*res_free_flags |= RESV_FREE_STR_QOS;
+				plus_minus = '\0';
+			} else {
+				resv_msg_ptr->qos = val;
+			}
 		} else if (!xstrncasecmp(tag, "ReservationName",
 			   MAX(taglen, 1))) {
 			resv_msg_ptr->name = val;
@@ -350,7 +383,7 @@ scontrol_update_res(int argc, char **argv)
 	ret = slurm_update_reservation(&resv_msg);
 	if (ret) {
 		exit_code = 1;
-		ret = slurm_get_errno();
+		ret = errno;
 	} else {
 		printf("Reservation updated.\n");
 	}
@@ -377,6 +410,7 @@ scontrol_create_res(int argc, char **argv)
 	char *new_res_name = NULL;
 	uint32_t res_free_flags = 0;
 	int ret = 0;
+	char *error_msg;
 
 	slurm_init_resv_desc_msg (&resv_msg);
 	ret = _parse_res_options(argc, argv, "No reservation created.",
@@ -385,88 +419,9 @@ scontrol_create_res(int argc, char **argv)
 	if (ret)
 		goto SCONTROL_CREATE_RES_CLEANUP;
 
-	if (resv_msg.start_time == (time_t)NO_VAL) {
+	if (validate_resv_create_desc(&resv_msg, &error_msg, &res_free_flags)) {
 		exit_code = 1;
-		error("A start time must be given.  No reservation created.");
-		goto SCONTROL_CREATE_RES_CLEANUP;
-	}
-	if (resv_msg.end_time == (time_t)NO_VAL &&
-	    resv_msg.duration == NO_VAL) {
-		exit_code = 1;
-		error("An end time or duration must be given.  No reservation created.");
-		goto SCONTROL_CREATE_RES_CLEANUP;
-	}
-	if (resv_msg.end_time != (time_t)NO_VAL &&
-	    resv_msg.duration != NO_VAL &&
-	    resv_msg.start_time + resv_msg.duration*60 != resv_msg.end_time) {
-		exit_code = 1;
-		error("StartTime + Duration does not equal EndTime.  No reservation created.");
-		goto SCONTROL_CREATE_RES_CLEANUP;
-	}
-	if (resv_msg.start_time > resv_msg.end_time &&
-	    resv_msg.end_time != (time_t)NO_VAL) {
-		exit_code = 1;
-		error("Start time cannot be after end time.  No reservation created.");
-		goto SCONTROL_CREATE_RES_CLEANUP;
-	}
-
-	/*
-	 * If "ALL" is specified for the nodes and a partition is specified,
-	 * only allocate all of the nodes the partition.
-	 */
-	if ((resv_msg.partition != NULL) && (resv_msg.node_list != NULL) &&
-	    (xstrcasecmp(resv_msg.node_list, "ALL") == 0)) {
-		if (resv_msg.flags == NO_VAL64)
-			resv_msg.flags = RESERVE_FLAG_PART_NODES;
-		else
-			resv_msg.flags |= RESERVE_FLAG_PART_NODES;
-	}
-
-	/*
-	 * If RESERVE_FLAG_PART_NODES is specified for the reservation,
-	 * make sure a partition name is specified and nodes=ALL.
-	 */
-	if ((resv_msg.flags != NO_VAL64) &&
-            (resv_msg.flags & RESERVE_FLAG_PART_NODES) &&
-	    (!resv_msg.partition ||
-	     (xstrcasecmp(resv_msg.node_list, "ALL")))) {
-		exit_code = 1;
-		error("PART_NODES flag requires specifying a Partition and ALL nodes.  No reservation created.");
-		goto SCONTROL_CREATE_RES_CLEANUP;
-	}
-
-	/*
-	 * If the following parameters are null, but a partition is named, then
-	 * make the reservation for the whole partition.
-	 */
-	if ((!resv_msg.core_cnt || (resv_msg.core_cnt == NO_VAL)) &&
-	    (resv_msg.burst_buffer == NULL ||
-	     resv_msg.burst_buffer[0] == '\0') &&
-	    (!resv_msg.node_cnt || (resv_msg.node_cnt == NO_VAL)) &&
-	    (resv_msg.node_list == NULL || resv_msg.node_list[0] == '\0') &&
-	    (resv_msg.licenses  == NULL || resv_msg.licenses[0]  == '\0') &&
-	    (resv_msg.tres_str  == NULL || resv_msg.tres_str[0]  == '\0')) {
-		if (resv_msg.partition == NULL) {
-			exit_code = 1;
-			error("CoreCnt, Nodes, NodeCnt, TRES or Watts must be specified.  No reservation created.");
-			goto SCONTROL_CREATE_RES_CLEANUP;
-		}
-		if (resv_msg.flags == NO_VAL64)
-			resv_msg.flags = RESERVE_FLAG_PART_NODES;
-		else
-			resv_msg.flags |= RESERVE_FLAG_PART_NODES;
-		resv_msg.node_list = "ALL";
-	}
-
-	if ((resv_msg.users == NULL    || resv_msg.users[0] == '\0') &&
-	    (resv_msg.groups == NULL   || resv_msg.groups[0] == '\0') &&
-	    (resv_msg.accounts == NULL || resv_msg.accounts[0] == '\0')) {
-		exit_code = 1;
-		error("Either Users/Groups and/or Accounts must be specified.  No reservation created.");
-		goto SCONTROL_CREATE_RES_CLEANUP;
-	} else if (resv_msg.users && resv_msg.groups) {
-		exit_code = 1;
-		error("Users and Groups are mutually exclusive.  You can have one or the other, but not both.  No reservation created.");
+		error("%s", error_msg);
 		goto SCONTROL_CREATE_RES_CLEANUP;
 	}
 
@@ -478,10 +433,10 @@ scontrol_create_res(int argc, char **argv)
 		     (errno == ESLURM_NODES_BUSY)) && !resv_msg.node_list)
 			printf("Note, unless nodes are directly requested a reservation must exist in a single partition.\n"
 			       "If no partition is requested the default partition is assumed.\n");
-		ret = slurm_get_errno();
+		ret = errno;
 	} else {
 		printf("Reservation created: %s\n", new_res_name);
-		free(new_res_name);
+		xfree(new_res_name);
 	}
 
 SCONTROL_CREATE_RES_CLEANUP:

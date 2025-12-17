@@ -1,4 +1,4 @@
-.TH sdiag "1" "Slurm Commands" "May 2023" "Slurm Commands"
+.TH sdiag "1" "Slurm Commands" "Slurm 26.05" "Slurm Commands"
 
 .SH "NAME"
 sdiag \- Scheduling diagnostic tool for Slurm
@@ -97,11 +97,6 @@ Number of jobs pending at the given time of the time stamp above.
 Number of jobs running at the given time of the time stamp above.
 .IP
 
-.TP
-\fBJobs running ts:\fR
-Time stamp of when the running job count was taken.
-.IP
-
 .LP
 The next block of information is related to main scheduling algorithm based
 on jobs priorities. A scheduling cycle implies to get the job_write_lock lock,
@@ -112,7 +107,7 @@ dependencies or affected  by accounts limits are not processed.
 
 .TP
 \fBLast cycle\fR
-Time in microseconds for last scheduling cycle. 
+Time in microseconds for last scheduling cycle.
 .IP
 
 .TP
@@ -328,6 +323,11 @@ data_parser with parameters. Sorting and formatting arguments will be ignored.
 .IP
 
 .TP
+\fB\-\-no-trunc\fR
+Do not truncate long lines to 80 char.
+.IP
+
+.TP
 \fB\-r\fR, \fB\-\-reset\fR
 Reset scheduler and RPC counters to 0. Only supported for Slurm operators and
 administrators.
@@ -391,6 +391,36 @@ Same as \fB\-\-cluster\fR
 .TP 20
 \fBSLURM_CONF\fR
 The location of the Slurm configuration file.
+
+.TP
+\fBSLURM_JSON\fR
+Control JSON serialization:
+.IP
+.RS
+.TP
+\fBcompact\fR
+Output JSON as compact as possible.
+.IP
+
+.TP
+\fBpretty\fR
+Output JSON in pretty format to make it more readable.
+.IP
+.RE
+
+.TP
+\fBSLURM_YAML\fR
+Control YAML serialization:
+.IP
+.RS
+.TP
+\fBcompact\fR Output YAML as compact as possible.
+.IP
+
+.TP
+\fBpretty\fR Output YAML in pretty format to make it more readable.
+.RE
+.IP
 
 .SH "COPYING"
 Copyright (C) 2010\-2011 Barcelona Supercomputing Center.

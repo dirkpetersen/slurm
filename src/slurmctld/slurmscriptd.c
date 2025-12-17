@@ -41,6 +41,7 @@
 #  include <sys/prctl.h>
 #endif
 
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -53,12 +54,17 @@
 #include "src/common/fd.h"
 #include "src/common/fetch_config.h"
 #include "src/common/log.h"
+#include "src/common/msg_type.h"
+#include "src/common/probes.h"
 #include "src/common/run_command.h"
 #include "src/common/setproctitle.h"
 #include "src/common/slurm_protocol_pack.h"
+#include "src/common/threadpool.h"
 #include "src/common/track_script.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
+
+#include "src/conmgr/conmgr.h"
 
 #include "src/interfaces/burst_buffer.h"
 #include "src/interfaces/hash.h"
@@ -110,6 +116,7 @@ typedef struct {
 	char *key;
 	pthread_mutex_t mutex;
 	int rc;
+	bool received_response;
 	char *resp_msg;
 	bool track_script_signalled;
 } script_response_t;
@@ -205,15 +212,17 @@ static void _wait_for_script_resp(script_response_t *script_resp,
 				  int *status, char **resp_msg,
 				  bool *track_script_signalled)
 {
-	slurm_mutex_lock(&script_resp->mutex);
-	slurm_cond_wait(&script_resp->cond, &script_resp->mutex);
+	/* script_resp->mutex should already be locked */
+	/* Loop to handle spurious wakeups */
+	while (!script_resp->received_response) {
+		slurm_cond_wait(&script_resp->cond, &script_resp->mutex);
+	}
 	/* The script is done now, and we should have the response */
 	*status = script_resp->rc;
 	if (resp_msg)
 		*resp_msg = xstrdup(script_resp->resp_msg);
 	if (track_script_signalled)
 		*track_script_signalled = script_resp->track_script_signalled;
-	slurm_mutex_unlock(&script_resp->mutex);
 }
 
 static void _wait_for_powersave_scripts()
@@ -384,12 +393,26 @@ static int _send_to_slurmscriptd(uint32_t msg_type, void *msg_data, bool wait,
 		rc = SLURM_ERROR;
 		goto cleanup;
 	}
-	if (msg_type == SLURMSCRIPTD_REQUEST_RUN_SCRIPT)
-		_incr_script_cnt();
+	if (msg_type == SLURMSCRIPTD_REQUEST_RUN_SCRIPT) {
+		run_script_msg_t *run_script_msg = msg_data;
+
+		/*
+		 * Don't track powersave scripts. We don't want slurmctld to
+		 * wait forever for them to finish while shutting down.
+		 */
+		if (!(run_script_msg->script_type == SLURMSCRIPTD_POWER))
+			_incr_script_cnt();
+	}
+
+	if (wait)
+		slurm_mutex_lock(&script_resp->mutex);
 	rc = _write_msg(slurmctld_writefd, msg.msg_type, buffer, true);
 
 	if ((rc == SLURM_SUCCESS) && wait) {
 		_wait_for_script_resp(script_resp, &rc, resp_msg, signalled);
+	}
+	if (wait) {
+		slurm_mutex_unlock(&script_resp->mutex);
 		_script_resp_map_remove(script_resp->key);
 	}
 
@@ -471,18 +494,9 @@ static void _incr_script_cnt(void)
 static void _change_proc_name(int argc, char **argv, char *proc_name)
 {
 	char *log_prefix;
-	/*
-	 * Since running_in_slurmctld() is called before we fork()'d,
-	 * the result is cached in static variables, so calling it now
-	 * would return true even though we're now slurmscriptd.
-	 * Reset those cached variables so running_in_slurmctld()
-	 * returns false if called from slurmscriptd.
-	 * But first change slurm_prog_name since that is
-	 * read by run_in_daemon().
-	 */
-	xfree(slurm_prog_name);
-	slurm_prog_name = xstrdup(proc_name);
-	running_in_slurmctld_reset();
+
+	/* Update slurm_daemon to ensure run_in_daemon() works properly. */
+	slurm_daemon = IS_SLURMSCRIPTD;
 
 	/*
 	 * Change the process name to slurmscriptd.
@@ -507,10 +521,6 @@ static void _send_bb_script_msg(int write_fd, void *cb_arg)
 	run_script_msg_t *script_msg = cb_arg;
 	buf_t *buffer = init_buf(0);
 	bb_script_info_msg_t bb_msg = {
-		.authalttypes = slurm_conf.authalttypes,
-		.authinfo = slurm_conf.authinfo,
-		.authalt_params = slurm_conf.authalt_params,
-		.authtype = slurm_conf.authtype,
 		.cluster_name = slurm_conf.cluster_name,
 		.extra_buf = script_msg->extra_buf,
 		.extra_buf_size = script_msg->extra_buf_size,
@@ -712,6 +722,7 @@ static int _handle_shutdown(slurmscriptd_msg_t *recv_msg)
 	_wait_for_powersave_scripts();
 	track_script_flush();
 
+	conmgr_request_shutdown();
 	eio_signal_shutdown(msg_handle);
 
 	return SLURM_ERROR; /* Don't handle any more requests. */
@@ -719,6 +730,7 @@ static int _handle_shutdown(slurmscriptd_msg_t *recv_msg)
 
 static int _handle_run_script(slurmscriptd_msg_t *recv_msg)
 {
+	extern char **environ;
 	run_script_msg_t *script_msg = recv_msg->msg_data;
 	int rc, status = 0;
 	char *resp_msg = NULL;
@@ -746,7 +758,13 @@ static int _handle_run_script(slurmscriptd_msg_t *recv_msg)
 
 	switch (script_msg->script_type) {
 	case SLURMSCRIPTD_BB_LUA:
-		/* Set SLURM_SCRIPT_CONTEXT in env for slurmctld */
+		/*
+		 * Set SLURM_SCRIPT_CONTEXT in env for slurmctld, but we also
+		 * need to preserve the parent's environment. There was not any
+		 * env passed to us in script_msg.
+		 */
+		xassert(!run_command_args.env);
+		run_command_args.env = env_array_copy((const char **) environ);
 		env_array_append(&run_command_args.env, "SLURM_SCRIPT_CONTEXT",
 				 "burst_buffer.lua");
 
@@ -834,11 +852,12 @@ static int _notify_script_done(char *key, script_complete_t *script_complete)
 		      script_complete->script_name, key);
 		rc = SLURM_ERROR;
 	} else {
+		slurm_mutex_lock(&script_resp->mutex);
+		script_resp->received_response = true;
 		script_resp->resp_msg = xstrdup(script_complete->resp_msg);
 		script_resp->rc = script_complete->status;
 		script_resp->track_script_signalled =
 			script_complete->signalled;
-		slurm_mutex_lock(&script_resp->mutex);
 		slurm_cond_signal(&script_resp->cond);
 		slurm_mutex_unlock(&script_resp->mutex);
 	}
@@ -875,7 +894,8 @@ static int _handle_script_complete(slurmscriptd_msg_t *msg)
 		break;
 	case SLURMSCRIPTD_POWER:
 		ping_nodes_now = true;
-		break;
+		/* Don't call _decr_script_cnt() */
+		return SLURM_SUCCESS;
 	case SLURMSCRIPTD_PROLOG:
 		prep_prolog_slurmctld_callback(script_complete->status,
 					       script_complete->job_id,
@@ -1066,8 +1086,174 @@ static void _setup_eio(int fd)
 	eio_new_initial_obj(msg_handle, eio_obj);
 }
 
-static void _slurmscriptd_mainloop(char *binary_path)
+static void _on_sigint(conmgr_callback_args_t conmgr_args, void *arg)
 {
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	log_flag(SCRIPT, "Caught SIGINT. Ignoring.");
+}
+
+static void _on_sigterm(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	log_flag(SCRIPT, "Caught SIGTERM. Ignoring.");
+}
+
+static void _on_sigchld(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	log_flag(SCRIPT, "Caught SIGCHLD. Ignoring");
+}
+
+static void _on_sigquit(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	log_flag(SCRIPT, "Caught SIGQUIT. Ignoring.");
+}
+
+static void _on_sighup(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	log_flag(SCRIPT, "Caught SIGHUP. Ignoring.");
+}
+
+static void _on_sigusr1(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	log_flag(SCRIPT, "Caught SIGUSR1. Ignoring.");
+}
+
+static void _on_sigusr2(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	log_flag(SCRIPT, "Caught SIGUSR2. Ignoring.");
+}
+
+static void _on_sigpipe(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	/* debug5 to avoid polluting the SCRIPT debug flag */
+	debug5("Caught SIGPIPE. Ignoring.");
+}
+
+static void _on_sigxcpu(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	log_flag(SCRIPT, "Caught SIGXCPU. Ignoring.");
+}
+
+static void _on_sigabrt(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	log_flag(SCRIPT, "Caught SIGABRT. Ignoring.");
+}
+
+static void _on_sigalrm(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	log_flag(SCRIPT, "Caught SIGALRM. Ignoring.");
+}
+
+static void _on_sigprof(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	(void) probe_run(true, NULL, NULL, __func__);
+}
+
+static void _init_slurmscriptd_conmgr(void)
+{
+	if (slurm_conf.slurmctld_params)
+		conmgr_set_params(slurm_conf.slurmctld_params);
+
+	conmgr_init(0, 0, 0);
+
+	/*
+	 * Ignore signals. slurmscriptd should only handle requests directly
+	 * from slurmctld.
+	 */
+	conmgr_add_work_signal(SIGINT, _on_sigint, NULL);
+	conmgr_add_work_signal(SIGTERM, _on_sigterm, NULL);
+	conmgr_add_work_signal(SIGCHLD, _on_sigchld, NULL);
+	conmgr_add_work_signal(SIGQUIT, _on_sigquit, NULL);
+	conmgr_add_work_signal(SIGHUP, _on_sighup, NULL);
+	conmgr_add_work_signal(SIGUSR1, _on_sigusr1, NULL);
+	conmgr_add_work_signal(SIGUSR2, _on_sigusr2, NULL);
+	conmgr_add_work_signal(SIGPIPE, _on_sigpipe, NULL);
+	conmgr_add_work_signal(SIGXCPU, _on_sigxcpu, NULL);
+	conmgr_add_work_signal(SIGABRT, _on_sigabrt, NULL);
+	conmgr_add_work_signal(SIGALRM, _on_sigalrm, NULL);
+	conmgr_add_work_signal(SIGPROF, _on_sigprof, NULL);
+
+	conmgr_run(false);
+}
+
+__attribute__((noreturn))
+extern void slurmscriptd_run_slurmscriptd(int argc, char **argv,
+					  char *binary_path)
+{
+	ssize_t i;
+	int rc = SLURM_ERROR, ack;
+
+	slurmscriptd_writefd = SLURMSCRIPT_WRITE_FD;
+	slurmscriptd_readfd = SLURMSCRIPT_READ_FD;
+
+	_change_proc_name(argc, argv, "slurmscriptd");
+
+	/* Test communications with slurmctld. */
+	ack = SLURM_SUCCESS;
+	i = write(slurmscriptd_writefd, &ack, sizeof(int));
+	if (i != sizeof(int)) {
+		error("%s: slurmscriptd: failed to send return code to slurmctld: %m",
+		      __func__);
+		_exit(1);
+	}
+	i = read(slurmscriptd_readfd, &rc, sizeof(int));
+	if (i < 0) {
+		error("%s: slurmscriptd: Can not read ack from slurmctld: %m",
+		      __func__);
+		_exit(1);
+	} else if (i != sizeof(int)) {
+		error("%s: slurmscriptd: slurmctld failed to send expected ack: received %zd bytes when %zd bytes was expected.",
+		      __func__, i, sizeof(int));
+		_exit(1);
+	}
+
+	debug("slurmscriptd: Got ack from slurmctld");
+
+	i = write(slurmscriptd_writefd, &ack, sizeof(int));
+	if (i != sizeof(int))
+		fatal("%s: Failed to send initialization code to slurmctld",
+		      __func__);
+
+	_init_slurmscriptd_conmgr();
+
+	debug("Initialization successful");
+
+	slurm_mutex_init(&powersave_script_count_mutex);
+	slurm_mutex_init(&write_mutex);
 	if ((run_command_init(0, NULL, binary_path) != SLURM_SUCCESS) &&
 	    binary_path && binary_path[0])
 		fatal("%s: Unable to reliably execute %s",
@@ -1078,6 +1264,14 @@ static void _slurmscriptd_mainloop(char *binary_path)
 	debug("%s: started", __func__);
 	eio_handle_mainloop(msg_handle);
 	debug("%s: finished", __func__);
+
+#ifdef MEMORY_LEAK_DEBUG
+	track_script_fini();
+	slurm_mutex_destroy(&powersave_script_count_mutex);
+#endif
+
+	/* We never want to return from here, only exit. */
+	_exit(0);
 }
 
 static void *_slurmctld_listener_thread(void *x)
@@ -1143,7 +1337,7 @@ static void _kill_slurmscriptd(void)
 			 * that we won't wait forever.
 			 */
 			run_command_waitpid_timeout("slurmscriptd",
-						    slurmscriptd_pid,
+						    slurmscriptd_pid, false,
 						    &status, 10 * MSEC_IN_SEC,
 						    0, 0, NULL);
 		}
@@ -1225,10 +1419,6 @@ static void _init_bb_script_config(char **function, uint32_t *job_id,
 	*job_id = bb_msg->job_id;
 	*job_info = _unpack_bb_job_info(bb_msg);
 
-	slurm_conf.authalttypes = bb_msg->authalttypes;
-	slurm_conf.authinfo = bb_msg->authinfo;
-	slurm_conf.authalt_params = bb_msg->authalt_params;
-	slurm_conf.authtype = bb_msg->authtype;
 	slurm_conf.cluster_name = bb_msg->cluster_name;
 	slurm_conf.slurmctld_debug = bb_msg->slurmctld_debug;
 	slurm_conf.slurmctld_logfile = bb_msg->slurmctld_logfile;
@@ -1300,14 +1490,7 @@ extern void slurmscriptd_handle_bb_lua_mode(int argc, char **argv)
 
 	/*
 	 * Initialize plugins.
-	 * Lua plugins may call slurm_sprint_job_info() which calls
-	 * slurm_load_jobs() which makes an RPC to slurmctld, and that uses
-	 * the auth and hash plugins.
 	 */
-	if (auth_g_init() != SLURM_SUCCESS)
-		fatal("failed to initialize auth plugin");
-	if (hash_g_init() != SLURM_SUCCESS)
-		fatal("failed to initialize hash plugin");
 	slurm_conf.bb_type = "burst_buffer/lua";
 	if (bb_g_init() != SLURM_SUCCESS)
 		fatal("failed to initialize burst_buffer plugin");
@@ -1449,6 +1632,8 @@ extern void slurmscriptd_run_prepilog(uint32_t job_id, bool is_epilog,
 	slurmscriptd_msg_t *send_args = xmalloc(sizeof(*send_args));
 	char *script_name;
 	script_type_t script_type;
+	int timeout = is_epilog ?
+		slurm_conf.epilog_timeout : slurm_conf.prolog_timeout;
 
 	if (is_epilog) {
 		script_name = "EpilogSlurmctld";
@@ -1459,8 +1644,7 @@ extern void slurmscriptd_run_prepilog(uint32_t job_id, bool is_epilog,
 	}
 
 	run_script_msg = _init_run_script_msg(env, script_name, script,
-					      script_type,
-					      slurm_conf.prolog_epilog_timeout);
+					      script_type, timeout);
 	run_script_msg->argc = 1;
 	run_script_msg->argv = xcalloc(2, sizeof(char *)); /* NULL terminated */
 	run_script_msg->argv[0] = xstrdup(script);
@@ -1540,7 +1724,7 @@ extern void slurmscriptd_update_log_level(int debug_level, bool log_rotate)
 			      false, NULL, NULL);
 }
 
-extern int slurmscriptd_init(int argc, char **argv, char *binary_path)
+extern int slurmscriptd_init(char **argv, char *binary_path)
 {
 	int to_slurmscriptd[2] = {-1, -1};
 	int to_slurmctld[2] = {-1, -1};
@@ -1566,14 +1750,21 @@ extern int slurmscriptd_init(int argc, char **argv, char *binary_path)
 		 * slurmctld writes data to slurmscriptd with the
 		 * to_slurmscriptd pipe and slurmscriptd writes data to
 		 * slurmctld with the to_slurmctld pipe.
+		 * If there is a failure with startup, SIGKILL the slurmscriptd
+		 * and then exit. The slurmscriptd pid will be adopted and then
+		 * reaped by init, so we don't need to call waitpid().
 		 */
 		if (close(to_slurmscriptd[0]) < 0) {
-			_kill_slurmscriptd();
+			rc = errno;
+			killpg(slurmscriptd_pid, SIGKILL);
+			errno = rc;
 			fatal("%s: slurmctld: Unable to close read to_slurmscriptd in parent: %m",
 			      __func__);
 		}
 		if (close(to_slurmctld[1]) < 0) {
-			_kill_slurmscriptd();
+			rc = errno;
+			killpg(slurmscriptd_pid, SIGKILL);
+			errno = rc;
 			fatal("%s: slurmctld: Unable to close write to_slurmctld in parent: %m",
 			      __func__);
 		}
@@ -1581,25 +1772,31 @@ extern int slurmscriptd_init(int argc, char **argv, char *binary_path)
 		/* Test communications with slurmscriptd. */
 		i = read(slurmctld_readfd, &rc, sizeof(int));
 		if (i < 0) {
-			_kill_slurmscriptd();
-			fatal("%s: slurmctld: Can not read return code from slurmscriptd: %m",
-			      __func__);
+			rc = errno;
+			killpg(slurmscriptd_pid, SIGKILL);
+			errno = rc;
+			fatal_abort("%s: slurmctld: Can not read return code from slurmscriptd: %m",
+				    __func__);
 		} else if (i != sizeof(int)) {
-			_kill_slurmscriptd();
-			fatal("%s: slurmctld: slurmscriptd failed to send return code: %m",
-			      __func__);
+			rc = errno;
+			killpg(slurmscriptd_pid, SIGKILL);
+			errno = rc;
+			fatal_abort("%s: slurmctld: slurmscriptd failed to send return code: %m",
+				    __func__);
 		}
 		if (rc != SLURM_SUCCESS) {
-			_kill_slurmscriptd();
-			fatal("%s: slurmctld: slurmscriptd did not initialize",
-			      __func__);
+			killpg(slurmscriptd_pid, SIGKILL);
+			fatal_abort("%s: slurmctld: slurmscriptd did not initialize",
+				    __func__);
 		}
 		ack = SLURM_SUCCESS;
 		i = write(slurmctld_writefd, &ack, sizeof(int));
 		if (i != sizeof(int)) {
-			_kill_slurmscriptd();
-			fatal("%s: slurmctld: failed to send ack to slurmscriptd: %m",
-			      __func__);
+			rc = errno;
+			killpg(slurmscriptd_pid, SIGKILL);
+			errno = rc;
+			fatal_abort("%s: slurmctld: failed to send ack to slurmscriptd: %m",
+				    __func__);
 		}
 
 		/* Get slurmscriptd initialization status */
@@ -1621,74 +1818,17 @@ extern int slurmscriptd_init(int argc, char **argv, char *binary_path)
 				    _slurmctld_listener_thread, NULL);
 		debug("slurmctld: slurmscriptd fork()'d and initialized.");
 	} else { /* child (slurmscriptd_pid == 0) */
-		ssize_t i;
-		int rc = SLURM_ERROR, ack;
-		char *failed_plugin = NULL;
-
-		_change_proc_name(argc, argv, "slurmscriptd");
-
-		/* Close extra fd's. */
-		if (close(to_slurmscriptd[1]) < 0) {
-			error("%s: slurmscriptd: Unable to close write to_slurmscriptd in child: %m",
-			      __func__);
-			_exit(1);
-		}
-		if (close(to_slurmctld[0]) < 0) {
-			error("%s: slurmscriptd: Unable to close read to_slurmctld in child: %m",
-			      __func__);
-			_exit(1);
-		}
-		/* Test communiations with slurmctld. */
-		ack = SLURM_SUCCESS;
-		i = write(slurmscriptd_writefd, &ack, sizeof(int));
-		if (i != sizeof(int)) {
-			error("%s: slurmscriptd: failed to send return code to slurmctld: %m",
-			      __func__);
-			_exit(1);
-		}
-		i = read(slurmscriptd_readfd, &rc, sizeof(int));
-		if (i < 0) {
-			error("%s: slurmscriptd: Can not read ack from slurmctld: %m",
-			      __func__);
-			_exit(1);
-		} else if (i != sizeof(int)) {
-			error("%s: slurmscriptd: slurmctld failed to send ack: %m",
-			      __func__);
-			_exit(1);
-		}
-
-		debug("slurmscriptd: Got ack from slurmctld");
-
 		/*
-		 * Initialize required plugins to avoid lazy linking.
-		 * If plugins fail to initialize, send an error to slurmctld.
+		 * Dup needed file descriptors and re-exec self.
+		 * We do not need to closeall() here because it will happen on
+		 * the re-exec.
 		 */
-		if (bb_g_init() != SLURM_SUCCESS) {
-			failed_plugin = "burst_buffer";
-			ack = SLURM_ERROR;
-		}
-
-		i = write(slurmscriptd_writefd, &ack, sizeof(int));
-		if (i != sizeof(int))
-			fatal("%s: Failed to send initialization code to slurmctld",
-			      __func__);
-		if (ack != SLURM_SUCCESS)
-			fatal("%s: Failed to initialize %s plugin",
-			      __func__, failed_plugin);
-
-		debug("Initialization successful");
-
-		slurm_mutex_init(&powersave_script_count_mutex);
-		slurm_mutex_init(&write_mutex);
-		_slurmscriptd_mainloop(binary_path);
-
-#ifdef MEMORY_LEAK_DEBUG
-		track_script_fini();
-		slurm_mutex_destroy(&powersave_script_count_mutex);
-#endif
-
-		/* We never want to return from here, only exit. */
-		_exit(0);
+		dup2(slurmscriptd_readfd, SLURMSCRIPT_READ_FD);
+		dup2(slurmscriptd_writefd, SLURMSCRIPT_WRITE_FD);
+		setenv(SLURMSCRIPTD_MODE_ENV, "1", 1);
+		execv(binary_path, argv);
+		fatal("%s: execv() failed: %m", __func__);
+		/* Never returns */
 	}
 
 	return SLURM_SUCCESS;

@@ -41,6 +41,17 @@
 #ifndef _SLURM_BACKFILL_H
 #define _SLURM_BACKFILL_H
 
+#include "src/slurmctld/licenses.h"
+
+typedef struct {
+	time_t begin_time;
+	time_t end_time;
+	bitstr_t *avail_bitmap;
+	bf_licenses_t *licenses;
+	uint32_t fragmentation;
+	int next; /* next record, by time, zero termination */
+} node_space_map_t;
+
 /* backfill_agent - detached thread periodically attempts to backfill jobs */
 extern void *backfill_agent(void *args);
 
@@ -49,5 +60,8 @@ extern void stop_backfill_agent(void);
 
 /* Note that slurm.conf has changed */
 extern void backfill_reconfig(void);
+
+/* Used for testsuite to call backfill */
+extern void __attempt_backfill(void);
 
 #endif	/* _SLURM_BACKFILL_H */

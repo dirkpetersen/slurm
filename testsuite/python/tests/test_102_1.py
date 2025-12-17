@@ -38,6 +38,40 @@ pos = 0
 text = ""
 
 
+@pytest.fixture(scope="function")
+def setup_federation1(no_federations):
+    atf.run_command(
+        f"sacctmgr -i add federation {federation1}",
+        user=atf.properties["slurm-user"],
+        fatal=True,
+    )
+    yield
+
+    atf.run_command(
+        f"sacctmgr -i delete federation {federation1}",
+        user=atf.properties["slurm-user"],
+        fatal=False,
+    )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def clean_clusters():
+    yield
+    atf.run_command(
+        f"sacctmgr -i delete cluster {cluster_string}",
+        user=atf.properties["slurm-user"],
+    )
+
+
+@pytest.fixture(scope="function")
+def no_federations():
+    atf.run_command(
+        f"sacctmgr -i delete federation {federation1},{federation2},{federation3}",
+        user=atf.properties["slurm-user"],
+        xfail=True,
+    )
+
+
 # Performs an initial match and prepares to do subsequent matching
 def first_match(pattern, initial_string):
     global pos, text
@@ -146,7 +180,7 @@ def test_add_second_federation():
     assert next_match(rf"(?m)^ +{federation2}")
 
     output = atf.run_command_output(
-        f"sacctmgr show federation format=federation%20",
+        "sacctmgr show federation format=federation%20",
         user=atf.properties["slurm-user"],
     )
     assert first_match(r"Federation", output)
@@ -273,7 +307,7 @@ def test_modify_cluster_fedstate():
         user=atf.properties["slurm-user"],
     )
     assert first_match(r"Setting", output)
-    assert next_match(rf"(?m)^ +FedState += +DRAIN")
+    assert next_match(r"(?m)^ +FedState += +DRAIN")
     assert next_match(r"Modified cluster\.\.\.")
     assert next_match(rf"(?m)^ +{cluster1}")
     assert next_match(rf"(?m)^ +{cluster3}")
@@ -283,7 +317,7 @@ def test_modify_cluster_fedstate():
         user=atf.properties["slurm-user"],
     )
     assert first_match(r"Setting", output)
-    assert next_match(rf"(?m)^ +FedState += +DRAIN\+REMOVE")
+    assert next_match(r"(?m)^ +FedState += +DRAIN\+REMOVE")
     assert next_match(r"Modified cluster\.\.\.")
     assert next_match(rf"(?m)^ +{cluster2}")
 
@@ -292,7 +326,7 @@ def test_modify_cluster_fedstate():
         user=atf.properties["slurm-user"],
     )
     assert first_match(r"Setting", output)
-    assert next_match(rf"(?m)^ +FedState += +ACTIVE")
+    assert next_match(r"(?m)^ +FedState += +ACTIVE")
     assert next_match(r"Modified cluster\.\.\.")
     assert next_match(rf"(?m)^ +{cluster1}")
 
@@ -388,7 +422,14 @@ def test_add_federation_existing_cluster():
     )
     child = pexpect.spawn(
         "sudo",
-        ["-nu", atf.properties["slurm-user"], "/bin/bash", "-lc", command],
+        [
+            "--preserve-env=PATH",
+            "-nu",
+            atf.properties["slurm-user"],
+            "/bin/bash",
+            "-lc",
+            command,
+        ],
         encoding="utf-8",
     )
     assert (
@@ -431,7 +472,7 @@ def test_modify_cluster_clear_federation():
         user=atf.properties["slurm-user"],
     )
     assert first_match(r"Setting", output)
-    assert next_match(rf"(?m)^ +Federation += +$")
+    assert next_match(r"(?m)^ +Federation += +$")
     assert next_match(r"Modified cluster\.\.\.")
     assert next_match(rf"(?m)^ +{cluster3}")
 
@@ -610,7 +651,7 @@ def test_set_state_inactive():
         user=atf.properties["slurm-user"],
     )
     assert first_match(r"Setting", output)
-    assert next_match(rf"(?m)^ +FedState += +INACTIVE")
+    assert next_match(r"(?m)^ +FedState += +INACTIVE")
     assert next_match(r"Modified cluster\.\.\.")
     assert next_match(rf"(?m)^ +{cluster4}")
 
@@ -738,7 +779,7 @@ def test_modify_federation_change_clusters():
 
 
 def test_operators():
-    """Eror checking on using +, - and ="""
+    """Error checking on using +, - and ="""
 
     error = atf.run_command_error(
         f"sacctmgr -i modify federation {federation1} set cluster={cluster1},+{cluster2}",
@@ -814,7 +855,7 @@ def test_delete_cluster_by_federation():
     assert next_match(rf"(?m)^ +Cluster += +{cluster1}")
     assert next_match(rf"(?m)^ +Cluster += +{cluster2}")
 
-    # Add second cluster to make sure selectin only on federation
+    # Add second cluster to make sure selection only on federation
     output = atf.run_command_output(
         f"sacctmgr -i add federation {federation3} clusters={cluster3},{cluster4}",
         user=atf.properties["slurm-user"],
@@ -855,7 +896,7 @@ def test_delete_cluster_by_federation():
     assert next_match(rf"(?m)^ +{cluster4}")
 
 
-def test_add_max_clusters_federation():
+def test_max_clusters_federation(setup_federation1):
     """Test adding more than 63 clusters to a federation"""
 
     atf.run_command(
@@ -886,9 +927,7 @@ def test_add_max_clusters_federation():
     assert next_match(r"Setting")
     assert next_match(rf"(?m)^ +Federation += +{federation1}")
 
-
-def test_modify_max_clusters_federation():
-    """Modify cluster to exceed max clusters in federation"""
+    # Modify cluster to exceed max clusters in federation
 
     output = atf.run_command_output(
         f"sacctmgr -i add cluster cluster{max_fed_clusters}",
@@ -901,8 +940,6 @@ def test_modify_max_clusters_federation():
         f"sacctmgr -i modify cluster cluster{max_fed_clusters} set federation={federation1}",
         user=atf.properties["slurm-user"],
     )
-    assert first_match(r"Setting", results["stdout"])
-    assert next_match(rf"(?m)^ +Federation += +{federation1}")
     assert first_match(r"Too many clusters in federation", results["stderr"])
 
     output = atf.run_command_output(
@@ -931,7 +968,7 @@ def test_delete_cluster():
     assert re.search(rf"(?m)^ +{federation1} +{cluster1} *$", output) is None
 
 
-def test_delete_federation():
+def test_delete_federation(setup_federation1):
     """Delete federation - should clean clusters from federation"""
 
     output = atf.run_command_output(
@@ -950,7 +987,7 @@ def test_delete_federation():
     assert re.search(rf"(?m)^ +{federation1} +$", output) is None
 
     output = atf.run_command_output(
-        f"sacctmgr show cluster format=cluster%20,federation%20",
+        "sacctmgr show cluster format=cluster%20,federation%20",
         user=atf.properties["slurm-user"],
     )
     assert first_match(r"Cluster +Federation", output)
@@ -988,8 +1025,8 @@ def test_add_modify_cluster_features():
         user=atf.properties["slurm-user"],
     )
     assert first_match(r"Setting", output)
-    assert next_match(rf"(?m)^ +Feature += +aa")
-    assert next_match(rf"(?m)^ +Feature += +ab")
+    assert next_match(r"(?m)^ +Feature += +aa")
+    assert next_match(r"(?m)^ +Feature += +ab")
     assert next_match(r"Modified cluster\.\.\.")
     assert next_match(rf"(?m)^ +{cluster1}")
 
@@ -1005,7 +1042,7 @@ def test_add_modify_cluster_features():
         user=atf.properties["slurm-user"],
     )
     assert first_match(r"Setting", output)
-    assert next_match(rf"(?m)^ +Feature +\+= +fc")
+    assert next_match(r"(?m)^ +Feature +\+= +fc")
     assert next_match(r"Modified cluster\.\.\.")
     assert next_match(rf"(?m)^ +{cluster1}")
 
@@ -1021,7 +1058,7 @@ def test_add_modify_cluster_features():
         user=atf.properties["slurm-user"],
     )
     assert first_match(r"Setting", output)
-    assert next_match(rf"(?m)^ +Feature +-= +ab")
+    assert next_match(r"(?m)^ +Feature +-= +ab")
     assert next_match(r"Modified cluster\.\.\.")
     assert next_match(rf"(?m)^ +{cluster1}")
 
@@ -1037,8 +1074,8 @@ def test_add_modify_cluster_features():
         user=atf.properties["slurm-user"],
     )
     assert first_match(r"Setting", output)
-    assert next_match(rf"(?m)^ +Feature +-= +aa")
-    assert next_match(rf"(?m)^ +Feature +-= +fc")
+    assert next_match(r"(?m)^ +Feature +-= +aa")
+    assert next_match(r"(?m)^ +Feature +-= +fc")
     assert next_match(r"Modified cluster\.\.\.")
     assert next_match(rf"(?m)^ +{cluster1}")
 

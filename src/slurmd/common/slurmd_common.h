@@ -1,7 +1,7 @@
 /*****************************************************************************\
  *  slurmd_common.c - functions for determining job status
  *****************************************************************************
- *  Copyright (C) 2024 SchedMD LLC.
+ *  Copyright (C) SchedMD LLC.
  *
  *  This file is part of Slurm, a resource management program.
  *  For details, see <https://slurm.schedmd.com/>.
@@ -44,10 +44,7 @@
  *   Returns SLURM_SUCCESS if message sent successfully,
  *           SLURM_ERROR if epilog complete message fails to be sent.
  */
-extern int epilog_complete(uint32_t jobid, char *node_list, int rc);
-
-/* Connect to the slurmd and determine if the requested job has running steps */
-extern bool is_job_running(uint32_t job_id, bool ignore_extern);
+extern int epilog_complete(slurm_step_id_t *step_id, char *node_list, int rc);
 
 /*
  *  Wait for up to max_time seconds.
@@ -55,17 +52,17 @@ extern bool is_job_running(uint32_t job_id, bool ignore_extern);
  *
  *  Returns true if all job processes are gone
  */
-extern bool pause_for_job_completion(uint32_t job_id, int max_time,
+extern bool pause_for_job_completion(slurm_step_id_t *step_id, int max_time,
 				     bool ignore_extern);
 
 /*
  * terminate_all_steps - signals the container of all steps of a job
- * jobid IN - id of job to signal
+ * step_id IN - id of job to signal
  * batch IN - if true signal batch script, otherwise skip it
  * RET count of signaled job steps (plus batch script, if applicable)
  */
-extern int terminate_all_steps(uint32_t jobid, bool batch, bool extern_step);
-
+extern int terminate_all_steps(slurm_step_id_t *step_id, bool batch,
+			       bool extern_step);
 
 extern int run_prolog(job_env_t *job_env, slurm_cred_t *cred);
 

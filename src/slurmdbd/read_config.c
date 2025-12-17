@@ -50,17 +50,19 @@
 
 #include "slurm/slurm_errno.h"
 
-#include "src/common/log.h"
 #include "src/common/list.h"
+#include "src/common/log.h"
 #include "src/common/macros.h"
 #include "src/common/parse_config.h"
 #include "src/common/parse_time.h"
 #include "src/common/read_config.h"
-#include "src/interfaces/accounting_storage.h"
+#include "src/common/slurmdb_defs.h"
 #include "src/common/uid.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
-#include "src/common/slurmdb_defs.h"
+
+#include "src/interfaces/accounting_storage.h"
+
 #include "src/slurmdbd/read_config.h"
 
 /* Global variables */
@@ -110,6 +112,8 @@ static void _clear_slurmdbd_conf(void)
 		slurmdbd_conf->purge_txn = 0;
 		slurmdbd_conf->purge_usage = 0;
 		xfree(slurmdbd_conf->storage_loc);
+		xfree(slurmdbd_conf->storage_pass_script);
+		xfree(slurmdbd_conf->storage_user);
 		slurmdbd_conf->track_wckey = 0;
 		slurmdbd_conf->track_ctld = 0;
 	}
@@ -150,10 +154,12 @@ extern int read_slurmdbd_conf(void)
 		{"DebugLevelSyslog", S_P_STRING},
 		{"DefaultQOS", S_P_STRING},
 		{"DisableCoordDBD", S_P_BOOLEAN},
+		{"DisableArchiveCommands", S_P_BOOLEAN},
 		{"HashPlugin", S_P_STRING},
 		{"JobPurge", S_P_UINT32},
 		{"LogFile", S_P_STRING},
 		{"LogTimeFormat", S_P_STRING},
+		{"MaxPurgeLimit", S_P_UINT32},
 		{"MaxQueryTimeRange", S_P_STRING},
 		{"MessageTimeout", S_P_UINT16},
 		{"Parameters", S_P_STRING},
@@ -180,6 +186,7 @@ extern int read_slurmdbd_conf(void)
 		{"StorageLoc", S_P_STRING},
 		{"StorageParameters", S_P_STRING},
 		{"StoragePass", S_P_STRING},
+		{"StoragePassScript", S_P_STRING},
 		{"StoragePort", S_P_UINT16},
 		{"StorageType", S_P_STRING},
 		{"StorageUser", S_P_STRING},
@@ -218,12 +225,12 @@ extern int read_slurmdbd_conf(void)
 		bool tmp_bool = false;
 		uint32_t parse_flags = 0;
 		uid_t conf_path_uid;
+		mode_t permission = buf.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO);
 		debug3("Checking slurmdbd.conf file:%s access permissions",
 		       conf_path);
-		if ((buf.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO)) != 0600)
-			fatal("slurmdbd.conf file %s should be 600 is %o accessible for group or others",
-			      conf_path,
-			      buf.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO));
+		if ((permission != 0600) && (permission != 0640))
+			fatal("slurmdbd.conf file %s should be 600 or 640 but is %o",
+			      conf_path, permission);
 
 		debug("Reading slurmdbd.conf file %s", conf_path);
 
@@ -349,6 +356,11 @@ extern int read_slurmdbd_conf(void)
 			slurmdbd_conf->flags |=
 				DBD_CONF_FLAG_DISABLE_COORD_DBD;
 
+		s_p_get_boolean(&tmp_bool, "DisableArchiveCommands", tbl);
+		if (tmp_bool)
+			slurmdbd_conf->flags |=
+				DBD_CONF_FLAG_DISABLE_ARCHIVE_COMMANDS;
+
 		if (!s_p_get_string(&slurm_conf.hash_plugin, "HashPlugin", tbl))
 			slurm_conf.hash_plugin = xstrdup(DEFAULT_HASH_PLUGIN);
 
@@ -380,10 +392,13 @@ extern int read_slurmdbd_conf(void)
 				slurm_conf.log_fmt = LOG_FMT_SHORT;
 			else if (xstrcasestr(temp_str, "thread_id"))
 				slurm_conf.log_fmt = LOG_FMT_THREAD_ID;
-			if (xstrcasestr(temp_str, "format_stderr"))
-				slurm_conf.log_fmt |= LOG_FMT_FORMAT_STDERR;
 			xfree(temp_str);
 		}
+
+		if (!s_p_get_uint32(&slurmdbd_conf->max_purge_limit,
+				    "MaxPurgeLimit", tbl))
+			slurmdbd_conf->max_purge_limit =
+				DEFAULT_SLURMDBD_MAX_PURGE_LIMIT;
 
 		if (s_p_get_string(&temp_str, "MaxQueryTimeRange", tbl)) {
 			slurmdbd_conf->max_time_range = time_str2secs(temp_str);
@@ -561,11 +576,13 @@ extern int read_slurmdbd_conf(void)
 		if (slurm_conf.slurm_user_name) {
 			uid_t uid;
 
-			if (uid_from_string(slurm_conf.slurm_user_name, &uid) < 0)
+			if (uid_from_string(slurm_conf.slurm_user_name, &uid) !=
+			    SLURM_SUCCESS)
 				fatal("failed to look up SlurmUser uid");
 
-			if (conf_path_uid != uid)
-				fatal("slurmdbd.conf owned by %u not SlurmUser(%u)",
+			/* Validate slurmdbd.conf owner is SlurmUser or root */
+			if ((conf_path_uid != uid) && conf_path_uid)
+				fatal("slurmdbd.conf owned by %u not SlurmUser(%u) or root",
 				      conf_path_uid, uid);
 		}
 
@@ -588,12 +605,13 @@ extern int read_slurmdbd_conf(void)
 			       "StorageParameters", tbl);
 		s_p_get_string(&slurm_conf.accounting_storage_pass,
 			       "StoragePass", tbl);
+		s_p_get_string(&slurmdbd_conf->storage_pass_script,
+			       "StoragePassScript", tbl);
 		s_p_get_uint16(&slurm_conf.accounting_storage_port,
 		               "StoragePort", tbl);
 		s_p_get_string(&slurm_conf.accounting_storage_type,
 		               "StorageType", tbl);
-		s_p_get_string(&slurm_conf.accounting_storage_user,
-			       "StorageUser", tbl);
+		s_p_get_string(&slurmdbd_conf->storage_user, "StorageUser", tbl);
 
 		if (!s_p_get_uint16(&slurm_conf.tcp_timeout, "TCPTimeout", tbl))
 			slurm_conf.tcp_timeout = DEFAULT_TCP_TIMEOUT;
@@ -646,7 +664,7 @@ extern int read_slurmdbd_conf(void)
 		slurm_conf.plugindir = xstrdup(default_plugin_path);
 	if (slurm_conf.slurm_user_name) {
 		if (uid_from_string(slurm_conf.slurm_user_name,
-		                    &slurm_conf.slurm_user_id) < 0)
+				    &slurm_conf.slurm_user_id) != SLURM_SUCCESS)
 			fatal("Invalid user for SlurmUser %s, ignored",
 			      slurm_conf.slurm_user_name);
 	} else {
@@ -666,8 +684,8 @@ extern int read_slurmdbd_conf(void)
 		slurm_conf.accounting_storage_host =
 			xstrdup(DEFAULT_STORAGE_HOST);
 
-	if (!slurm_conf.accounting_storage_user)
-		slurm_conf.accounting_storage_user = xstrdup(getlogin());
+	if (!slurmdbd_conf->storage_user)
+		slurmdbd_conf->storage_user = xstrdup(getlogin());
 
 	if (!xstrcmp(slurm_conf.accounting_storage_type,
 	             "accounting_storage/mysql")) {
@@ -736,7 +754,7 @@ extern int read_slurmdbd_conf(void)
 /* Log the current configuration using verbose() */
 extern void log_config(void)
 {
-	List dbd_config_list;
+	list_t *dbd_config_list;
 	config_key_pair_t *key_pair;
 	list_itr_t *itr;
 
@@ -757,11 +775,11 @@ extern void log_config(void)
  * Dump the configuration in name,value pairs for output to
  * "sacctmgr show config", caller must call list_destroy()
  */
-extern List dump_config(void)
+extern list_t *dump_config(void)
 {
 	char time_str[32];
 	char *tmp_ptr = NULL;
-	List my_list = list_create(destroy_config_key_pair);
+	list_t *my_list = list_create(destroy_config_key_pair);
 
 	add_key_pair_bool(my_list, "AllowNoDefAcct",
 		(slurmdbd_conf->flags & DBD_CONF_FLAG_ALLOW_NO_DEF_ACCT));
@@ -834,9 +852,16 @@ extern List dump_config(void)
 			  (slurmdbd_conf->flags &
 			   DBD_CONF_FLAG_DISABLE_COORD_DBD));
 
+	add_key_pair_bool(my_list, "DisableArchiveCommands",
+			  (slurmdbd_conf->flags &
+			   DBD_CONF_FLAG_DISABLE_ARCHIVE_COMMANDS));
+
 	add_key_pair(my_list, "HashPlugin", "%s", slurm_conf.hash_plugin);
 
 	add_key_pair(my_list, "LogFile", "%s", slurmdbd_conf->log_file);
+
+	add_key_pair(my_list, "MaxPurgeLimit", "%u",
+		     slurmdbd_conf->max_purge_limit);
 
 	secs2time_str(slurmdbd_conf->max_time_range, time_str,
 		      sizeof(time_str));
@@ -947,14 +972,16 @@ extern List dump_config(void)
 
 	/* StoragePass should NOT be passed due to security reasons */
 
+	add_key_pair(my_list, "StoragePassScript", "%s",
+		     slurmdbd_conf->storage_pass_script);
+
 	add_key_pair(my_list, "StoragePort", "%u",
 		     slurm_conf.accounting_storage_port);
 
 	add_key_pair(my_list, "StorageType", "%s",
 		     slurm_conf.accounting_storage_type);
 
-	add_key_pair(my_list, "StorageUser", "%s",
-		     slurm_conf.accounting_storage_user);
+	add_key_pair(my_list, "StorageUser", "%s", slurmdbd_conf->storage_user);
 
 	add_key_pair(my_list, "TCPTimeout", "%u secs", slurm_conf.tcp_timeout);
 

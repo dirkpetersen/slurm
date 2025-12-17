@@ -71,7 +71,7 @@
 
 #define MAX_STEP_RETRIES 4
 
-static List local_job_list = NULL;
+static list_t *local_job_list = NULL;
 static uint32_t *local_global_rc = NULL;
 static pthread_mutex_t launch_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t het_job_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -79,7 +79,7 @@ static pthread_cond_t  start_cond  = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t start_mutex = PTHREAD_MUTEX_INITIALIZER;
 static slurm_opt_t *opt_save = NULL;
 
-static List task_state_list = NULL;
+static list_t *task_state_list = NULL;
 static time_t launch_start_time;
 static bool retry_step_begin = false;
 static int  retry_step_cnt = 0;
@@ -100,9 +100,7 @@ static int _step_signal(int signal)
 	iter = list_iterator_create(local_job_list);
 	while ((my_srun_job = (srun_job_t *) list_next(iter))) {
 		info("Terminating %ps", &my_srun_job->step_id);
-		rc2 = slurm_kill_job_step(my_srun_job->step_id.job_id,
-					  my_srun_job->step_id.step_id, signal,
-					  0);
+		rc2 = slurm_kill_job_step(&my_srun_job->step_id, signal, 0);
 		if (rc2)
 			rc = rc2;
 	}
@@ -257,7 +255,6 @@ static void
 _handle_openmpi_port_error(const char *tasks, const char *hosts,
 			   slurm_step_ctx_t *step_ctx)
 {
-	slurm_step_id_t step_id = step_ctx->step_req->step_id;
 	char *msg = "retrying";
 
 	if (!retry_step_begin) {
@@ -270,8 +267,8 @@ _handle_openmpi_port_error(const char *tasks, const char *hosts,
 	error("%s: tasks %s unable to claim reserved port, %s.",
 	      hosts, tasks, msg);
 
-	info("Terminating job step %ps", &step_id);
-	slurm_kill_job_step(step_id.job_id, step_id.step_id, SIGKILL, 0);
+	info("Terminating job step %ps", &step_ctx->step_req->step_id);
+	slurm_kill_job_step(&step_ctx->step_req->step_id, SIGKILL, 0);
 }
 
 static char *_mpir_get_host_name(char *node_name)
@@ -493,7 +490,7 @@ static void _task_finish(task_exit_msg_t *msg)
 /*
  * Load the multi_prog config file into argv, pass the  entire file contents
  * in order to avoid having to read the file on every node. We could parse
- * the infomration here too for loading the MPIR records for TotalView
+ * the information here too for loading the MPIR records for TotalView
  */
 static void _load_multi(int *argc, char **argv)
 {
@@ -511,7 +508,7 @@ static void _load_multi(int *argc, char **argv)
 		      argv[0]);
 		exit(error_exit);
 	}
-	if (stat_buf.st_size > 60000) {
+	if (stat_buf.st_size > MAX_BATCH_SCRIPT_SIZE) {
 		error("Multi_prog config file %s is too large",
 		      argv[0]);
 		exit(error_exit);
@@ -630,16 +627,6 @@ static void _wait_all_het_job_comps_started(slurm_opt_t *opt_local)
 	slurm_mutex_unlock(&start_mutex);
 }
 
-/*
- * Initialize context for plugin
- */
-extern int launch_init(void)
-{
-	int retval = SLURM_SUCCESS;
-
-	return retval;
-}
-
 extern int location_fini(void)
 {
 	FREE_NULL_LIST(task_state_list);
@@ -683,11 +670,11 @@ static job_step_create_request_msg_t *_create_job_step_create_request(
 	char *add_tres = NULL, *pos;
 	srun_opt_t *srun_opt = opt_local->srun_opt;
 	job_step_create_request_msg_t *step_req = xmalloc(sizeof(*step_req));
-	List tmp_gres_list = NULL;
+	list_t *tmp_gres_list = NULL;
 	int rc;
 
 	xassert(srun_opt);
-
+	step_req->use_protocol_ver = job->use_protocol_ver;
 	step_req->host = xshort_hostname();
 	step_req->cpu_freq_min = opt_local->cpu_freq_min;
 	step_req->cpu_freq_max = opt_local->cpu_freq_max;
@@ -725,6 +712,13 @@ static job_step_create_request_msg_t *_create_job_step_create_request(
 	}
 	if (opt_local->job_flags & GRES_ALLOW_TASK_SHARING)
 		step_req->flags |= SSF_GRES_ALLOW_TASK_SHARING;
+	if (srun_opt->wait_for_children)
+		step_req->flags |= SSF_WAIT_FOR_CHILDREN;
+
+	if (((srun_opt->kill_bad_exit != NO_VAL) && srun_opt->kill_bad_exit) ||
+	    ((srun_opt->kill_bad_exit == NO_VAL) &&
+	     slurm_conf.kill_on_bad_exit))
+		step_req->flags |= SSF_KILL_ON_BAD_EXIT;
 
 	if (opt_local->immediate == 1)
 		step_req->immediate = opt_local->immediate;
@@ -880,6 +874,10 @@ static job_step_create_request_msg_t *_create_job_step_create_request(
 	memcpy(&step_req->step_id, &job->step_id, sizeof(step_req->step_id));
 	step_req->array_task_id = srun_opt->array_task_id;
 
+	step_req->cwd = xstrdup(opt_local->chdir);
+	step_req->std_err = xstrdup(opt_local->efname);
+	step_req->std_in = xstrdup(opt_local->ifname);
+	step_req->std_out = xstrdup(opt_local->ofname);
 	step_req->submit_line = xstrdup(opt_local->submit_line);
 
 	if (opt_local->threads_per_core != NO_VAL) {
@@ -1123,7 +1121,6 @@ extern bool launch_common_step_retry_errno(int rc)
 {
 	if ((rc == EAGAIN) ||
 	    (rc == ESLURM_DISABLED) ||
-	    (rc == ESLURM_INTERCONNECT_BUSY) ||
 	    (rc == ESLURM_NODES_BUSY) ||
 	    (rc == ESLURM_PORTS_BUSY) ||
 	    (rc == SLURM_PROTOCOL_SOCKET_IMPL_TIMEOUT))
@@ -1192,13 +1189,11 @@ extern int launch_g_create_job_step(srun_job_t *job, bool use_all_cpus,
 		       opt_local->min_nodes, opt_local->max_nodes);
 		return SLURM_ERROR;
 	}
-#if !defined HAVE_FRONT_END
 	if (opt_local->min_nodes && (opt_local->min_nodes > job->nhosts)) {
 		error ("Minimum node count > allocated node count (%d > %d)",
 		       opt_local->min_nodes, job->nhosts);
 		return SLURM_ERROR;
 	}
-#endif
 
 	step_req = _create_job_step_create_request(
 		opt_local, use_all_cpus, job);
@@ -1252,7 +1247,7 @@ extern int launch_g_create_job_step(srun_job_t *job, bool use_all_cpus,
 			}
 			break;
 		}
-		rc = slurm_get_errno();
+		rc = errno;
 
 		if (((opt_local->immediate != 0) &&
 		     ((opt_local->immediate == 1) ||
@@ -1392,11 +1387,10 @@ extern int launch_g_step_launch(srun_job_t *job, slurm_step_io_fds_t *cio_fds,
 		task_state_alter(task_state, job->ntasks);
 	}
 
-	launch_params.alias_list = job->alias_list;
 	launch_params.argc = opt_local->argc;
 	launch_params.argv = opt_local->argv;
 	launch_params.multi_prog = srun_opt->multi_prog ? true : false;
-	launch_params.container = xstrdup(opt_local->container);
+	launch_params.container = opt_local->container;
 	launch_params.cwd = opt_local->chdir;
 	launch_params.slurmd_debug = srun_opt->slurmd_debug;
 	launch_params.buffered_stdio = !srun_opt->unbuffered;
@@ -1410,6 +1404,7 @@ extern int launch_g_step_launch(srun_job_t *job, slurm_step_io_fds_t *cio_fds,
 	launch_params.het_job_ntasks = job->het_job_ntasks;
 	launch_params.het_job_offset = job->het_job_offset;
 	launch_params.het_job_step_cnt = srun_opt->het_step_cnt;
+	launch_params.het_job_step_task_cnts = job->het_job_step_task_cnts;
 	launch_params.het_job_task_offset = job->het_job_task_offset;
 	launch_params.het_job_task_cnts = job->het_job_task_cnts;
 	launch_params.het_job_tids = job->het_job_tids;
@@ -1465,6 +1460,7 @@ extern int launch_g_step_launch(srun_job_t *job, slurm_step_io_fds_t *cio_fds,
 	launch_params.mpi_plugin_name = srun_opt->mpi_type;
 	launch_params.env = _build_user_env(job, opt_local);
 	launch_params.tree_width = srun_opt->tree_width;
+	launch_params.oom_kill_step = opt_local->oom_kill_step;
 
 	memcpy(&launch_params.local_fds, cio_fds, sizeof(slurm_step_io_fds_t));
 

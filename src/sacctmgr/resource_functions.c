@@ -42,7 +42,7 @@
 static void _print_overcommit(slurmdb_res_rec_t *res,
 			      slurmdb_res_cond_t *res_cond)
 {
-	List res_list = NULL, cluster_list = NULL;
+	list_t *res_list = NULL, *cluster_list = NULL;
 	list_itr_t *itr, *clus_itr = NULL, *found_clus_itr = NULL;
 	slurmdb_res_rec_t *found_res;
 	slurmdb_clus_res_rec_t *clus_res = NULL;
@@ -136,8 +136,8 @@ static void _print_overcommit(slurmdb_res_rec_t *res,
 }
 
 static int _set_res_cond(int *start, int argc, char **argv,
-			     slurmdb_res_cond_t *res_cond,
-			     List format_list)
+			 slurmdb_res_cond_t *res_cond,
+			 list_t *format_list)
 {
 	int i;
 	int set = 0;
@@ -150,15 +150,10 @@ static int _set_res_cond(int *start, int argc, char **argv,
 	}
 
 	for (i=(*start); i<argc; i++) {
-		end = parse_option_end(argv[i]);
-		if (!end)
-			command_len=strlen(argv[i]);
-		else {
-			command_len=end-1;
-			if (argv[i][end] == '=') {
-				end++;
-			}
-		}
+		int op_type;
+		end = parse_option_end(argv[i], &op_type, &command_len);
+		if (!common_verify_option_syntax(argv[i], op_type, false))
+			continue;
 
 		if (!xstrncasecmp(argv[i], "Set", MAX(command_len, 3))) {
 			i--;
@@ -272,7 +267,7 @@ static int _set_res_cond(int *start, int argc, char **argv,
 }
 
 static int _set_res_rec(int *start, int argc, char **argv,
-			List name_list, List cluster_list,
+			list_t *name_list, list_t *cluster_list,
 			slurmdb_res_rec_t *res)
 {
 	int i;
@@ -280,20 +275,12 @@ static int _set_res_rec(int *start, int argc, char **argv,
 	int end = 0;
 	int command_len = 0;
 	int option = 0;
+	bool allow_option = false;
 
 	xassert(res);
 
 	for (i=(*start); i<argc; i++) {
-		end = parse_option_end(argv[i]);
-		if (!end)
-			command_len=strlen(argv[i]);
-		else {
-			command_len=end-1;
-			if (argv[i][end] == '=') {
-				option = (int)argv[i][end-1];
-				end++;
-			}
-		}
+		end = parse_option_end(argv[i], &option, &command_len);
 
 		if (!xstrncasecmp(argv[i], "Where", MAX(command_len, 5))) {
 			i--;
@@ -340,6 +327,7 @@ static int _set_res_rec(int *start, int argc, char **argv,
 			set = 1;
 		} else if (!xstrncasecmp(argv[i], "Flags",
 					 MAX(command_len, 2))) {
+			allow_option = true;
 			res->flags = str_2_res_flags(argv[i]+end, option);
 			if (res->flags == SLURMDB_RES_FLAG_NOTSET) {
 				char *tmp_char = slurmdb_res_flags_str(
@@ -397,11 +385,14 @@ static int _set_res_rec(int *start, int argc, char **argv,
 			}
 			xfree(temp);
 		} else {
+			allow_option = true;
 			exit_code = 1;
 			printf(" Unknown option: %s\n"
 			       " Use keyword 'where' to modify condition\n",
 			       argv[i]);
 		}
+
+		common_verify_option_syntax(argv[i], option, allow_option);
 	}
 
 	(*start) = i;
@@ -524,10 +515,10 @@ extern int sacctmgr_add_res(int argc, char **argv)
 	slurmdb_res_rec_t *res = NULL;
 	slurmdb_res_rec_t *found_res = NULL;
 	slurmdb_res_rec_t *start_res = xmalloc(sizeof(slurmdb_res_rec_t));
-	List cluster_list = list_create(xfree_ptr);
-	List name_list = list_create(xfree_ptr);
+	list_t *cluster_list = list_create(xfree_ptr);
+	list_t *name_list = list_create(xfree_ptr);
 	char *name = NULL;
-	List res_list = NULL;
+	list_t *res_list = NULL;
 	char *res_str = NULL;
 
 	slurmdb_init_res_rec(start_res, 0);
@@ -748,10 +739,16 @@ extern int sacctmgr_add_res(int argc, char **argv)
 		goto end_it;
 	if (rc == SLURM_SUCCESS) {
 		if (commit_check("Would you like to commit changes?")) {
-			slurmdb_connection_commit(db_conn, 1);
+			rc = slurmdb_connection_commit(db_conn, 1);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr, " Error committing changes: %s\n",
+					slurm_strerror(rc));
 		} else {
 			printf(" Changes Discarded\n");
-			slurmdb_connection_commit(db_conn, 0);
+			rc = slurmdb_connection_commit(db_conn, 0);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr, " Error rolling back changes: %s\n",
+					slurm_strerror(rc));
 		}
 	} else {
 		exit_code = 1;
@@ -776,10 +773,10 @@ extern int sacctmgr_list_res(int argc, char **argv)
 	list_itr_t *itr2 = NULL;
 	slurmdb_res_rec_t *res = NULL;
 	slurmdb_clus_res_rec_t *clus_res = NULL;
-	List res_list = NULL;
+	list_t *res_list = NULL;
 	int field_count = 0;
-	List format_list = list_create(xfree_ptr);
-	List print_fields_list; /* types are of print_field_t */
+	list_t *format_list = list_create(xfree_ptr);
+	list_t *print_fields_list; /* types are of print_field_t */
 
 	slurmdb_init_res_cond(res_cond, 0);
 
@@ -858,7 +855,7 @@ extern int sacctmgr_modify_res(int argc, char **argv)
 		xmalloc(sizeof(slurmdb_res_rec_t));
 	int i=0;
 	int cond_set = 0, rec_set = 0, set = 0;
-	List ret_list = NULL;
+	list_t *ret_list = NULL;
 
 	slurmdb_init_res_cond(res_cond, 0);
 	slurmdb_init_res_rec(res, 0);
@@ -929,7 +926,7 @@ extern int sacctmgr_modify_res(int argc, char **argv)
 		list_iterator_destroy(itr);
 		set = 1;
 	} else if (ret_list) {
-		printf(" Nothing modified\n");
+		printf("  Nothing modified\n");
 		rc = SLURM_ERROR;
 	} else if (errno == ESLURM_OVER_ALLOCATE) {
 		exit_code=1;
@@ -946,11 +943,17 @@ extern int sacctmgr_modify_res(int argc, char **argv)
 	}
 
 	if (set) {
-		if (commit_check("Would you like to commit changes?")){
-			slurmdb_connection_commit(db_conn, 1);
+		if (commit_check("Would you like to commit changes?")) {
+			rc = slurmdb_connection_commit(db_conn, 1);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr, " Error committing changes: %s\n",
+					slurm_strerror(rc));
 		} else {
 			printf(" Changes Discarded\n");
-			slurmdb_connection_commit(db_conn, 0);
+			rc = slurmdb_connection_commit(db_conn, 0);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr, " Error rolling back changes: %s\n",
+					slurm_strerror(rc));
 		}
 	}
 
@@ -967,7 +970,7 @@ extern int sacctmgr_delete_res(int argc, char **argv)
 	int rc = SLURM_SUCCESS;
 	slurmdb_res_cond_t *res_cond = xmalloc(sizeof(slurmdb_res_cond_t));
 	int i=0;
-	List ret_list = NULL;
+	list_t *ret_list = NULL;
 	list_itr_t *itr = NULL;
 	int set = 0;
 	char *name = NULL;
@@ -1008,13 +1011,19 @@ extern int sacctmgr_delete_res(int argc, char **argv)
 		}
 		list_iterator_destroy(itr);
 		if (commit_check("Would you like to commit changes?")) {
-			slurmdb_connection_commit(db_conn, 1);
+			rc = slurmdb_connection_commit(db_conn, 1);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr, " Error committing changes: %s\n",
+					slurm_strerror(rc));
 		} else {
 			printf(" Changes Discarded\n");
-			slurmdb_connection_commit(db_conn, 0);
+			rc = slurmdb_connection_commit(db_conn, 0);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr, " Error rolling back changes: %s\n",
+					slurm_strerror(rc));
 		}
 	} else if (ret_list) {
-		printf(" Nothing deleted\n");
+		printf("  Nothing deleted\n");
 		rc = SLURM_ERROR;
 	} else {
 		exit_code=1;

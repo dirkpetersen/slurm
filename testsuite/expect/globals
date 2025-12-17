@@ -173,6 +173,7 @@ cset sshare      "${slurm_dir}/bin/sshare"
 cset sstat       "${slurm_dir}/bin/sstat"
 cset strigger    "${slurm_dir}/bin/strigger"
 
+cset slurmctld   "${slurm_dir}/sbin/slurmctld"
 cset slurmd      "${slurm_dir}/sbin/slurmd"
 cset slurmrestd  "${slurm_dir}/sbin/slurmrestd"
 
@@ -237,8 +238,7 @@ cset bin_perldoc "/usr/bin/perldoc"
 cset bin_py3     "python3"
 cset bin_oasgen  "openapi-generator-cli"
 
-# Don't user $bin_hostname unless on a front-end system that
-# doesn't fully use the slurmd, use $bin_printenv SLURMD_NODENAME
+# Don't user $bin_hostname, use $bin_printenv SLURMD_NODENAME
 cset bin_hostname "hostname"
 
 cset bin_kill	"kill"
@@ -1028,7 +1028,7 @@ proc check_user_id user {
 #		command exits with a non-zero exit code.
 #	-timeout <float_number>
 #		Time in seconds to wait for the command to complete before
-#		timing out (default is 60.0)
+#		timing out (default is max_job_delay)
 #	-nolog
 #		Logging for this command will occur at trace threshold only
 #	-stdin
@@ -1053,14 +1053,14 @@ proc check_user_id user {
 #
 ################################################################
 proc run_command args {
-	global bin_bash bin_sudo
+	global bin_bash bin_sudo max_job_delay
 
 	set alt_user ""
 	set exit_status 0
 	set timedout false
 	set output ""
 	set action "warn"
-	set timeout 60
+	set timeout $max_job_delay
 	set expect_failure false
 	set log_at_trace_level false
 	set stdin ""
@@ -1224,7 +1224,7 @@ proc run_command args {
 #		times out.
 #	-timeout <float_number>
 #		time in seconds to wait for the command to complete before
-#		timing out (default is 60.0)
+#		timing out (default is max_job_delay)
 #	-stdin
 #		Provide standard in to be piped into command
 #
@@ -1282,7 +1282,7 @@ proc run_command_output args {
 #		times out.
 #	-timeout <float_number>
 #		time in seconds to wait for the command to complete before
-#		timing out (default is 60.0)
+#		timing out (default is max_job_delay)
 #	-stdin
 #		Provide standard in to be piped into command
 #
@@ -1420,6 +1420,41 @@ proc get_line_cnt { file_name } {
 		}
 	}
 	return $lines
+}
+
+
+################################################################
+#
+# NAME
+#	convert_time_str - Converts a string like [HH:]MM:SS[.sss] to secs
+#
+# SYNOPSIS
+#	Convert the string to a number.
+#
+# DESCRIPTION
+#	Units can be hours, mins, secs.
+#
+# RETURN VALUE
+#	A non-zero return code indicates a failure.
+#
+################################################################
+
+proc convert_time_str { time_str units } {
+	subtest {[regexp {(?:(\d+):)?(\d+):(\d+)(?:\.(\d+))?} $time_str - hours mins secs msecs]} "Time should be in the format \[HH:\]MM:SS\[.sss\]" "$time_str"
+	if { $hours eq "" } {
+		set hours 0
+	}
+
+	# Use scan to avoid TCL octals
+	set value  [expr ([scan $hours "%d"] * 3600) + ([scan $mins "%d"] * 60) + [scan $secs "%d"]]
+
+	if { $units eq "hours" } {
+		set value [expr $value / 3600]
+	} elseif { $units eq "mins" } {
+		set value [expr $value / 60]
+	}
+
+	return $value
 }
 
 
@@ -1595,6 +1630,37 @@ proc get_my_gid {  } {
 ################################################################
 #
 # NAME
+#	get_version - gets the version of the Slurm component to use with the
+#                     TCL package module. It call the component with "-V"
+#
+# SYNOPSIS
+#	get_version <component>
+#
+# RETURN VALUE
+#	The version of the component
+#
+################################################################
+
+proc get_version {{component ""}} {
+	global slurmctld
+
+	if {$component == ""} {
+		set component $slurmctld
+	}
+	set version_str [string map {"slurm " ""} [string trimright [run_command_output -fail "$component -V"]]]
+
+	set re {^([0-9]+(?:\.[0-9]+)*)(.*)$}
+	if {[regexp $re $version_str -> version_num suffix1] == 0} {
+		fail "Invalid version: $version_num"
+	}
+
+	return $version_num
+}
+
+
+################################################################
+#
+# NAME
 #	kill_salloc - kills all salloc commands associated with this user
 #
 # SYNOPSIS
@@ -1681,7 +1747,7 @@ proc kill_srun {  } {
 #		call subfail
 #	-timeout <float_number>
 #		time in seconds to wait for the condition to be met before
-#		timing out (default is 60.0)
+#		timing out (default is max_job_delay)
 #	-pollinterval <float_number>
 #		time in seconds between each loop execution and condition check
 #		(default is 1.0)
@@ -1699,9 +1765,11 @@ proc kill_srun {  } {
 ################################################################
 
 proc wait_for args {
+	global max_job_delay
+
 	set action          "none"
 	set subtest         false
-	set timeout         60
+	set timeout         $max_job_delay
 	set poll_interval   1
 	while {[llength $args]} {
 		switch -glob -- [lindex $args 0] {
@@ -1784,7 +1852,7 @@ proc wait_for args {
 #		call subfail
 #	-timeout <float_number>
 #		time in seconds to wait for the condition to be met before
-#		timing out (default is 60.0)
+#		timing out (default is max_job_delay)
 #	-pollinterval <float_number>
 #		time in seconds between each loop execution and condition
 #		check (default is 1.0)
@@ -1808,8 +1876,10 @@ proc wait_for args {
 ################################################################
 
 proc wait_for_command args {
+	global max_job_delay
+
 	set action          "none"
-	set timeout         60
+	set timeout         $max_job_delay
 	set poll_interval   1
 	while {[llength $args]} {
 		switch -glob -- [lindex $args 0] {
@@ -1901,7 +1971,7 @@ proc wait_for_command args {
 #		call subfail
 #	-timeout <float_number>
 #		time in seconds to wait for the pattern to be matched before
-#		timing out (default is 60.0)
+#		timing out (default is max_job_delay)
 #	-pollinterval <float_number>
 #		time in seconds between each loop execution and match check
 #		(default is 1.0)
@@ -1947,7 +2017,7 @@ proc wait_for_command_match args {
 #		by the timeout, fail the test rather than returning an error
 #	-timeout <integer_number>
 #		time in seconds to wait for the file to exist before
-#		timing out (default is 90)
+#		timing out (default is max_job_delay)
 #	-pollinterval <integer_number>
 #		time in seconds between each file existence test (default is 1)
 #
@@ -1963,10 +2033,10 @@ proc wait_for_command_match args {
 ################################################################
 
 proc wait_for_file args {
-	global bin_sleep
+	global bin_sleep max_job_delay
 
 	set fatal         false
-	set timeout       90
+	set timeout       $max_job_delay
 	set poll_interval 1
 	while {[llength $args]} {
 		switch -glob -- [lindex $args 0] {
@@ -1988,8 +2058,6 @@ proc wait_for_file args {
 	for {set my_delay 0} {$my_delay <= $timeout} \
 	                     {set my_delay [expr $my_delay + $poll_interval]} {
 		if {[file exists $file_name]} {
-			# Add small delay for I/O buffering
-			exec $bin_sleep 1
 			return $::RETURN_SUCCESS
 		}
 		exec $bin_sleep $poll_interval
@@ -2021,7 +2089,7 @@ proc wait_for_file args {
 #	_wait_for_single_job - waits for a job to reach the desired state
 #
 # SYNOPSIS
-#	_wait_for_single_job ?options? job_id desired_state
+#	_wait_for_single_job ?options? job_id desired_state desired_reason
 #
 # DESCRIPTION
 #	Wait for a previously submitted Slurm job to reach the desired state.
@@ -2048,6 +2116,8 @@ proc wait_for_file args {
 #			RUNNING   - job is running
 #			SPECIAL_EXIT
 #			SUSPENDED - job is suspended
+#	desired_reason
+#		The desired_reason.
 #
 # RETURN VALUE
 #	RETURN_SUCCESS, or non-zero on error.
@@ -2071,10 +2141,10 @@ proc _wait_for_single_job args {
 		}
 	}
 	set argument_count [llength $args]
-	if {$argument_count != 2} {
+	if {$argument_count != 3} {
 		fail "Invalid number of arguments ($argument_count): $args"
 	} else {
-		lassign $args job_id desired_state
+		lassign $args job_id desired_state desired_reason
 	}
 
 	# First verify that desired_state is supported
@@ -2104,7 +2174,7 @@ proc _wait_for_single_job args {
 		return $::RETURN_ERROR
 	}
 
-	set my_delay    0
+	set start_time [format "%.3f" [expr [clock milliseconds] / 1000.000]]
 	while 1 {
 		set fd [open "|$scontrol -o show job $job_id"]
 		gets $fd line
@@ -2112,18 +2182,21 @@ proc _wait_for_single_job args {
 		if {[regexp {JobState\s*=\s*(\w+)} $line foo state] != 1} {
 			set state "NOT_FOUND"
 		}
+		if {[regexp {Reason\s*=\s*(\w+)} $line foo reason] != 1} {
+			set reason "NOT_FOUND"
+		}
 
 		switch $state {
 			"CANCELLED" {
-				if {$desired_state eq "CANCELLED"} {
+				if {$desired_state eq "CANCELLED" && ($desired_reason eq "" || $reason eq $desired_reason)} {
 					log_debug "Job $job_id is CANCELLED"
 					return $::RETURN_SUCCESS
 				}
-				if {$desired_state eq "DONE"} {
+				if {$desired_state eq "DONE" && ($desired_reason eq "" || $reason eq $desired_reason)} {
 					log_debug "Job $job_id is DONE ($state)"
 					return $::RETURN_SUCCESS
 				}
-				set message "Job ($job_id) is $state, but we wanted $desired_state"
+				set message "Job ($job_id) is $state (and reason '$reason'), but we wanted $desired_state (and reason '$desired_reason')"
 				if {$fatal} {
 					fail $message
 				}
@@ -2139,11 +2212,11 @@ proc _wait_for_single_job args {
 			"OUT_OF_MEMORY" -
 			"PREEMPTED" -
 			"TIMEOUT" {
-				if {$desired_state eq "DONE"} {
+				if {$desired_state eq "DONE" && ($desired_reason eq "" || $reason eq $desired_reason)} {
 					log_debug "Job $job_id is DONE ($state)"
 					return $::RETURN_SUCCESS
 				}
-				set message "Job ($job_id) is $state, but we wanted $desired_state"
+				set message "Job ($job_id) is $state (and reason '$reason'), but we wanted $desired_state (and reason '$desired_reason')"
 				if {$fatal} {
 					fail $message
 				}
@@ -2151,49 +2224,45 @@ proc _wait_for_single_job args {
 				return $::RETURN_ERROR
 			}
 			"PENDING" {
-				if {$desired_state eq "PENDING"} {
+				if {$desired_state eq "PENDING" && ($desired_reason eq "" || $reason eq $desired_reason)} {
 					log_debug "Job $job_id is PENDING"
 					return $::RETURN_SUCCESS
 				}
-				log_debug "Job $job_id is in state $state, desire $desired_state"
 			}
 			"RUNNING" {
-				if {$desired_state eq "RUNNING"} {
+				if {$desired_state eq "RUNNING" && ($desired_reason eq "" || $reason eq $desired_reason)} {
 					log_debug "Job $job_id is RUNNING"
 					return $::RETURN_SUCCESS
 				}
-				log_debug "Job $job_id is in state $state, desire $desired_state"
 			}
 			"SPECIAL_EXIT" {
-				if {$desired_state eq "SPECIAL_EXIT"} {
+				if {$desired_state eq "SPECIAL_EXIT" && ($desired_reason eq "" || $reason eq $desired_reason)} {
 					log_debug "Job $job_id is SPECIAL_EXIT"
 					return $::RETURN_SUCCESS
 				}
-				log_debug "Job $job_id is in state $state, desire $desired_state"
 			}
 			"SUSPENDED" {
-				if {$desired_state eq "SUSPENDED"} {
+				if {$desired_state eq "SUSPENDED" && ($desired_reason eq "" || $reason eq $desired_reason)} {
 					log_debug "Job $job_id is SUSPENDED"
 					return $::RETURN_SUCCESS
 				}
-				log_debug "Job $job_id is in state $state, desire $desired_state"
 			}
 			default {
-				log_debug "Job $job_id is in state $state, desire $desired_state"
 			}
 		}
 
-		if { $my_delay > $timeout } {
-			set message "Timeout waiting for job state $desired_state"
+		log_debug "Job $job_id is in state $state (and reason '$reason'), desire $desired_state (and reason '$desired_reason')"
+		set now [format "%.3f" [expr [clock milliseconds] / 1000.000]]
+		if {$now > $start_time + $timeout} {
+			set message "Timeout waiting for job state $desired_state (and reason '$desired_reason')"
 			if {$fatal} {
 				fail $message
 			}
-			log_warn "Timeout waiting for job state $desired_state"
+			log_debug $message
 			return $::RETURN_TIMEOUT
 		}
 
 		exec sleep $poll_interval
-		set my_delay [expr $my_delay + $poll_interval]
 	}
 }
 
@@ -2215,7 +2284,7 @@ proc _wait_for_single_job args {
 #		by the timeout, fail the test rather than returning an error
 #	-timeout <integer_number>
 #		time in seconds to wait for the job to be in the desired state
-#		before timing out (default is 90)
+#		before timing out (default is max_job_delay)
 #	-pollinterval <integer_number>
 #		time in seconds between each job state check (default is 1)
 #
@@ -2234,6 +2303,8 @@ proc _wait_for_single_job args {
 #	het_job
 #		If set, checks the state of each component job if the job
 #		is a het one.
+#	desired_reason
+#		The desired reason to match too.
 #
 # RETURN VALUE
 #	RETURN_SUCCESS if job reaches the desired state, or non-zero value
@@ -2248,6 +2319,7 @@ proc wait_for_job args {
 
 	set options  [list]
 	set het_job  0
+	set desired_reason ""
 
 	while {[llength $args]} {
 		switch -glob -- [lindex $args 0] {
@@ -2267,12 +2339,13 @@ proc wait_for_job args {
 	set argument_count [llength $args]
 	if {$argument_count < 2} {
 		fail "Too few arguments ($argument_count): $args"
-	} elseif {$argument_count > 3}  {
+	} elseif {$argument_count > 4}  {
 		fail "Too many arguments ($argument_count): $args"
 	} else {
 		lassign $args job_id desired_state
 	}
-	if {$argument_count == 3} { set hetjob [lindex $args 2] }
+	if {$argument_count >= 3} { set hetjob [lindex $args 2] }
+	if {$argument_count == 3} { set desired_reason [lindex $args 3] }
 
 	if { $het_job } {
 		# get component job ids
@@ -2287,7 +2360,7 @@ proc wait_for_job args {
 	}
 
 	foreach jid $jid_list {
-		set rc [_wait_for_single_job {*}$options $jid $desired_state]
+		set rc [_wait_for_single_job {*}$options $jid $desired_state $desired_reason]
 		if { $rc } {
 			# bail out on first failure
 			break
@@ -2315,7 +2388,7 @@ proc wait_for_job args {
 #		by the timeout, fail the test rather than returning an error
 #	-timeout <integer_number>
 #		time in seconds to wait for the job's field to be populated
-#		before timing out (default is 90)
+#		before timing out (default is max_job_delay)
 #	-pollinterval <integer_number>
 #		time in seconds between each field check (default is 1)
 #
@@ -2333,10 +2406,10 @@ proc wait_for_job args {
 ################################################################
 
 proc wait_for_job_acct args {
-	global sacct
+	global sacct max_job_delay
 
 	set options [list]
-	set timeout 10
+	set timeout $max_job_delay
 	set pollinterval .2
 	set field End
 
@@ -2576,7 +2649,7 @@ proc wait_for_part_done args {
 # OPTIONS
 #	-timeout <integer_number>
 #		time in seconds to wait for the job step to be found before
-#		timing out (default is 30)
+#		timing out (default is max_job_delay)
 #	-pollinterval <integer_number>
 #		time in seconds between each step existence check (default is 1)
 #
@@ -2590,9 +2663,9 @@ proc wait_for_part_done args {
 ################################################################
 
 proc wait_for_step args {
-	global scontrol
+	global scontrol max_job_delay
 
-	set timeout       30
+	set timeout       $max_job_delay
 	set poll_interval 1
 	while {[llength $args]} {
 		switch -glob -- [lindex $args 0] {
@@ -2699,7 +2772,7 @@ proc wait_job_reason args {
 	set log_user_prev [log_user -info]
 	log_user 0
 
-	set my_delay 0
+	set start_time [format "%.3f" [expr [clock milliseconds] / 1000.000]]
 	set rc $::RETURN_ERROR
 	while true {
 		set pending 0
@@ -2745,12 +2818,13 @@ proc wait_job_reason args {
 		}
 
 		# Check if this was the last poll
-		if {$my_delay > $timeout} {
+		set now [format "%.3f" [expr [clock milliseconds] / 1000.000]]
+		if {$now > $start_time + $timeout} {
 			log_error "Timeout"
 			set rc $::RETURN_TIMEOUT
 			break
 		}
-		set remamining_sec [expr $timeout - $my_delay]
+		set remamining_sec [expr $timeout - $now]
 		log_debug [format "Job in state/reason '%s' / '%s' instead of the desired '%s' / '%s'." \
 		                  $job_state $job_reason \
 		                  $desired_state $desired_reason_list]
@@ -2758,7 +2832,6 @@ proc wait_job_reason args {
 		                  $poll_interval $remamining_sec]
 
 		sleep $poll_interval
-		set my_delay [expr $my_delay + $poll_interval]
 	}
 
 	log_user $log_user_prev
@@ -3007,6 +3080,29 @@ proc get_mps_count_by_index { index hostname } {
 	return $count
 }
 
+################################################################
+#
+# NAME
+#	check_mpi - determines if mpicc and the desired --mpi option are available
+#
+# SYNOPSIS
+#	check_mpi desired_mpi
+#
+# DESCRIPTION
+#	Runs srun --mpi=list to determine if the desired mpi is available, as
+#	well as if mpicc set in globals.local is too.
+#
+# RETURN VALUE
+#	Returns true if the desired mpi and mpicc are available, false otherwise.
+#
+################################################################
+
+proc check_mpi {desired_mpi} {
+	global srun eol mpicc
+	set output [run_command_output -fail "$srun --mpi=list"]
+
+	return [regexp "${desired_mpi}${eol}" $output] && [file executable $mpicc]
+}
 
 ################################################################
 #
@@ -3984,7 +4080,7 @@ proc check_config_node_mem { } {
 # OPTIONS
 #	-timeout <integer_number>
 #		time in seconds to wait for the node state before
-#		timing out (default is 3)
+#		timing out (default is max_job_delay)
 #	-pollinterval <integer_number>
 #		time in seconds between each node state check (default is 1)
 #
@@ -4002,10 +4098,10 @@ proc check_config_node_mem { } {
 ################################################################
 
 proc wait_for_node args {
-	global sinfo number
+	global sinfo number max_job_delay
 
 	set partition     ""
-	set timeout       3
+	set timeout       $max_job_delay
 	set poll_interval 1
 	set desired_state "PENDING"
 	set desired_reason_list ""
@@ -6211,6 +6307,60 @@ proc get_jobs { {job_id_in ""} } {
 ################################################################
 #
 # NAME
+#	get_steps - returns a dictionary of dictionaries of step parameters
+#
+# SYNOPSIS
+#	get_steps job_id
+#
+# DESCRIPTION
+#	Uses `scontrol show steps job_id` to return a dictionary of
+#	dictionaries of the step parameters of the job_id.
+#	I doesn't return all the steps in the system because that's not
+#	possible with stepmgr, and probably that's not really needed.
+#
+################################################################
+
+proc get_steps {job_id} {
+	global scontrol
+
+	set steps_dict {}
+	set results [run_command -none "$scontrol show steps -d -o $job_id"]
+	if {[dict get $results "exit_code"]} {
+		log_debug "No steps found for JobId $job_id"
+		return $steps_dict
+	}
+
+	# Iterate over each step's parameter list
+	set output [dict get $results "output"]
+	foreach line [split $output "\n"] {
+		if {$line eq ""} { continue }
+		if {$line eq "No job steps in the system"} { continue }
+
+		# Peel off the step parameters one at a time
+		# The first quantifier sets the greediness for the whole RE
+		while {[regexp {^ *?([^ =]+)=(.*)(?= +[^ =]+=| *$)} $line {} param_name param_value]} {
+			# Remove the consumed parameter from the line
+			set line [regsub {^ *?[^ =]+=.*(?= +[^ =]+=| *$)} $line {}]
+			# Add it to the temporary job dictionary
+			dict set step_dict $param_name $param_value
+		}
+
+		set step_id [dict get $step_dict "StepId"]
+
+		# Add the step dictionary to steps dictionary
+		dict set steps_dict $step_id $step_dict
+
+		# Clear the setp dictionary for the next step
+		set step_dict {}
+	}
+
+	return $steps_dict
+}
+
+
+################################################################
+#
+# NAME
 #	get_job_param - returns a specific parameter value for a specific job
 #
 # SYNOPSIS
@@ -7171,8 +7321,14 @@ proc _test_init {} {
 	if {![regexp "is UP" [run_command_output -nolog -none "$scontrol ping"]]} {
 		skip "The expect testsuite requires Slurm to be running, but '$scontrol ping' failed."
 	}
-	if {[llength [get_nodes_by_state]] < 1} {
+	set idle_nodes [get_nodes_by_state]
+	if {[llength $idle_nodes] < 1} {
 		skip "The expect testsuite requires there to be at least one idle node in the default partition."
+	}
+	# Ensure that idle nodes are not drained/down
+	# Checking one by one to be able to print a warning if some was drain/down
+	foreach idle_node $idle_nodes {
+		run_command -nolog -xfail "$scontrol update nodename=$idle_node state=resume"
 	}
 }
 
@@ -7233,6 +7389,25 @@ proc _test_fini { status } {
 	if {$status != $STATUS_FAIL || $testsuite_cleanup_on_failure} {
 		_test_cleanup
 	}
+
+	# If failed, print the normalized load average to help troubleshooting
+	if {$status > 0} {
+		set cpu_count [string trim [run_command_output -nolog "nproc"]]
+		set output [run_command_output -nolog "cat /proc/loadavg"]
+		if {[scan $output "%f %f %f" load1 load5 load15] != 3} {
+			log_warn "Cannot read load average from: $output"
+		} else {
+			set load1 [expr {int($load1 * 100 / $cpu_count)}]
+			set load5 [expr {int($load5 * 100 / $cpu_count)}]
+			set load15 [expr {int($load15 * 100 / $cpu_count)}]
+			log_debug "Load Average: ${load1}% / ${load5}% / ${load15}%"
+
+			if {$load1 > 100} {
+				set output [run_command_output "ps aux --sort=-pcpu | head -n 10"]
+			}
+		}
+	}
+
 	_print_summary $status $completed
 
 	__exit $status
@@ -7293,4 +7468,3 @@ proc exit { {status 0} } {
 
 # Call _test_init at the beginning of each test
 _test_init
-

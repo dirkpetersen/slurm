@@ -5,7 +5,7 @@
  *  Copyright (C) 2008-2010 Lawrence Livermore National Security.
  *  Copyright (C) SchedMD LLC.
  *  Produced at Lawrence Livermore National Laboratory (cf, DISCLAIMER).
- *  Written by David Bigagli david@schemd.com
+ *  Written by David Bigagli david@schemed.com
  *  CODE-OCEC-09-009. All rights reserved.
  *
  *  This file is part of Slurm, a resource management program.
@@ -151,7 +151,7 @@ static void _print_license_info(const char *name, license_info_msg_t *msg)
 	for (cc = 0; cc < msg->num_lic; cc++) {
 		if (name && xstrcmp((sorted_lic[cc])->name, name))
 			continue;
-		printf("LicenseName=%s%sTotal=%d Used=%u Free=%u Reserved=%u Remote=%s",
+		printf("LicenseName=%s%sTotal=%u Used=%u Free=%u Reserved=%u Remote=%s",
 		       (sorted_lic[cc])->name,
 		       one_liner ? " " : "\n    ",
 		       (sorted_lic[cc])->total,
@@ -159,8 +159,11 @@ static void _print_license_info(const char *name, license_info_msg_t *msg)
 		       (sorted_lic[cc])->available,
 		       (sorted_lic[cc])->reserved,
 		       (sorted_lic[cc])->remote ? "yes" : "no");
-
-		if (sorted_lic[cc]->remote) {
+		if (sorted_lic[cc]->mode) {
+			printf("%sNodes=%s Mode=%u\n",
+			       one_liner ? " " : "\n    ",
+			       sorted_lic[cc]->nodes, sorted_lic[cc]->mode);
+		} else if (sorted_lic[cc]->remote) {
 			char time_str[256];
 			slurm_make_time_str(&sorted_lic[cc]->last_update,
 					    time_str, sizeof(time_str));
@@ -171,9 +174,6 @@ static void _print_license_info(const char *name, license_info_msg_t *msg)
 		} else {
 			printf("\n");
 		}
-
-		if (name)
-			break;
 	}
 
 	xfree(sorted_lic);

@@ -53,9 +53,6 @@
 /* State file name */
 #define SLINGSHOT_STATE_FILE "slingshot_state"
 
-/* New state file name (for atomic replacing) */
-#define SLINGSHOT_STATE_FILE_NEW "slingshot_state.new"
-
 /* Environment variable for libcxi library name (for dlopen()) */
 #define SLINGSHOT_CXI_LIB_VERSION_ENV "SLURM_SLINGSHOT_CXI_VERSION"
 
@@ -78,9 +75,13 @@
 #define SLINGSHOT_RDZV_GET_EN_FMT \
 	"/sys/class/cxi/cxi%d/device/properties/rdzv_get_en"
 
-/* File path to the default rdzv_get_en setting */
-#define SLINGSHOT_RDZV_GET_EN_DEFAULT_FILE \
-	"/sys/module/cxi_core/parameters/rdzv_get_en_default"
+/* File path format to the default rdzv_get_en setting */
+#define SLINGSHOT_RDZV_GET_EN_DEFAULT_FMT \
+	"/sys/module/cxi_%s/parameters/rdzv_get_en_default"
+
+/* RGID sharing: max_lnis_per_rgid value found here - insert device name */
+#define SLINGSHOT_RGIDS_AVAIL_FMT \
+	"/sys/class/cxi/%s/device/properties/rgids_avail"
 
 extern int free_vnis; /* Number of free VNIs */
 
@@ -128,7 +129,7 @@ typedef struct slingshot_state {
 #define SLINGSHOT_TLE_DEF     1       /* Per-thread trigger list entries */
 #define SLINGSHOT_PTE_DEF     6       /* Per-thread portal table entries */
 #define SLINGSHOT_LE_DEF      16      /* Per-thread list entries */
-#define SLINGSHOT_AC_DEF      4       /* Per-thread addressing contexts */
+#define SLINGSHOT_AC_DEF      2       /* Per-thread addressing contexts */
 
 /* NIC resource limit structure */
 typedef struct slingshot_limits {
@@ -154,6 +155,7 @@ typedef struct slingshot_limits_set {
  * 'SwitchParameters' slurm.conf variable
  */
 typedef struct slingshot_config {
+	uint32_t destroy_retries; /* retry count for destroying services */
 	uint8_t single_node_vni;        /* Allocate VNIs for single-node apps */
 	uint8_t job_vni;                /* Allocate extra VNI per-job */
 	uint32_t tcs;                   /* Bitmap of default traffic classes */
@@ -167,6 +169,11 @@ typedef struct slingshot_config {
 	char *fm_url;                   /* fabric manager REST interface URL */
 	slingshot_rest_auth_t fm_auth;  /* fabric manager authentication type */
 	char *fm_authdir;               /* fabric manager auth file directory */
+	char *fm_mtls_ca; /* fabric manager certificate bundle path */
+	char *fm_mtls_cert; /* fabric manager client public certificate path */
+	char *fm_mtls_key; /* fabric manager client private key path */
+	char *fm_mtls_url; /* fabric manager REST interface URL for mtls */
+	uint16_t nic_dist_cnt; /* Num of NICs that tasks will distribute over */
 } slingshot_config_t;
 
 /* Values for slingshot_config_t.single_node_vni */
@@ -239,6 +246,7 @@ typedef struct slingshot_stepinfo {
 	uint32_t flags;        /* Configuration flags */
 	uint32_t num_nics;     /* Number of entries in 'nics' array */
 	slingshot_hsn_nic_t *nics; /* HSN NIC information for instant on */
+	uint16_t nic_dist_cnt; /* Num of NICs that tasks will distribute over */
 	slingshot_hwcoll_t *hwcoll; /* HSN HW collectives info */
 } slingshot_stepinfo_t;
 
@@ -256,14 +264,14 @@ typedef struct slingshot_stepinfo {
  * resource limit reservations by subtracting system service reserved/used
  * resources
  *
+ * If SLINGSHOT_FLAGS_ENABLE_MTLS is set, Slurm daemons will use mTLS
+ * authentication with the fabric manager for the duration of the application
+ *
  * If SLINGSHOT_FLAGS_DISABLE_RDZV_GET is set, slurmd will disable rendezvous
  * gets in the Cassini NIC for the duration of the application
  */
 #define SLINGSHOT_FLAGS_ADJUST_LIMITS 0x1
-/*
- * #define SLINGSHOT_FLAGS_VNI_PIDS      0x2 DEPRECATED in 23.02, can be used in
- *					     25.02
- */
+#define SLINGSHOT_FLAGS_ENABLE_MTLS 0x2
 #define SLINGSHOT_FLAGS_DISABLE_RDZV_GET 0x4
 #define SLINGSHOT_FLAGS_DEFAULT SLINGSHOT_FLAGS_ADJUST_LIMITS
 
@@ -300,7 +308,9 @@ extern void slingshot_release_collectives_job_step(slingshot_stepinfo_t *job);
 extern void slingshot_release_collectives_job(uint32_t job_id);
 /* config.c */
 extern void slingshot_free_config(void);
+extern bool slingshot_stepd_init(const char *switch_params);
 extern bool slingshot_setup_config(const char *switch_params);
+extern int slingshot_update_vni_table(void);
 extern bool slingshot_setup_job_vni_pool(job_record_t *job_ptr);
 extern bool slingshot_setup_job_step_vni(
 	slingshot_stepinfo_t *job, int node_cnt,
@@ -310,11 +320,6 @@ extern void slingshot_free_job_step_vni(slingshot_stepinfo_t *job);
 extern void slingshot_free_job_vni(uint32_t job_id);
 extern void slingshot_free_job_vni_pool(slingshot_jobinfo_t *job);
 extern void slingshot_free_jobinfo(slingshot_jobinfo_t *jobinfo);
-/* instant_on.c */
-extern bool slingshot_init_instant_on(void);
-extern void slingshot_fini_instant_on(void);
-extern bool slingshot_fetch_instant_on(slingshot_stepinfo_t *job,
-				       char *node_list, uint32_t node_cnt);
 /* setup_nic.c */
 extern bool slingshot_open_cxi_lib(slingshot_stepinfo_t *job);
 extern bool slingshot_create_services(slingshot_stepinfo_t *job, uint32_t uid,

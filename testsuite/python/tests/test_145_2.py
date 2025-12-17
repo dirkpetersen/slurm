@@ -45,9 +45,9 @@ def test_constraint(constraint, xfail, command):
         )
 
     if xfail:
-        assert result["exit_code"] != 0, "Verify tha job was NOT submitted"
+        assert result["exit_code"] != 0, "Verify that job was NOT submitted"
     else:
-        assert result["exit_code"] == 0, "Verify tha job was submitted"
+        assert result["exit_code"] == 0, "Verify that job was submitted"
 
     stdout = result["stdout"]
     stderr = result["stderr"]
@@ -58,18 +58,18 @@ def test_constraint(constraint, xfail, command):
             atf.properties["submitted-jobs"].append(job_id)
             atf.wait_for_job_state(job_id, "DONE")
             atf.wait_for_file("job.out")
-            stdout = atf.run_command_output(f"cat job.out", fatal=True)
+            stdout = atf.run_command_output("cat job.out", fatal=True)
 
     node = ""
     if match := re.search(r"SLURM_JOB_NODELIST=(.*)", stdout):
         node = match.group(1)
 
     if not xfail:
-        node_features = atf.get_node_parameter(node, "AvailableFeatures")
+        node_features = atf.get_node_parameter(node, "features")
         constraints = constraint.split(",")
         for c in constraints:
             assert c in node_features, "Verify {node} has feature {c}"
     else:
         assert (
             "Invalid feature specification" in stderr
-        ), f"Verify that 'Invalid feature specification' is in stderr"
+        ), "Verify that 'Invalid feature specification' is in stderr"

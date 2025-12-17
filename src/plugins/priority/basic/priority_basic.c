@@ -59,48 +59,20 @@ list_t *job_list = NULL;
 int slurmctld_tres_cnt = 0;
 #endif
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobcomp" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobcomp/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-const char plugin_name[]       	= "Priority BASIC plugin";
-const char plugin_type[]       	= "priority/basic";
-const uint32_t plugin_version	= SLURM_VERSION_NUMBER;
+/* Required Slurm plugin symbols: */
+const char plugin_name[] = "Priority BASIC plugin";
+const char plugin_type[] = "priority/basic";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
-int init ( void )
+extern int init(void)
 {
 	debug("%s loaded", plugin_name);
 	return SLURM_SUCCESS;
 }
 
-int fini ( void )
+extern void fini(void)
 {
-	return SLURM_SUCCESS;
+	return;
 }
 
 void priority_p_thread_start(void)
@@ -167,26 +139,7 @@ extern void priority_p_set_assoc_usage(slurmdb_assoc_rec_t *assoc)
 	return;
 }
 
-extern double priority_p_calc_fs_factor(long double usage_efctv,
-					long double shares_norm)
-{
-	/* This calculation is needed for sshare when ran from a
-	 * non-multifactor machine to a multifactor machine.  It
-	 * doesn't do anything on regular systems, it should always
-	 * return 0 since shares_norm will always be NO_VAL. */
-	double priority_fs;
-
-	xassert(!fuzzy_equal(usage_efctv, NO_VAL));
-
-	if ((shares_norm <= 0.0) || fuzzy_equal(shares_norm, NO_VAL))
-		priority_fs = 0.0;
-	else
-		priority_fs = pow(2.0, -(usage_efctv / shares_norm));
-
-	return priority_fs;
-}
-
-extern List priority_p_get_priority_factors_list(uid_t uid)
+extern list_t *priority_p_get_priority_factors_list(uid_t uid)
 {
 	return(list_create(NULL));
 }

@@ -44,8 +44,7 @@
  * A bitstr_t is an array of configurable size words.  The first two words
  * are for internal use.  Word 0 is a magic cookie used to validate that the
  * bitstr_t is properly initialized.  Word 1 is the number of valid bits in
- * the bitstr_t This limts the capacity of a bitstr_t to 4 gigabits if using
- * 32 bit words.
+ * the bitstr_t.
  *
  * bitstrings are zero origin
  *
@@ -59,9 +58,6 @@
 
 #include <inttypes.h>
 
-#define BITSTR_SHIFT_WORD8	3
-#define BITSTR_SHIFT_WORD64	6
-#define BITSTR_MAXVAL           0xffffffffffffffff
 #define BITSTR_FMT		PRId64
 
 /* Below are also defined in src/slurm/slurm.h.in.  If it changes please update
@@ -71,30 +67,21 @@
 #  define __bitstr_datatypes_defined
 
 typedef int64_t bitstr_t;
-#define BITSTR_SHIFT 		BITSTR_SHIFT_WORD64
-
 typedef bitstr_t bitoff_t;
 
 #endif
 
 /*
- * internal macros / defs
+ * Cache bitstrings of a specific length for reuse rather than xfree()'ing.
+ * Intended for use with node_record_count to improve performance in slurmctld.
  */
-
-/* 2 words used for magic cookie and size */
-#define BITSTR_OVERHEAD 	2
-
-/* bitstr_t signature in first word */
-#define BITSTR_MAGIC 		0x42434445
-
-/* word size */
-#define BITSTR_WORD_SIZE	(sizeof(bitstr_t) * 8)
-/* max bit position in word */
-#define BITSTR_MAXPOS		(BITSTR_WORD_SIZE - 1)
+extern void bit_cache_init(bitoff_t nbits);
+extern void bit_cache_fini(void);
 
 /* compat with Vixie macros */
 bitstr_t *bit_alloc(bitoff_t nbits);
-int bit_test(bitstr_t *b, bitoff_t bit);
+#define bit_test slurm_bit_test
+int slurm_bit_test(bitstr_t *b, bitoff_t bit);
 void bit_set(bitstr_t *b, bitoff_t bit);
 void bit_clear(bitstr_t *b, bitoff_t bit);
 void bit_nclear(bitstr_t *b, bitoff_t start, bitoff_t stop);
@@ -119,9 +106,6 @@ void slurm_bit_free(bitstr_t **b);
 bitstr_t *slurm_bit_realloc(bitstr_t **b, bitoff_t nbits);
 
 /* new */
-bitoff_t bit_nffs(bitstr_t *b, int32_t n);
-bitoff_t bit_nffc(bitstr_t *b, int32_t n);
-bitoff_t bit_noc(bitstr_t *b, int32_t n, int32_t seed);
 bitoff_t bit_size(bitstr_t *b);
 void	bit_and(bitstr_t *b1, bitstr_t *b2);
 void	bit_and_not(bitstr_t *b1, bitstr_t *b2);
@@ -131,8 +115,6 @@ void	bit_or_not(bitstr_t *b1, bitstr_t *b2);
 int32_t	bit_set_count(bitstr_t *b);
 int32_t	bit_set_count_range(bitstr_t *b, int32_t start, int32_t end);
 int32_t	bit_clear_count(bitstr_t *b);
-int32_t	bit_clear_count_range(bitstr_t *b, int32_t start, int32_t end);
-int32_t	bit_nset_max_count(bitstr_t *b);
 bitstr_t *bit_rotate_copy(bitstr_t *b1, int32_t n, bitoff_t nbits);
 void	bit_rotate(bitstr_t *b1, int32_t n);
 char	*bit_fmt(char *str, int32_t len, bitstr_t *b);
@@ -140,14 +122,11 @@ char    *bit_fmt_full(bitstr_t *b);
 char    *bit_fmt_range(bitstr_t *b, int offset, int len);
 extern int bit_unfmt(bitstr_t *b, const char *str);
 extern int32_t *bitfmt2int(const char *bit_str_ptr);
-char *  inx2bitfmt (int32_t *inx);
 int     inx2bitstr(bitstr_t *b, int32_t *inx);
 int32_t *bitstr2inx(bitstr_t *b);
 char	*bit_fmt_hexmask(bitstr_t *b);
 char    *bit_fmt_hexmask_trim(bitstr_t *b);
 int 	bit_unfmt_hexmask(bitstr_t *b, const char *str);
-char	*bit_fmt_binmask(bitstr_t *b);
-void 	bit_unfmt_binmask(bitstr_t *b, const char *str);
 bitoff_t bit_ffs_from_bit(bitstr_t *b, bitoff_t bit);
 bitoff_t bit_fls(bitstr_t *b);
 bitoff_t bit_fls_from_bit(bitstr_t *b, bitoff_t bit);
@@ -176,5 +155,12 @@ do {				\
 	_X = NULL;		\
 } while (0)
 
+#define COPY_BITMAP(_X, _Y)		\
+do {					\
+	if (_X)				\
+		bit_copybits(_X, _Y);	\
+	else				\
+		_X = bit_copy(_Y);	\
+} while (0)
 
 #endif /* !_BITSTRING_H_ */

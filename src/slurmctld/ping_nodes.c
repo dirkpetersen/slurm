@@ -49,7 +49,6 @@
 #include "src/interfaces/select.h"
 
 #include "src/slurmctld/agent.h"
-#include "src/slurmctld/front_end.h"
 #include "src/slurmctld/ping_nodes.h"
 #include "src/slurmctld/slurmctld.h"
 
@@ -60,6 +59,7 @@
 #define PING_TIMEOUT 100
 
 static pthread_mutex_t lock_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool ping_updated = false;
 static int ping_count = 0;
 static time_t ping_start = 0;
 
@@ -83,8 +83,17 @@ bool is_ping_done (void)
 			      PING_TIMEOUT);
 			ping_msg_sent = true;
 		}
-	} else
+	} else {
 		ping_msg_sent = false;
+		/*
+		 * We can only consider the last node ping cycle to be fully
+		 * completed if ping_updated is true, meaning the
+		 * _agent_nodes_update thread finished updating the nodes
+		 * response. Otherwise, we could hit a race and incorrectly set
+		 * responding/healthy nodes to DOWN.
+		 */
+		is_done = ping_updated;
+	}
 	slurm_mutex_unlock(&lock_mutex);
 
 	return is_done;
@@ -105,6 +114,18 @@ void ping_begin (void)
 }
 
 /*
+ * ping_nodes_update - A ping cycle can end but the update can still be pending
+ * for the _agent_nodes_update thread. This call will confirm node info was
+ * updated.
+ */
+void ping_nodes_update(void)
+{
+	slurm_mutex_lock(&lock_mutex);
+	ping_updated = true;
+	slurm_mutex_unlock(&lock_mutex);
+}
+
+/*
  * ping_end - record that a ping cycle has ended. This can be called more
  *	than once (for REQUEST_PING and simultaneous REQUEST_NODE_REGISTRATION
  *	for selected nodes). Matching ping_end calls must be made for each
@@ -121,7 +142,7 @@ void ping_end (void)
 
 	if (ping_count == 0) /* no more running ping cycles */
 		ping_start = 0;
-
+	ping_updated = false;
 	slurm_mutex_unlock(&lock_mutex);
 }
 
@@ -145,14 +166,10 @@ void ping_nodes (void)
 	char *host_str = NULL;
 	agent_arg_t *ping_agent_args = NULL;
 	agent_arg_t *reg_agent_args = NULL;
-#ifdef HAVE_FRONT_END
-	front_end_record_t *front_end_ptr = NULL;
-#else
 	node_record_t *node_ptr = NULL;
 	time_t old_cpu_load_time = now - slurm_conf.slurmd_timeout;
 	time_t old_free_mem_time = now - slurm_conf.slurmd_timeout;
 	int node_offset = 0;
-#endif
 
 	ping_agent_args = xmalloc (sizeof (agent_arg_t));
 	ping_agent_args->msg_type = REQUEST_PING;
@@ -194,79 +211,10 @@ void ping_nodes (void)
 	    (reg_offset >= (max_reg_threads * MAX_REG_FREQUENCY)))
 		reg_offset = 0;
 
-#ifdef HAVE_FRONT_END
-	for (i = 0, front_end_ptr = front_end_nodes;
-	     i < front_end_node_cnt; i++, front_end_ptr++) {
-		if ((slurm_conf.slurmd_timeout == 0)	&&
-		    (!restart_flag)				&&
-		    (!IS_NODE_UNKNOWN(front_end_ptr))		&&
-		    (!IS_NODE_NO_RESPOND(front_end_ptr)))
-			continue;
-
-		if ((front_end_ptr->last_response != (time_t) 0)     &&
-		    (front_end_ptr->last_response <= node_dead_time) &&
-		    (!IS_NODE_DOWN(front_end_ptr))) {
-			if (down_hostlist)
-				(void) hostlist_push_host(down_hostlist,
-					front_end_ptr->name);
-			else {
-				down_hostlist =
-					hostlist_create(front_end_ptr->name);
-				if (!down_hostlist) {
-					fatal("invalid front_end list: %s",
-					      front_end_ptr->name);
-				}
-			}
-			set_front_end_down(front_end_ptr, "Not responding");
-			front_end_ptr->not_responding = false;
-			continue;
-		}
-
-		if (restart_flag)
-			front_end_ptr->last_response = slurm_conf.last_update;
-
-		/* Request a node registration if its state is UNKNOWN or
-		 * on a periodic basis (about every MAX_REG_FREQUENCY ping,
-		 * this mechanism avoids an additional (per node) timer or
-		 * counter and gets updated configuration information
-		 * once in a while). We limit these requests since they
-		 * can generate a flood of incoming RPCs. */
-		if (IS_NODE_UNKNOWN(front_end_ptr) || restart_flag ||
-		    ((i >= reg_offset) && (i < (reg_offset + max_reg_threads)))) {
-			if (reg_agent_args->protocol_version >
-			    front_end_ptr->protocol_version)
-				reg_agent_args->protocol_version =
-					front_end_ptr->protocol_version;
-			hostlist_push_host(reg_agent_args->hostlist,
-				      front_end_ptr->name);
-			reg_agent_args->node_count++;
-			continue;
-		}
-
-		if ((!IS_NODE_NO_RESPOND(front_end_ptr)) &&
-		    (front_end_ptr->last_response >= still_live_time))
-			continue;
-
-		/* The problems that exist on a normal system with
-		 * hierarchical communication don't exist on a
-		 * front-end system, so it is ok to ping none
-		 * responding or down front-end nodes. */
-		/* if (IS_NODE_NO_RESPOND(front_end_ptr) && */
-		/*     IS_NODE_DOWN(front_end_ptr)) */
-		/* 	continue; */
-
-		if (ping_agent_args->protocol_version >
-		    front_end_ptr->protocol_version)
-			ping_agent_args->protocol_version =
-				front_end_ptr->protocol_version;
-		hostlist_push_host(ping_agent_args->hostlist,
-				   front_end_ptr->name);
-		ping_agent_args->node_count++;
-	}
-#else
 	for (i = 0; (node_ptr = next_node(&i)); i++) {
 		node_offset++;
 		if (IS_NODE_FUTURE(node_ptr) ||
+		    IS_NODE_EXTERNAL(node_ptr) ||
 		    IS_NODE_POWERED_DOWN(node_ptr) ||
 		    IS_NODE_POWERING_DOWN(node_ptr) ||
 		    IS_NODE_POWERING_UP(node_ptr) ||
@@ -338,7 +286,6 @@ void ping_nodes (void)
 		if (PACK_FANOUT_ADDRS(node_ptr))
 			ping_agent_args->msg_flags |= SLURM_PACK_ADDRS;
 	}
-#endif
 
 	restart_flag = false;
 	if (ping_agent_args->node_count == 0) {
@@ -382,17 +329,36 @@ void ping_nodes (void)
 /* Spawn health check function for every node that is not DOWN */
 extern void run_health_check(void)
 {
-#ifdef HAVE_FRONT_END
-	front_end_record_t *front_end_ptr;
-	int i;
-#else
-	node_record_t *node_ptr;
-	int node_test_cnt = 0, node_limit, node_states, run_cyclic;
-	static int base_node_loc = 0;
-	static time_t cycle_start_time = (time_t) 0;
-#endif
 	char *host_str = NULL;
 	agent_arg_t *check_agent_args = NULL;
+	node_record_t *node_ptr;
+	int node_test_cnt = 0;
+	int node_limit = 0;
+	int node_states = slurm_conf.health_check_node_state &
+		(~HEALTH_CHECK_CYCLE);
+	int run_cyclic = slurm_conf.health_check_node_state &
+		HEALTH_CHECK_CYCLE;
+	static int base_node_loc = 0;
+	static time_t cycle_start_time = (time_t) 0;
+
+	if (run_cyclic) {
+		time_t now = time(NULL);
+		if (cycle_start_time == (time_t) 0)
+			cycle_start_time = now;
+		else if (base_node_loc > 0)
+			;	/* mid-cycle */
+		else if (difftime(now, cycle_start_time) <
+		         slurm_conf.health_check_interval)
+			return;	/* Wait to start next cycle */
+		cycle_start_time = now;
+		/*
+		 * Determine how many nodes we want to test on each call of
+		 * run_health_check() to spread out the work.
+		 */
+		node_limit = (active_node_record_count * 2) /
+		             slurm_conf.health_check_interval;
+		node_limit = MAX(node_limit, 10);
+	}
 
 	check_agent_args = xmalloc (sizeof (agent_arg_t));
 	check_agent_args->msg_type = REQUEST_HEALTH_CHECK;
@@ -408,48 +374,12 @@ extern void run_health_check(void)
 	 */
 	select_g_select_nodeinfo_set_all();
 
-#ifdef HAVE_FRONT_END
-	for (i = 0, front_end_ptr = front_end_nodes;
-	     i < front_end_node_cnt; i++, front_end_ptr++) {
-		if (IS_NODE_NO_RESPOND(front_end_ptr))
-			continue;
-		if (check_agent_args->protocol_version >
-		    front_end_ptr->protocol_version)
-			check_agent_args->protocol_version =
-				front_end_ptr->protocol_version;
-		hostlist_push_host(check_agent_args->hostlist,
-				   front_end_ptr->name);
-		check_agent_args->node_count++;
-	}
-#else
-	node_limit = 0;
-	run_cyclic = slurm_conf.health_check_node_state &
-	             HEALTH_CHECK_CYCLE;
-	node_states = slurm_conf.health_check_node_state &
-	              (~HEALTH_CHECK_CYCLE);
-	if (run_cyclic) {
-		time_t now = time(NULL);
-		if (cycle_start_time == (time_t) 0)
-			cycle_start_time = now;
-		else if (base_node_loc > 0)
-			;	/* mid-cycle */
-		else if (difftime(now, cycle_start_time) <
-		         slurm_conf.health_check_interval) {
-			return;	/* Wait to start next cycle */
-		}
-		cycle_start_time = now;
-		/* Determine how many nodes we want to test on each call of
-		 * run_health_check() to spread out the work. */
-		node_limit = (active_node_record_count * 2) /
-		             slurm_conf.health_check_interval;
-		node_limit = MAX(node_limit, 10);
-	}
-
 	for (; (node_ptr = next_node(&base_node_loc)); base_node_loc++) {
 		if (run_cyclic &&
 		    (node_test_cnt++ >= node_limit))
 				break;
 		if (IS_NODE_FUTURE(node_ptr) ||
+		    IS_NODE_EXTERNAL(node_ptr) ||
 		    IS_NODE_INVALID_REG(node_ptr) ||
 		    IS_NODE_NO_RESPOND(node_ptr) ||
 		    IS_NODE_POWERED_DOWN(node_ptr) ||
@@ -461,11 +391,10 @@ extern void run_health_check(void)
 			uint16_t cpus_total, cpus_used = 0;
 			cpus_total = node_ptr->config_ptr->cpus;
 			if (!IS_NODE_IDLE(node_ptr)) {
-				select_g_select_nodeinfo_get(
-						node_ptr->select_nodeinfo,
-						SELECT_NODEDATA_SUBCNT,
-						NODE_STATE_ALLOCATED,
-						&cpus_used);
+				node_select_stats_t *tmp =
+					node_select_stats_array
+						[node_ptr->index];
+				cpus_used = tmp->alloc_cpus;
 			}
 			/* Here the node state is inferred from
 			 * the cpus allocated on it.
@@ -503,7 +432,6 @@ extern void run_health_check(void)
 	}
 	if (!node_ptr)
 		base_node_loc = 0;
-#endif
 
 	if (check_agent_args->node_count == 0) {
 		hostlist_destroy(check_agent_args->hostlist);
@@ -523,11 +451,7 @@ extern void run_health_check(void)
 /* Update acct_gather data for every node that is not DOWN */
 extern void update_nodes_acct_gather_data(void)
 {
-#ifdef HAVE_FRONT_END
-	front_end_record_t *front_end_ptr;
-#else
 	node_record_t *node_ptr;
-#endif
 	int i;
 	char *host_str = NULL;
 	agent_arg_t *agent_args = NULL;
@@ -538,22 +462,9 @@ extern void update_nodes_acct_gather_data(void)
 	agent_args->protocol_version = SLURM_PROTOCOL_VERSION;
 	agent_args->hostlist = hostlist_create(NULL);
 
-#ifdef HAVE_FRONT_END
-	for (i = 0, front_end_ptr = front_end_nodes;
-	     i < front_end_node_cnt; i++, front_end_ptr++) {
-		if (IS_NODE_NO_RESPOND(front_end_ptr))
-			continue;
-		if (agent_args->protocol_version >
-		    front_end_ptr->protocol_version)
-			agent_args->protocol_version =
-				front_end_ptr->protocol_version;
-
-		hostlist_push_host(agent_args->hostlist, front_end_ptr->name);
-		agent_args->node_count++;
-	}
-#else
 	for (i = 0; (node_ptr = next_node(&i)); i++) {
 		if (IS_NODE_FUTURE(node_ptr) ||
+		    IS_NODE_EXTERNAL(node_ptr) ||
 		    IS_NODE_INVALID_REG(node_ptr) ||
 		    IS_NODE_NO_RESPOND(node_ptr) ||
 		    IS_NODE_POWERED_DOWN(node_ptr) ||
@@ -569,7 +480,6 @@ extern void update_nodes_acct_gather_data(void)
 		if (PACK_FANOUT_ADDRS(node_ptr))
 			agent_args->msg_flags |= SLURM_PACK_ADDRS;
 	}
-#endif
 
 	if (agent_args->node_count == 0) {
 		hostlist_destroy(agent_args->hostlist);

@@ -1684,11 +1684,8 @@ static void _update_sview_part_sub(sview_part_sub_t *sview_part_sub,
 
 	if ((sview_part_sub->node_state & NODE_STATE_BASE)
 	    == NODE_STATE_MIXED) {
-		slurm_get_select_nodeinfo(node_ptr->select_nodeinfo,
-					  SELECT_NODEDATA_SUBCNT,
-					  NODE_STATE_ALLOCATED,
-					  &alloc_cpus);
-		idle_cpus -= alloc_cpus;
+		alloc_cpus = node_ptr->alloc_cpus;
+		idle_cpus -= node_ptr->alloc_cpus;
 	} else if (sview_part_sub->node_state == NODE_STATE_ALLOCATED) {
 		alloc_cpus = idle_cpus;
 		idle_cpus = 0;
@@ -2009,7 +2006,7 @@ need_refresh:
 
 	if (!found) {
 		if (!popup_win->not_found) {
-			char *temp = "PARTITION DOESN'T EXSIST\n";
+			char *temp = "PARTITION DOESN'T EXIST\n";
 			GtkTreeIter iter;
 			GtkTreeModel *model = NULL;
 

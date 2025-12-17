@@ -115,6 +115,7 @@ struct job_resources {
 	uint16_t  cr_type;
 	uint64_t *memory_allocated;
 	uint64_t *memory_used;
+	uint32_t  next_step_node_inx;
 	uint32_t  nhosts;
 	bitstr_t *node_bitmap;
 	uint32_t  node_req;
@@ -302,5 +303,8 @@ extern int job_resources_node_inx_to_cpu_inx(job_resources_t *job_resrcs_ptr,
 extern uint16_t job_resources_get_node_cpu_cnt(job_resources_t *job_resrcs_ptr,
 					       int job_node_inx,
 					       int sys_node_inx);
+
+extern void pack_resource_layout(job_record_t *job_ptr, buf_t *buffer,
+				 uint16_t protocol_version);
 
 #endif /* !_JOB_RESOURCES_H */

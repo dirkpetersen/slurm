@@ -73,29 +73,30 @@
 #include "src/common/spank.h"
 #include "src/common/strlcpy.h"
 #include "src/common/xmalloc.h"
-#include "src/common/xsignal.h"
 #include "src/common/xstring.h"
 
 #include "src/interfaces/auth.h"
+#include "src/interfaces/conn.h"
 #include "src/interfaces/gres.h"
 #include "src/interfaces/mpi.h"
 #include "src/interfaces/proctrack.h"
 #include "src/interfaces/switch.h"
 #include "src/interfaces/task.h"
 
+#include "src/slurmd/common/fname.h"
 #include "src/slurmd/slurmd/slurmd.h"
 #include "src/slurmd/slurmstepd/container.h"
 #include "src/slurmd/slurmstepd/pdebug.h"
+#include "src/slurmd/slurmstepd/slurmstepd.h"
 #include "src/slurmd/slurmstepd/task.h"
 #include "src/slurmd/slurmstepd/ulimits.h"
 
 /*
  * Static prototype definitions.
  */
-static void  _make_tmpdir(stepd_step_rec_t *step);
-static int   _run_script_and_set_env(const char *name, const char *path,
-				     stepd_step_rec_t *step);
-static void  _proc_stdout(char *buf, stepd_step_rec_t *step);
+static void _make_tmpdir(void);
+static int _run_script_and_set_env(const char *name, const char *path);
+static void _proc_stdout(char *buf);
 
 /*
  * Process TaskProlog output
@@ -103,7 +104,7 @@ static void  _proc_stdout(char *buf, stepd_step_rec_t *step);
  * "unset  NAME"	clears an environment variable
  * "print  <whatever>"	writes that to the step's stdout
  */
-static void _proc_stdout(char *buf, stepd_step_rec_t *step)
+static void _proc_stdout(char *buf)
 {
 	bool end_buf = false;
 	int len;
@@ -136,16 +137,6 @@ static void _proc_stdout(char *buf, stepd_step_rec_t *step)
 				equal_ptr--;
 			equal_ptr[0] = '\0';
 			end_line[0] = '\0';
-			if (!xstrcmp(name_ptr, "SLURM_PROLOG_CPU_MASK")) {
-				step->cpu_bind_type = CPU_BIND_MASK;
-				xfree(step->cpu_bind);
-				step->cpu_bind = xstrdup(val_ptr);
-				if (task_g_pre_launch(step)) {
-					error("Failed SLURM_PROLOG_CPU_MASK "
-					      "setup");
-					exit(1);
-				}
-			}
 			debug("export name:%s:val:%s:", name_ptr, val_ptr);
 			if (setenvf(env, name_ptr, "%s", val_ptr)) {
 				error("Unable to set %s environment variable",
@@ -178,7 +169,6 @@ rwfail:		 /* process rest of script output */
 			break;
 		buf_ptr = end_line + 1;
 	}
-	return;
 }
 
 /*
@@ -191,9 +181,7 @@ rwfail:		 /* process rest of script output */
  *	if prolog
  * RET the exit status of the script or 1 on generic error and 0 on success
  */
-static int
-_run_script_and_set_env(const char *name, const char *path,
-			stepd_step_rec_t *step)
+static int _run_script_and_set_env(const char *name, const char *path)
 {
 	int status = 0, rc = 0;
 	char *argv[2];
@@ -203,6 +191,7 @@ _run_script_and_set_env(const char *name, const char *path,
 		.max_wait = -1,
 		.script_path = path,
 		.script_type = name,
+		.direct_exec = true,
 		.status = &status
 	};
 
@@ -217,13 +206,12 @@ _run_script_and_set_env(const char *name, const char *path,
 	argv[1] = NULL;
 	args.script_argv = argv;
 
-	debug("[job %u] attempting to run %s [%s]",
-	      step->step_id.job_id, name, path);
+	debug("%pI attempting to run %s [%s]", &step->step_id, name, path);
 	buf = run_command(&args);
 
 	if (WIFEXITED(status)) {
 		if (buf)
-			_proc_stdout(buf, step);
+			_proc_stdout(buf);
 		rc = WEXITSTATUS(status);
 	} else {
 		error("%s did not exit normally. reason: %s", name, buf);
@@ -284,19 +272,16 @@ static char *_build_path(char *fname, char **prog_env)
 	return file_name;
 }
 
-static int
-_setup_mpi(stepd_step_rec_t *step, int ltaskid)
+static int _setup_mpi(int ltaskid)
 {
 	mpi_task_info_t info[1];
 
+	info->step_id = step->step_id;
+
 	if (step->het_job_id && (step->het_job_id != NO_VAL))
-		info->step_id.job_id   = step->het_job_id;
-	else
-		info->step_id.job_id   = step->step_id.job_id;
+		info->step_id.job_id = step->het_job_id;
 
 	if (step->het_job_offset != NO_VAL) {
-		info->step_id.step_id  = step->step_id.step_id;
-		info->step_id.step_het_comp  = step->step_id.step_het_comp;
 		info->nnodes  = step->het_job_nnodes;
 		info->nodeid  = step->het_job_node_offset + step->nodeid;
 		info->ntasks  = step->het_job_ntasks;
@@ -306,8 +291,6 @@ _setup_mpi(stepd_step_rec_t *step, int ltaskid)
 		info->ltaskid = step->task[ltaskid]->id;
 		info->client  = step->envtp->cli;
 	} else {
-		info->step_id.step_id  = step->step_id.step_id;
-		info->step_id.step_het_comp  = step->step_id.step_het_comp;
 		info->nnodes  = step->nnodes;
 		info->nodeid  = step->nodeid;
 		info->ntasks  = step->ntasks;
@@ -323,7 +306,7 @@ _setup_mpi(stepd_step_rec_t *step, int ltaskid)
 /*
  *  Current process is running as the user when this is called.
  */
-extern void exec_task(stepd_step_rec_t *step, int local_proc_id)
+extern void exec_task(int local_proc_id)
 {
 	int fd, j;
 	stepd_step_task_info_t *task = step->task[local_proc_id];
@@ -332,7 +315,7 @@ extern void exec_task(stepd_step_rec_t *step, int local_proc_id)
 	uint32_t node_offset = 0, task_offset = 0;
 
 	if (step->container)
-		container_task_init(step, task);
+		container_task_init(task);
 
 	if (step->het_job_node_offset != NO_VAL)
 		node_offset = step->het_job_node_offset;
@@ -368,6 +351,13 @@ extern void exec_task(stepd_step_rec_t *step, int local_proc_id)
 	step->envtp->job_licenses = xstrdup(step->job_licenses);
 	step->envtp->job_start_time = step->job_start_time;
 	step->envtp->user_name = xstrdup(step->user_name);
+	step->envtp->oom_kill_step = step->oom_kill_step ? 1 : 0;
+
+	if (conn_tls_enabled()) {
+		srun_info_t *srun = list_peek(step->sruns);
+		if (srun)
+			step->envtp->tls_cert = srun->tls_cert;
+	}
 
 	/*
 	 * Modify copy of step's environment. Do not alter in place or
@@ -404,7 +394,7 @@ extern void exec_task(stepd_step_rec_t *step, int local_proc_id)
 			_exit(1);
 		}
 
-		if (_setup_mpi(step, local_proc_id) != SLURM_SUCCESS) {
+		if (_setup_mpi(local_proc_id) != SLURM_SUCCESS) {
 			error("Unable to configure MPI plugin: %m");
 			log_fini();
 			_exit(1);
@@ -438,7 +428,7 @@ extern void exec_task(stepd_step_rec_t *step, int local_proc_id)
 	 * lock here.
 	 */
 	auth_setuid_unlock();
-	if (spank_user_task(step, local_proc_id) < 0) {
+	if (spank_user_task(step, local_proc_id)) {
 		error("Failed to invoke spank plugin stack");
 		_exit(1);
 	}
@@ -459,7 +449,7 @@ extern void exec_task(stepd_step_rec_t *step, int local_proc_id)
 
 	if (slurm_conf.task_prolog) {
 		status = _run_script_and_set_env("slurm task_prolog",
-						 slurm_conf.task_prolog, step);
+						 slurm_conf.task_prolog);
 		if (status) {
 			error("TaskProlog failed status=%d", status);
 			_exit(status);
@@ -467,7 +457,7 @@ extern void exec_task(stepd_step_rec_t *step, int local_proc_id)
 	}
 	if (step->task_prolog) {
 		status = _run_script_and_set_env("user task_prolog",
-						 step->task_prolog, step);
+						 step->task_prolog);
 		if (status) {
 			error("--task-prolog failed status=%d", status);
 			_exit(status);
@@ -479,10 +469,10 @@ extern void exec_task(stepd_step_rec_t *step, int local_proc_id)
 	 * might be set or changed in one of the prolog scripts.
 	 */
 	if (local_proc_id == 0)
-		_make_tmpdir(step);
+		_make_tmpdir();
 
 	if (!step->batch)
-		pdebug_stop_current(step);
+		pdebug_stop_current();
 	if (step->env == NULL) {
 		debug("step->env is NULL");
 		step->env = (char **)xmalloc(sizeof(char *));
@@ -509,7 +499,7 @@ extern void exec_task(stepd_step_rec_t *step, int local_proc_id)
 	/* Do this last so you don't worry too much about the users
 	   limits including the slurmstepd in with it.
 	*/
-	set_user_limits(step, 0);
+	set_user_limits(0);
 
 	/*
 	 * If argv[0] ends with '/' it indicates that srun was called with
@@ -517,13 +507,13 @@ extern void exec_task(stepd_step_rec_t *step, int local_proc_id)
 	 * convention used by _rpc_file_bcast().
 	 */
 	if (task->argv[0][strlen(task->argv[0]) - 1] == '/') {
-		xstrfmtcat(task->argv[0], "slurm_bcast_%u.%u_%s",
+		xstrfmtcat(task->argv[0], BCAST_FILE_FMT,
 			   step->step_id.job_id, step->step_id.step_id,
 			   step->node_name);
 	}
 
 	if (step->container)
-		container_run(step, task);
+		container_run(task);
 
 	execve(task->argv[0], task->argv, step->env);
 	saved_errno = errno;
@@ -541,18 +531,17 @@ extern void exec_task(stepd_step_rec_t *step, int local_proc_id)
 			eol = strchr(buf, '\n');
 			if (eol)
 				eol[0] = '\0';
-			slurm_seterrno(saved_errno);
+			errno = saved_errno;
 			error("execve(): bad interpreter(%s): %m", buf+2);
 			_exit(errno);
 		}
 	}
-	slurm_seterrno(saved_errno);
+	errno = saved_errno;
 	error("execve(): %s: %m", task->argv[0]);
 	_exit(errno);
 }
 
-static void
-_make_tmpdir(stepd_step_rec_t *step)
+static void _make_tmpdir(void)
 {
 	char *tmpdir;
 
@@ -589,6 +578,4 @@ _make_tmpdir(stepd_step_rec_t *step)
 		error("Setting TMPDIR to /tmp");
 		setenvf(&step->env, "TMPDIR", "/tmp");
 	}
-
-	return;
 }

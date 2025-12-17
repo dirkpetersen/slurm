@@ -27,7 +27,6 @@ def setup():
         source="gres",
     )
     atf.require_nodes(2, [("Gres", f"gpu:2,mps:{mps_cnt}"), ("CPUs", 6)])
-    atf.require_config_parameter("FrontendName", None)
     atf.require_slurm_running()
 
 
@@ -42,7 +41,7 @@ def file_in_1a():
     file_in1 = atf.module_tmp_path / "input1"
     atf.make_bash_script(
         file_in1,
-        f"""
+        """
     echo HOST:$SLURMD_NODENAME
     echo CUDA_VISIBLE_DEVICES:$CUDA_VISIBLE_DEVICES
     echo CUDA_MPS_ACTIVE_THREAD_PERCENTAGE:$CUDA_MPS_ACTIVE_THREAD_PERCENTAGE
@@ -78,7 +77,7 @@ def test_environment_vars(mps_nodes):
 
     atf.make_bash_script(
         file_in1,
-        f"""
+        """
     echo HOST:$SLURMD_NODENAME
     echo CUDA_VISIBLE_DEVICES:$CUDA_VISIBLE_DEVICES
     echo CUDA_MPS_ACTIVE_THREAD_PERCENTAGE:$CUDA_MPS_ACTIVE_THREAD_PERCENTAGE
@@ -108,7 +107,7 @@ def test_two_parallel_consumption_sbatch(mps_nodes, file_in_2a):
         f"--gres=mps:{job_mps} -w {mps_nodes[0]} -n1 -t1 -o {file_out1} {file_in_2a}"
     )
     assert job_id != 0, "Job failed to submit"
-    atf.wait_for_job_state(job_id, "DONE", timeout=30, fatal=True)
+    atf.wait_for_job_state(job_id, "DONE", fatal=True)
     atf.wait_for_file(file_out1)
     file_output = atf.run_command_output(f"cat {file_out1}")
 
@@ -173,7 +172,7 @@ def test_three_parallel_consumption_sbatch(mps_nodes, file_in_1a):
     )
 
     assert job_id != 0, "Job failed to submit"
-    atf.wait_for_job_state(job_id, "DONE", timeout=40, fatal=True)
+    atf.wait_for_job_state(job_id, "DONE", fatal=True)
     atf.wait_for_file(file_out1)
     file_output = atf.run_command_output(f"cat {file_out1}")
     assert file_output is not None, "No output file"
@@ -213,7 +212,7 @@ def test_consume_more_gresMps_than_allocated(mps_nodes, file_in_1a):
     )
 
     assert job_id != 0, "Job failed to submit"
-    atf.wait_for_job_state(job_id, "DONE", timeout=20, fatal=True)
+    atf.wait_for_job_state(job_id, "DONE", fatal=True)
     atf.wait_for_file(file_out1)
     file_output = atf.run_command_output(f"cat {file_out1}")
     assert file_output is not None, "No output file"
@@ -268,7 +267,7 @@ def test_gresGPU_gresMPS_GPU_sharing(mps_nodes):
 
     atf.make_bash_script(
         file_in2,
-        f"""
+        """
     echo HOST:$SLURMD_NODENAME CUDA_VISIBLE_DEVICES:$CUDA_VISIBLE_DEVICES CUDA_MPS_ACTIVE_THREAD_PERCENTAGE:$CUDA_MPS_ACTIVE_THREAD_PERCENTAGE
     scontrol -dd show job $SLURM_JOB_ID
     squeue --name=test_job --noheader --state=r --format=\"jobid=%i state=%T\"
@@ -280,7 +279,8 @@ def test_gresGPU_gresMPS_GPU_sharing(mps_nodes):
     )
 
     assert job_id != 0, "Job failed to submit"
-    atf.wait_for_job_state(job_id, "DONE", timeout=60, fatal=True)
+    atf.wait_for_job_state(job_id, "RUNNING", fatal=True)
+    atf.wait_for_job_state(job_id, "DONE", fatal=True)
     atf.wait_for_file(file_out1)
     file_output = atf.run_command_output(f"cat {file_out1}")
     assert file_output is not None, "No output file"

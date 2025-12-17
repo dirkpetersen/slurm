@@ -67,7 +67,7 @@
 
 /*
  * Helper macro to log_flag(NET, ...) against a given connection
- * IN fd - file descriptor relavent for logging
+ * IN fd - file descriptor relevant for logging
  * IN con_name - human friendly name for fd or NULL (to auto resolve)
  * IN fmt - log message format
  */
@@ -89,18 +89,38 @@ do { \
  * for details.
  */
 strong_alias(closeall, slurm_closeall);
+strong_alias(closeall_except, slurm_closeall_except);
 strong_alias(fd_close, slurm_fd_close);
 strong_alias(fd_set_blocking,	slurm_fd_set_blocking);
 strong_alias(fd_set_nonblocking,slurm_fd_set_nonblocking);
 strong_alias(fd_get_socket_error, slurm_fd_get_socket_error);
-strong_alias(send_fd_over_pipe, slurm_send_fd_over_pipe);
-strong_alias(receive_fd_over_pipe, slurm_receive_fd_over_pipe);
+strong_alias(fd_get_readable_bytes, slurm_fd_get_readable_bytes);
+strong_alias(send_fd_over_socket, slurm_send_fd_over_socket);
+strong_alias(receive_fd_over_socket, slurm_receive_fd_over_socket);
 strong_alias(rmdir_recursive, slurm_rmdir_recursive);
 
 static int fd_get_lock(int fd, int cmd, int type);
 static pid_t fd_test_lock(int fd, int type);
 
-static void _slow_closeall(int fd)
+static bool _is_fd_skipped(int fd, int *skipped, log_closeall_skip_t log_skip)
+{
+	if (fd == log_skip.log_fd)
+		return true;
+
+	if (fd == log_skip.sched_log_fd)
+		return true;
+
+	if (!skipped)
+		return false;
+
+	for (int i = 0; skipped[i] >= 0; i++)
+		if (fd == skipped[i])
+			return true;
+
+	return false;
+}
+
+static void _slow_closeall(int fd, int *skipped, log_closeall_skip_t log_skip)
 {
 	struct rlimit rlim;
 
@@ -109,15 +129,18 @@ static void _slow_closeall(int fd)
 		rlim.rlim_cur = 4096;
 	}
 
-	while (fd < rlim.rlim_cur)
-		close(fd++);
+	for (; fd < rlim.rlim_cur; fd++)
+		if (!_is_fd_skipped(fd, skipped, log_skip))
+			close(fd);
 }
 
-extern void closeall(int fd)
+extern void closeall_except(int fd, int *skipped)
 {
 	char *name = "/proc/self/fd";
 	DIR *d;
+	int fd_of_d = -1;
 	struct dirent *dir;
+	log_closeall_skip_t log_skip = log_closeall_pre();
 
 	/*
 	 * Blindly closing all file descriptors is slow.
@@ -128,19 +151,37 @@ extern void closeall(int fd)
 	if (!(d = opendir(name))) {
 		debug("Could not read open files from %s: %m, closing all potential file descriptors",
 		      name);
-		_slow_closeall(fd);
+		_slow_closeall(fd, skipped, log_skip);
+		log_closeall_post();
 		return;
 	}
+
+	/*
+	 * Do not close fd_of_d during the loop, or successive readdir() calls
+	 * will fail, and the loop will terminate prematurely leaking fds to
+	 * the child process.
+	 */
+	fd_of_d = dirfd(d);
 
 	while ((dir = readdir(d))) {
 		/* Ignore "." and ".." entries */
 		if (dir->d_type != DT_DIR) {
 			int open_fd = atoi(dir->d_name);
-			if (open_fd >= fd)
+
+			if ((open_fd >= fd) && (open_fd != fd_of_d) &&
+			    !_is_fd_skipped(open_fd, skipped, log_skip))
 				close(open_fd);
 		}
 	}
 	closedir(d);
+	/* dirfd(3) says fd_of_d is closed automatically by closedir() */
+
+	log_closeall_post();
+}
+
+extern void closeall(int fd)
+{
+	return closeall_except(fd, NULL);
 }
 
 extern void fd_close(int *fd)
@@ -193,6 +234,18 @@ void fd_set_blocking(int fd)
 	if (fcntl(fd, F_SETFL, fval & ~O_NONBLOCK) < 0)
 		error("fcntl(F_SETFL) failed: %m");
 	return;
+}
+
+bool fd_is_nonblocking(int fd)
+{
+	int fval = 0;
+
+	xassert(fd >= 0);
+
+	if ((fval = fcntl(fd, F_GETFL, 0)) < 0)
+		error("fcntl(F_GETFL) failed: %m");
+
+	return (fval & O_NONBLOCK);
 }
 
 int fd_get_readw_lock(int fd)
@@ -280,68 +333,34 @@ extern int wait_fd_readable(int fd, int time_limit)
 {
 	struct pollfd ufd;
 	time_t start;
-	int rc, time_left;
 
 	start = time(NULL);
-	time_left = time_limit;
 	ufd.fd = fd;
 	ufd.events = POLLIN;
 	ufd.revents = 0;
 	while (1) {
+		int rc = -1;
+		const double elapsed = difftime(time(NULL), start);
+		const double time_left = time_limit - elapsed;
+
+		if (time_left < 0)
+			goto on_timeout;
+
 		rc = poll(&ufd, 1, time_left * 1000);
 		if (rc > 0) {	/* activity on this fd */
-			if (ufd.revents & POLLIN)
+			if (ufd.revents & (POLLIN | POLLHUP))
 				return 0;
 			else	/* Exception */
 				return -1;
 		} else if (rc == 0) {
+on_timeout:
 			error("Timeout waiting for socket");
 			return -1;
 		} else if (errno != EINTR) {
 			error("poll(): %m");
 			return -1;
-		} else {
-			time_left = time_limit - (time(NULL) - start);
 		}
 	}
-}
-
-/*
- * Check if a file descriptor is writable now.
- *
- * This function assumes that O_NONBLOCK is set already, if it is not this
- * function will block!
- *
- * Return 1 when writeable or 0 on error
- */
-extern bool fd_is_writable(int fd)
-{
-	bool rc = true;
-	char temp[2];
-	struct pollfd ufd;
-
-	/* setup call to poll */
-	ufd.fd = fd;
-	ufd.events = POLLOUT;
-
-	while (true) {
-		if (poll(&ufd, 1, 0) == -1) {
-			if ((errno == EINTR) || (errno == EAGAIN))
-				continue;
-			debug2("%s: poll error: %m", __func__);
-			rc = false;
-			break;
-		}
-		if ((ufd.revents & POLLHUP) ||
-		    (recv(fd, &temp, 1, MSG_PEEK) == 0)) {
-			debug2("%s: socket is not writable", __func__);
-			rc = false;
-			break;
-		}
-		break;
-	}
-
-	return rc;
 }
 
 /*
@@ -409,7 +428,7 @@ extern char *fd_resolve_path(int fd)
 	if (bytes < 0)
 		debug("%s: readlink(%s) failed: %m", __func__,  path);
 	else if (bytes >= PATH_MAX)
-		debug("%s: rejecting readlink(%s) for possble truncation",
+		debug("%s: rejecting readlink(%s) for possible truncation",
 		      __func__, path);
 	else
 		resolved = xstrdup(ret);
@@ -474,7 +493,7 @@ extern char *poll_revents_to_str(const short revents)
 }
 
 /* pass an open file descriptor back to the requesting process */
-extern void send_fd_over_pipe(int socket, int fd)
+extern void send_fd_over_socket(int socket, int fd)
 {
 	struct msghdr msg = { 0 };
 	struct cmsghdr *cmsg;
@@ -503,8 +522,36 @@ extern void send_fd_over_pipe(int socket, int fd)
 		error("%s: failed to send fd: %m", __func__);
 }
 
+extern void send_fd_over_socket_payload(int socket, int fd, char *payload)
+{
+	struct msghdr msg = { 0 };
+	struct cmsghdr *cmsg;
+	char buf[CMSG_SPACE(sizeof(fd))];
+	struct iovec iov[1];
+
+	memset(buf, '\0', sizeof(buf));
+
+	iov[0].iov_base = payload;
+	iov[0].iov_len = strlen(payload);
+	msg.msg_iov = iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = buf;
+	msg.msg_controllen = sizeof(buf);
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(fd));
+
+	memmove(CMSG_DATA(cmsg), &fd, sizeof(fd));
+	msg.msg_controllen = cmsg->cmsg_len;
+
+	if (sendmsg(socket, &msg, 0) < 0)
+		error("%s: failed to send fd and payload: %m", __func__);
+}
+
 /* receive an open file descriptor over unix socket */
-extern int receive_fd_over_pipe(int socket)
+extern int receive_fd_over_socket(int socket)
 {
 	struct msghdr msg = {0};
 	struct cmsghdr *cmsg;
@@ -723,10 +770,67 @@ extern int fd_get_readable_bytes(int fd, int *readable_ptr,
 #endif /* !FIONREAD */
 }
 
+extern int fd_get_buffered_output_bytes(int fd, int *bytes_ptr,
+					const char *con_name)
+{
+#ifdef TIOCOUTQ
+	/* default pending to max positive 32 bit signed integer */
+	int pending = INT32_MAX;
+
+	xassert(bytes_ptr);
+
+	if (fd < 0) {
+		log_net(fd, con_name,
+			"Refusing request for ioctl(%d, TIOCOUTQ) with invalid file descriptor: %d",
+			fd, fd);
+		return EINVAL;
+	}
+
+	/*
+	 * Request kernel tell us the number of bytes remain in the outgoing
+	 * buffer.
+	 */
+	if (ioctl(fd, TIOCOUTQ, &pending)) {
+		int rc = errno;
+		log_net(fd, con_name,
+			"ioctl(%d, TIOCOUTQ, 0x%"PRIxPTR") failed: %s",
+			fd, (uintptr_t) &pending, slurm_strerror(rc));
+		return rc;
+	}
+
+	/* validate response from kernel is sane (or likely sane) */
+	if (pending < 0) {
+		/* invalid TIOCOUTQ response -> bad driver response */
+		log_net(fd, con_name,
+			"Invalid response: ioctl(%d, TIOCOUTQ, 0x%"PRIxPTR")=%d",
+			 fd, (uintptr_t) &pending, pending);
+		return ENOSYS;
+	}
+	/* verify if pending was even set */
+	if (pending == INT32_MAX) {
+		/* ioctl() did not error but did not change pending?? */
+		log_net(fd, con_name,
+			"Invalid unchanged pending value: ioctl(%d, TIOCOUTQ, 0x%"PRIxPTR")=%d",
+			fd, (uintptr_t) &pending, pending);
+		return ENOSYS;
+	}
+
+	*bytes_ptr = pending;
+
+	log_net(fd, con_name,
+		"Successful query: ioctl(%d, TIOCOUTQ, 0x%"PRIxPTR")=%d",
+		fd, (uintptr_t) bytes_ptr, pending);
+
+	return SLURM_SUCCESS;
+#else /* TIOCOUTQ */
+	return ESLURM_NOT_SUPPORTED;
+#endif /* !TIOCOUTQ */
+}
+
 extern int fd_get_maxmss(int fd, const char *con_name)
 {
 	int mss = NO_VAL;
-	socklen_t tmp_socklen = { 0 };
+	socklen_t tmp_socklen = sizeof(mss);
 
 	if (getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, &tmp_socklen))
 		log_net(fd, con_name,

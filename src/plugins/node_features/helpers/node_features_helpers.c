@@ -66,14 +66,15 @@ extern slurmd_conf_t *conf __attribute__((weak_import));
 slurmd_conf_t *conf = NULL;
 #endif
 
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "node_features helpers plugin";
 const char plugin_type[] = "node_features/helpers";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
 static uid_t *allowed_uid = NULL;
 static int allowed_uid_cnt = 0;
-static List helper_features = NULL;
-static List helper_exclusives = NULL;
+static list_t *helper_features = NULL;
+static list_t *helper_exclusives = NULL;
 static uint32_t boot_time = (5 * 60);
 static uint32_t exec_time = 10;
 
@@ -147,7 +148,8 @@ static void _make_uid_array(char *uid_str)
 	tmp_str = xstrdup(uid_str);
 	tok = strtok_r(tmp_str, ",", &save_ptr);
 	while (tok) {
-		if (uid_from_string(tok, &allowed_uid[allowed_uid_cnt++]) < 0)
+		if (uid_from_string(tok, &allowed_uid[allowed_uid_cnt++]) !=
+		    SLURM_SUCCESS)
 			fatal("helpers.conf: Invalid AllowUserBoot: %s", tok);
 		tok = strtok_r(NULL, ",", &save_ptr);
 	}
@@ -214,12 +216,12 @@ static int _feature_set_state(const plugin_feature_t *feature)
 	return rc;
 }
 
-static List _feature_get_state(const plugin_feature_t *feature)
+static list_t *_feature_get_state(const plugin_feature_t *feature)
 {
 	char *tmp, *saveptr;
 	char *output = NULL;
 	int rc = 0;
-	List result = list_create(xfree_ptr);
+	list_t *result = list_create(xfree_ptr);
 	run_command_args_t run_command_args = {
 		.max_wait = (exec_time * 1000),
 		.script_path = feature->helper,
@@ -285,7 +287,7 @@ static int _feature_register(const char *name, const char *helper,
 
 static int _exclusive_register(const char *listp)
 {
-	List data_list = list_create(xfree_ptr);
+	list_t *data_list = list_create(xfree_ptr);
 	char *input = xstrdup(listp);
 	char *entry, *saveptr;
 
@@ -415,7 +417,7 @@ static int _handle_config_features(plugin_feature_t **features, int count)
 		     tok = strtok_r(NULL, ",", &saveptr)) {
 
 			if (!_is_feature_valid(tok)) {
-				slurm_seterrno(ESLURM_INVALID_FEATURE);
+				errno = ESLURM_INVALID_FEATURE;
 				xfree(tmp_name);
 				return SLURM_ERROR;
 			}
@@ -615,14 +617,12 @@ extern int init(void)
 	return _read_config_file();
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	FREE_NULL_LIST(helper_features);
 	FREE_NULL_LIST(helper_exclusives);
 	xfree(allowed_uid);
 	allowed_uid_cnt = 0;
-
-	return SLURM_SUCCESS;
 }
 
 extern bool node_features_p_changeable_feature(char *input)
@@ -672,7 +672,7 @@ static int _get_list_excl_count(void *x, void *y)
 
 static int _count_exclusivity(void *x, void *y)
 {
-	List exclusive_list = (List) x;
+	list_t *exclusive_list = x;
 
 	excl_count_t args = {
 		.job_features = (char *)y,
@@ -701,7 +701,7 @@ static int _foreach_feature(void *x, void *y)
 
 static int _has_exclusive_features(void *x, void *arg)
 {
-	List feature_list = x;
+	list_t *feature_list = x;
 	char *str = NULL;
 	int rc = 0;
 
@@ -718,7 +718,7 @@ static int _has_exclusive_features(void *x, void *arg)
 
 extern int node_features_p_job_valid(char *job_features, list_t *feature_list)
 {
-	List feature_sets;
+	list_t *feature_sets;
 	int rc;
 
 	if (!job_features)
@@ -793,7 +793,7 @@ fini:
 static int _foreach_filter_modes(void *x, void *y)
 {
 	char *feature = (char *)x;
-	List filtered = (List)y;
+	list_t *filtered = y;
 
 	/* Verify this mode is legitimate to filter out garbage */
 	if (list_find_first(helper_features, _cmp_features, feature))
@@ -805,7 +805,7 @@ static int _foreach_filter_modes(void *x, void *y)
 static int _foreach_check_duplicates(void *x, void *y)
 {
 	char *feature = (char *)x;
-	List filtered = (List)y;
+	list_t *filtered = y;
 
 	if (!list_find_first(filtered, _cmp_str, feature))
 		list_append(filtered, xstrdup(feature));
@@ -815,16 +815,16 @@ static int _foreach_check_duplicates(void *x, void *y)
 
 typedef struct {
 	char **avail_modes;
-	List all_current;
+	list_t *all_current;
 } _foreach_modes_t;
 
 static int _foreach_helper_get_modes(void *x, void *y)
 {
 	char **avail_modes = ((_foreach_modes_t *)y)->avail_modes;
-	List all_current = ((_foreach_modes_t *)y)->all_current;
+	list_t *all_current = ((_foreach_modes_t *)y)->all_current;
 	plugin_feature_t *feature = (plugin_feature_t *)x;
 
-	List current = _feature_get_state(feature);
+	list_t *current = _feature_get_state(feature);
 
 	xstrfmtcat(*avail_modes, "%s%s", (*avail_modes ? "," : ""), feature->name);
 
@@ -843,8 +843,8 @@ static int _foreach_helper_get_modes(void *x, void *y)
 
 extern void node_features_p_node_state(char **avail_modes, char **current_mode)
 {
-	List all_current = NULL;
-	List filtered_modes = NULL;
+	list_t *all_current = NULL;
+	list_t *filtered_modes = NULL;
 	_foreach_modes_t args;
 
 	if (!avail_modes || !current_mode)
@@ -880,7 +880,7 @@ extern void node_features_p_node_state(char **avail_modes, char **current_mode)
 extern char *node_features_p_node_xlate(char *new_features, char *orig_features,
 					char *avail_features, int node_inx)
 {
-	List features = NULL;
+	list_t *features = NULL;
 	char *feature = NULL;
 	char *input = NULL;
 	char *merged = NULL;
@@ -944,12 +944,6 @@ extern char *node_features_p_job_xlate(char *job_features,
 	return _xlate_job_features(job_features, feature_list, job_node_bitmap);
 }
 
-/* Return true if the plugin requires PowerSave mode for booting nodes */
-extern bool node_features_p_node_power(void)
-{
-	return false;
-}
-
 static char *_make_helper_str(const plugin_feature_t *feature)
 {
 	char *str = NULL;
@@ -960,7 +954,7 @@ static char *_make_helper_str(const plugin_feature_t *feature)
 	return str;
 }
 
-static char *_make_exclusive_str(List exclusive)
+static char *_make_exclusive_str(list_t *exclusive)
 {
 	char *str = NULL;
 
@@ -992,7 +986,7 @@ static char *_make_uid_str(uid_t *uid_array, int uid_cnt)
 static int _make_features_config(void *x, void *y)
 {
 	plugin_feature_t *feature = (plugin_feature_t *)x;
-	List data = (List)y;
+	list_t *data = y;
 
 	add_key_pair_own(data, "Feature", _make_helper_str(feature));
 
@@ -1001,8 +995,8 @@ static int _make_features_config(void *x, void *y)
 
 static int _make_exclusive_config(void *x, void *y)
 {
-	List exclusive = (List) x;
-	List data = (List) y;
+	list_t *exclusive = x;
+	list_t *data = y;
 
 	add_key_pair_own(data, "MutuallyExclusive",
 			 _make_exclusive_str(exclusive));
@@ -1013,7 +1007,7 @@ static int _make_exclusive_config(void *x, void *y)
 /* Get node features plugin configuration */
 extern void node_features_p_get_config(config_plugin_params_t *p)
 {
-	List data;
+	list_t *data;
 
 	xassert(p);
 	xstrcat(p->name, plugin_type);
@@ -1062,33 +1056,8 @@ extern bool node_features_p_user_update(uid_t uid)
 	return false;
 }
 
-extern void node_features_p_step_config(bool mem_sort, bitstr_t *numa_bitmap)
-{
-	return;
-}
-
 extern int node_features_p_overlap(bitstr_t *active_bitmap)
 {
 	/* Executed on slurmctld and not used by this plugin */
 	return bit_set_count(active_bitmap);
-}
-
-extern int node_features_p_get_node(char *node_list)
-{
-	/* Executed on slurmctld and not used by this plugin */
-	return SLURM_SUCCESS;
-}
-
-extern int node_features_p_node_update(char *active_features,
-				       bitstr_t *node_bitmap)
-{
-	/* Executed on slurmctld and not used by this plugin */
-	return SLURM_SUCCESS;
-}
-
-extern bool node_features_p_node_update_valid(void *node_ptr,
-					      update_node_msg_t *update_node_msg)
-{
-	/* Executed on slurmctld and not used by this plugin */
-	return true;
 }

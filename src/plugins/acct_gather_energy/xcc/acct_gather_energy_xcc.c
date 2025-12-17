@@ -1,8 +1,7 @@
 /*****************************************************************************\
  *  acct_gather_energy_xcc.c - slurm energy accounting plugin for xcc.
  *****************************************************************************
- *  Copyright (C) 2018
- *  Written by SchedMD - Felip Moll
+ *  Copyright (C) SchedMD LLC.
  *  Based on IPMI plugin by Thomas Cadeau/Yoann Blein @ Bull
  *
  *  This file is part of Slurm, a resource management program.
@@ -46,11 +45,14 @@
 #include <math.h>
 
 #include "src/common/slurm_xlator.h"
-#include "src/interfaces/acct_gather_energy.h"
-#include "src/common/slurm_protocol_defs.h"
+
 #include "src/common/fd.h"
+#include "src/common/slurm_protocol_defs.h"
+#include "src/common/threadpool.h"
+#include "src/common/xrandom.h"
 #include "src/common/xstring.h"
 
+#include "src/interfaces/acct_gather_energy.h"
 #include "src/interfaces/proctrack.h"
 
 #include "src/slurmd/slurmd/slurmd.h"
@@ -88,32 +90,7 @@ slurmd_conf_t *conf = NULL;
 #define XCC_SD650_RESPONSE_LEN 16
 #define XCC_SD650V2_RESPONSE_LEN 40
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobacct" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobacct/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "AcctGatherEnergy XCC plugin";
 const char plugin_type[] = "acct_gather_energy/xcc";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -474,17 +451,11 @@ static xcc_raw_single_data_t *_read_ipmi_values(ipmi_ctx_t *ipmi_ctx_p)
 	xcc_reading = xmalloc(sizeof(xcc_raw_single_data_t));
 	if (slurm_ipmi_conf.flags & XCC_FLAG_FAKE) {
 		static uint32_t fake_past_read = 10774496;
-		static bool fake_inited = false;
-
-		if (!fake_inited) {
-			srand((unsigned) time(NULL));
-			fake_inited = true;
-		}
 
 		xcc_reading->version = XCC_SD650_VERSION;
 		xcc_reading->fifo_inx = 0;
 		// Fake metric j
-		xcc_reading->j = fake_past_read + 550 + rand() % 200;
+		xcc_reading->j = fake_past_read + 550 + xrandom() % 200;
 		fake_past_read = xcc_reading->j;
 		xcc_reading->mj = 0;
 		xcc_reading->w = 0;
@@ -797,7 +768,7 @@ static void *_thread_ipmi_run(void *no_data)
 
 static void *_thread_launcher(void *no_data)
 {
-	//what arg would countain? frequency, socket?
+	//what arg would contain? frequency, socket?
 	struct timeval tvnow;
 	struct timespec abs;
 
@@ -820,13 +791,16 @@ static void *_thread_launcher(void *no_data)
 
 		/*
 		 * It is a known thing we can hang up on IPMI calls cancel if
-		 * we must.
+		 * we must. This might not be safe if we're stuck in the driver
+		 * and have some glibc lock locked. We will cancel the thread
+		 * but maybe we will end up deadlocked. This is a best effort.
 		 */
 		pthread_cancel(thread_ipmi_id_run);
 
 		/*
 		 * Unlock just to make sure since we could have canceled the
-		 * thread while in the lock.
+		 * thread while in the lock. This demonstrates how dangerous
+		 * it is to cancel a thread at random points in the code.
 		 */
 		slurm_mutex_unlock(&ipmi_mutex);
 	}
@@ -904,19 +878,15 @@ end_it:
 	return SLURM_SUCCESS;
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	if (!running_in_slurmd_stepd())
-		return SLURM_SUCCESS;
+		return;
 
 	flag_energy_accounting_shutdown = true;
 
@@ -933,8 +903,6 @@ extern int fini(void)
 	slurm_mutex_unlock(&ipmi_mutex);
 
 	slurm_thread_join(thread_ipmi_id_run);
-
-	return SLURM_SUCCESS;
 }
 
 extern int acct_gather_energy_p_update_node_energy(void)
@@ -1129,7 +1097,7 @@ extern void acct_gather_energy_p_conf_set(int context_id_in, s_p_hashtbl_t *tbl)
 	verbose("%s loaded", plugin_name);
 }
 
-extern void acct_gather_energy_p_conf_values(List *data)
+extern void acct_gather_energy_p_conf_values(list_t **data)
 {
 	xassert(*data);
 

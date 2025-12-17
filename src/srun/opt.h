@@ -58,11 +58,12 @@
 
 extern enum modes mode;
 
+extern int colon_cnt; /* count of ":" het component separators */
 extern int	error_exit;	/* exit code for slurm errors */
 extern int	immediate_exit;	/* exit code for --imediate option & busy */
 extern slurm_opt_t opt;
 extern srun_opt_t sropt;
-extern List	opt_list;
+extern list_t *opt_list;
 extern int	sig_array[];
 extern time_t	srun_begin_time; /* begin time of srun process */
 extern bool	srun_max_timer;

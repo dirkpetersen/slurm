@@ -2,6 +2,32 @@
 
 <h1>Control Group in Slurm</h1>
 
+<h2 id="contents">Contents
+<a class="slurm_link" href="#contents"></a>
+</h2>
+
+<ul>
+<li><a href="#overview">Control Group Overview</a></li>
+<li><a href="#cgroup_design">Slurm cgroup plugins design</a></li>
+<li><a href="#use">Use of cgroup in Slurm</a></li>
+<li><a href="#configuration">Slurm Cgroup Configuration Overview</a></li>
+<li><a href="#Plugins">Currently Available Cgroup Plugins</a>
+    <ul>
+        <li><a href="#proctrack">proctrack/cgroup plugin</a></li>
+        <li><a href="#task">task/cgroup plugin</a></li>
+        <li><a href="#jobacct_gather">jobacct_gather/cgroup plugin</a></li>
+    </ul>
+</li>
+<li><a href="#Specialization">Use of cgroup for Resource Specialization</a></li>
+<li><a href="#cgroupplugins">Slurm cgroup plugins</a>
+    <ul>
+        <li><a href="#differences">Main differences between cgroup/v1 and cgroup/v2</a></li>
+        <li><a href="#interfaces">Main differences between controller interfaces</a></li>
+        <li><a href="#generalities">Other generalities</a></li>
+    </ul>
+</li>
+</ul>
+
 <h2 id="overview">Control Group Overview
 <a class="slurm_link" href="#overview"></a>
 </h2>
@@ -27,6 +53,13 @@ groups, the plural form "cgroups" is used.</p>
 (cgroup v2). Hybrid mode where controllers from both version 1 and version 2 are
 mixed in a system is not supported.</p>
 
+<p><b>NOTE</b>: The cgroup/v1 plugin is deprecated and will not be supported in
+future Slurm versions. Newer GNU/Linux distributions are dropping, or have
+dropped, support for cgroup v1 and may even not provide kernel support for the
+required cgroup v1 interfaces. Systemd also deprecated cgroup v1. Starting with
+Slurm version 25.05, no new features will be added to cgroup v1. Support for
+critical bugs will be provided until its final removal.</p>
+
 <p>See the kernel.org documentation for a more comprehensive description of
 cgroup:</p>
 
@@ -39,13 +72,12 @@ Kernel's Cgroup v2 documentation </a>
 </li>
 </ul>
 
-<h1 id="cgroup_design">Slurm cgroup plugins design
+<h2 id="cgroup_design">Slurm cgroup plugins design
 <a class="slurm_link" href="#cgroup_design"></a>
-</h1>
+</h2>
 
 For extended information on Slurm's internal Cgroup plugin read:
 <ul>
-<li>cgroup/v1 plugin documentation (not available yet)</li>
 <li><a href="cgroup_v2.html">cgroup/v2 plugin documentation</a> </li>
 </ul>
 
@@ -191,10 +223,13 @@ details.</p>
 specific amount of memory on each compute node for exclusive use by the Slurm
 compute node daemon, slurmd.</p>
 
-<p>Slurmstepd is not constrained by this resource specialization, since it is
-considered part of the job and its consumption is completely dependent on the
-typology of the job. For example an MPI job can initialize many ranks with PMI
-and make slurmstepd consume more memory.</p>
+<p>If cgroup/v1 is used the reserved resources will also be used by the
+slurmstepd processes. If cgroup/v2 is used, slurmstepd is not constrained by
+this resource specialization. Instead the slurmstepd is constrained to the
+resources allocated to the job, since it is considered part of the job and its
+consumption is completely dependent on the topology of the job. For example an
+MPI job can initialize many ranks with PMI and make slurmstepd consume more
+memory.</p>
 
 <p>System-level resource specialization is enabled with special node
 configuration parameters. Read <a href="slurm.conf.html">slurm.conf</a> and core
@@ -206,14 +241,14 @@ information.</p>
 </h2>
 
 <p>
-Since 22.05, Slurm supports cgroup/v1 and cgroup/v2. Both plugins have very
-different ways of organizing their hierarchies and respond to different design
-constraints. The design is the responsibility of the kernel maintainers.
+Both cgroup v1 and v2 plugins have very different ways of organizing their
+hierarchies and respond to different design constraints. The design is the
+responsibility of the kernel maintainers.
 </p>
 
-<h2 id="differences">Main differences between cgroup/v1 and cgroup/v2
+<h3 id="differences">Main differences between cgroup/v1 and cgroup/v2
 <a class="slurm_link" href="#differences"></a>
-</h2>
+</h3>
 
 <p>The three main differences between v1 and v2 are:</p>
 
@@ -307,8 +342,12 @@ separate controller which needs to be mounted.
 program must be inserted in the kernel.
 </li>
 
-<li>In <i>cgroup/v2</i>, memory.stat file has changed and now we do the sum of
-anon+swapcached+anon_thp to match the RSS concept in v1.
+<li>In <i>cgroup/v2</i>, memory.current is used to report RSS and
+memory.peak for MaxRSS. File cache (active_file and inactive_file fields
+from memory.stat) are counted unless <i>JobAcctGatherParam=no_file_cache</i> is
+set. If this option is enabled, MaxRSS is taken only from the periodic polling
+rather than <i>memory.peak</i>, so short memory spikes can be missed between
+<i>JobAcctGatherFrequency</i> intervals.
 </li>
 
 <li>In <i>cgroup/v2</i>, cpu.stat provides metrics in milis while puacct.stat
@@ -317,7 +356,9 @@ in <i>cgroup/v1</i> provides metrics in USER_HZ.
 
 </ul>
 
-<h4>Main differences between controller interfaces</h4>
+<h3 id="interfaces">Main differences between controller interfaces
+<a class="slurm_link" href="#interfaces"></a>
+</h3>
 <table style="page-break-inside: avoid; font-family: Arial,Helvetica,sans-serif;" border="1" bordercolor="#000000" cellpadding="3" cellspacing="0" width="100%">
 <tr bgcolor="#e0e0e0">
 <td><u><b>cgroup/v1</b></u></td>
@@ -362,9 +403,9 @@ in <i>cgroup/v1</i> provides metrics in USER_HZ.
 </table>
 
 
-<h2 id="generalities">Other generalities
+<h3 id="generalities">Other generalities
 <a class="slurm_link" href="#generalities"></a>
-</h2>
+</h3>
 
 <ul>
 <li>When using cgroup/v1, some configurations can exclude the swap cgroup
@@ -392,7 +433,5 @@ controllers are under separate directories when using
 <i>cgroup/v1</i> legacy mode.
 </li>
 </ul>
-
-<p style="text-align:center;">Last modified 16 June 2022</p>
 
 <!--#include virtual="footer.txt"-->

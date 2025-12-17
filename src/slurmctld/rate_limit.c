@@ -36,9 +36,13 @@
 #include <stdbool.h>
 
 #include "src/common/macros.h"
+#include "src/common/parse_value.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/xstring.h"
 
+#include "src/interfaces/conn.h"
+
+#include "src/slurmctld/proc_req.h"
 #include "src/slurmctld/slurmctld.h"
 
 /*
@@ -51,53 +55,96 @@ typedef struct {
 	uid_t uid;
 } user_bucket_t;
 
-static int table_size = 8192;
+static uint32_t table_size = 8192;
 static user_bucket_t *user_buckets = NULL;
 
 static bool rate_limit_enabled = false;
 static pthread_mutex_t rate_limit_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* 30 tokens max, bucket refills 2 tokens per 1 second */
-static int bucket_size = 30;
+static uint32_t bucket_size = 30;
 static int log_freq = 0;
-static int refill_rate = 2;
-static int refill_period = 1;
+static uint32_t refill_rate = 2;
+static uint32_t refill_period = 1;
+
+static uint32_t _set_positive_rl_param(char *key, char *value_str)
+{
+	uint32_t value = 0;
+	int len = strlen(key);
+
+	/* take off '=' char */
+	key[len - 1] = '\0';
+
+	if (s_p_handle_uint32(&value, key, value_str) || !value) {
+		fatal("%s=%s is invalid, must be a positive non-zero integer",
+		      key, value_str);
+	}
+	return value;
+}
 
 extern void rate_limit_init(void)
 {
+	char rl_table_size_str[] = "rl_table_size=";
+	char rl_bucket_size_str[] = "rl_bucket_size=";
+	char rl_log_freq_str[] = "rl_log_freq=";
+	char rl_refill_rate_str[] = "rl_refill_rate=";
+	char rl_refill_period_str[] = "rl_refill_period=";
 	char *tmp_ptr;
 
 	if (!xstrcasestr(slurm_conf.slurmctld_params, "rl_enable"))
 		return;
 
-	if ((tmp_ptr = xstrcasestr(slurm_conf.slurmctld_params,
-				   "rl_table_size=")))
-		table_size = atoi(tmp_ptr + 14);
-	if ((tmp_ptr = xstrcasestr(slurm_conf.slurmctld_params,
-				   "rl_bucket_size=")))
-		bucket_size = atoi(tmp_ptr + 15);
-	if ((tmp_ptr = xstrcasestr(slurm_conf.slurmctld_params,
-				   "rl_log_freq=")))
-		log_freq = atoi(tmp_ptr + 12);
-	if ((tmp_ptr = xstrcasestr(slurm_conf.slurmctld_params,
-				   "rl_refill_rate=")))
-		refill_rate = atoi(tmp_ptr + 15);
-	if ((tmp_ptr = xstrcasestr(slurm_conf.slurmctld_params,
-				   "rl_refill_period=")))
-		refill_period = atoi(tmp_ptr + 17);
+	if ((tmp_ptr = conf_get_opt_str(slurm_conf.slurmctld_params,
+					rl_table_size_str))) {
+		table_size = _set_positive_rl_param(rl_table_size_str, tmp_ptr);
+		xfree(tmp_ptr);
+	}
 
+	if ((tmp_ptr = conf_get_opt_str(slurm_conf.slurmctld_params,
+					rl_bucket_size_str))) {
+		bucket_size =
+			_set_positive_rl_param(rl_bucket_size_str, tmp_ptr);
+		xfree(tmp_ptr);
+	}
+
+	if ((tmp_ptr = conf_get_opt_str(slurm_conf.slurmctld_params,
+					rl_log_freq_str))) {
+		log_freq = atoi(tmp_ptr);
+		if (log_freq < -1) {
+			fatal("%s%s is invalid, must be -1, 0, or a positive integer",
+			      rl_log_freq_str, tmp_ptr);
+		}
+		xfree(tmp_ptr);
+	}
+
+	if ((tmp_ptr = conf_get_opt_str(slurm_conf.slurmctld_params,
+					rl_refill_rate_str))) {
+		refill_rate =
+			_set_positive_rl_param(rl_refill_rate_str, tmp_ptr);
+		xfree(tmp_ptr);
+	}
+
+	if ((tmp_ptr = conf_get_opt_str(slurm_conf.slurmctld_params,
+					rl_refill_period_str))) {
+		refill_period =
+			_set_positive_rl_param(rl_refill_period_str, tmp_ptr);
+		xfree(tmp_ptr);
+	}
 
 	rate_limit_enabled = true;
 	user_buckets = xcalloc(table_size, sizeof(user_bucket_t));
 
 	info("RPC rate limiting enabled");
-	info("%s: rl_table_size=%d,rl_bucket_size=%d,rl_refill_rate=%d,rl_refill_period=%d",
+	info("%s: rl_table_size=%u,rl_bucket_size=%u,rl_refill_rate=%u,rl_refill_period=%u",
 	     __func__, table_size, bucket_size, refill_rate, refill_period);
 }
 
 extern void rate_limit_shutdown(void)
 {
+	slurm_mutex_lock(&rate_limit_mutex);
+	rate_limit_enabled = false;
 	xfree(user_buckets);
+	slurm_mutex_unlock(&rate_limit_mutex);
 }
 
 /*
@@ -106,11 +153,15 @@ extern void rate_limit_shutdown(void)
  */
 extern bool rate_limit_exceeded(slurm_msg_t *msg)
 {
+	slurmctld_rpc_t *this_rpc = NULL;
 	bool exceeded = false;
 	int start_position = 0, position = 0;
 	time_t now;
 
 	if (!rate_limit_enabled)
+		return false;
+
+	if ((this_rpc = find_rpc(msg->msg_type)) && this_rpc->rl_exempt)
 		return false;
 
 	/*
@@ -122,6 +173,11 @@ extern bool rate_limit_exceeded(slurm_msg_t *msg)
 		return false;
 
 	slurm_mutex_lock(&rate_limit_mutex);
+	/* This can happen if we already executed rate_limit_shutdown */
+	if (!user_buckets) {
+		slurm_mutex_unlock(&rate_limit_mutex);
+		return true;
+	}
 	now = time(NULL);
 
 	/*
@@ -180,11 +236,15 @@ extern bool rate_limit_exceeded(slurm_msg_t *msg)
 
 	if (exceeded && (log_freq != -1) &&
 	    ((user_buckets[position].last_logged + log_freq) <= now)) {
-		slurm_addr_t cli_addr;
-		(void) slurm_get_peer_addr(msg->conn_fd, &cli_addr);
+		slurm_addr_t *cli_addr = &msg->address;
+
+		if (cli_addr->ss_family == AF_UNSPEC) {
+			int fd = conn_g_get_fd(msg->conn);
+			(void) slurm_get_peer_addr(fd, cli_addr);
+		}
 
 		info("RPC rate limit exceeded by uid %u with %s from %pA, telling to back off",
-		      msg->auth_uid, rpc_num2string(msg->msg_type), &cli_addr);
+		     msg->auth_uid, rpc_num2string(msg->msg_type), cli_addr);
 		user_buckets[position].last_logged = now;
 	}
 

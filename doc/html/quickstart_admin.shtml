@@ -11,13 +11,13 @@
 <ul>
 <li><a href="#prereqs">Installing Prerequisites</a></li>
 <li><a href="#rpmbuild">Building RPMs</a></li>
-<li><a href="#rpms">Installing RPMs</a></li>
 <li><a href="#debuild">Building Debian Packages</a></li>
-<li><a href="#debinstall">Installing Debian Packages</a></li>
+<li><a href="#pkg_install">Installing Packages</a></li>
 <li><a href="#manual_build">Building Manually</a></li>
 </ul>
 </li>
-<li><a href="#daemons">Daemons</a></li>
+<li><a href="#nodes">Node Types</a></li>
+<li><a href="#HA">High Availability</a></li>
 <li><a href="#infrastructure">Infrastructure</a></li>
 <li><a href="#Config">Configuration</a></li>
 <li><a href="#security">Security</a></li>
@@ -47,7 +47,8 @@ across the cluster.</li>
 authentication. Make sure that all nodes in your cluster have the
 same <i>munge.key</i>. Make sure the MUNGE daemon, <i>munged</i>,
 is started before you start the Slurm daemons.</li>
-<li><a href="download.html">Download</a> the latest version of Slurm</li>
+<li><a href="https://www.schedmd.com/download-slurm/">Download</a> the latest
+version of Slurm.</li>
 <li>Install Slurm using one of the following methods:
 <ul>
 <li>Build <a href="#rpmbuild">RPM</a> or <a href="#debuild">DEB</a> packages
@@ -96,70 +97,134 @@ the cluster.</li>
 </h3>
 
 <p>Before building Slurm, consider which plugins you will need for your
-installation.  Which plugins are built can vary based on the libraries that
-are available when running configure.  Refer to the below list of possible
-plugins and what is required to build them.</p>
+installation. Which plugins are built can vary based on the libraries that
+are available when running the configure script. Refer to the below list of
+possible plugins and what is required to build them.</p>
 
-<ul>
-<li> <b>auth/Slurm</b> The auth/slurm plugin will be built if the jwt
-		development library is installed. This is an alternative to the
-		traditional MUNGE authentication mechanism.</li>
-<li> <b>AMD GPU Support</b> Autodetection of AMD GPUs will be available
-		if the <i>ROCm</i> development library is installed.
-		</li>
-<li> <b>cgroup Task Constraining</b> The <i>task/cgroup</i> plugin will be built
-		if the <i>hwloc</i> development library is present. cgroup/v2
-		support also requires the <i>bpf</i> and <i>dbus</i> development
-		libraries.</li>
-<li> <b>HDF5 Job Profiling</b> The <i>acct_gather_profile/hdf5</i> job profiling
-		plugin will be built if the <i>hdf5</i> development library is
-		present.</li>
-<li> <b>HTML Man Pages</b> HTML versions of the man pages will be generated if
-		the <i>man2html</i> command is present.</li>
-<li> <b>InfiniBand Accounting</b> The <i>acct_gather_interconnect/ofed</i>
-		InfiniBand accounting plugin will be built if the
-		<i>libibmad</i> and <i>libibumad</i> development libraries are
-		present.</li>
-<li> <b>Intel GPU Support</b> Autodetection of Intel GPUs will be available
-		if the <i>libvpl</i> development library is installed.
-		</li>
-<li> <b>IPMI Energy Consumption</b> The <i>acct_gather_energy/ipmi</i>
-		accounting plugin will be built if the <i>freeipmi</i>
-		development library is present. When building the RPM,
-		<code>rpmbuild ... --with freeipmi</code> can be
-		specified to explicitly check for these dependencies.</li>
-<li> <b>Lua Support</b> The lua API will be available in various plugins if the
-		<i>lua</i> development library is present.</li>
-<li> <b>MUNGE</b> The auth/munge plugin will be built if the MUNGE
-		authentication development library is installed. MUNGE is used
-		as the default authentication mechanism.</li>
-<li> <b>MySQL</b> MySQL support for accounting will be built if the
-		<i>MySQL</i> or <i>MariaDB</i> development library is present.
-		A currently supported version of MySQL or MariaDB should be
-		used.</li>
-<li> <b>NUMA Affinity</b> NUMA support in the task/affinity plugin will be
-		available if the <i>numa</i> development library is installed.
-		</li>
-<li> <b>NVIDIA GPU Support</b> Autodetection of NVIDIA GPUs will be available
-		if the <i>libnvidia-ml</i> development library is installed.
-		</li>
-<li> <b>PAM Support</b> PAM support will be added if the <i>PAM</i> development
-		library is installed.</li>
-<li> <b>PMIx</b> PMIx support will be added if the <i>pmix</i> development
-		library is installed.</li>
-<li> <b>Readline Support</b> Readline support in scontrol and sacctmgr's
-		interactive modes will be available if the <i>readline</i>
-		development library is present.</li>
-<li> <b>REST API</b> Support for Slurm's REST API will be built if the
-		<i>http-parser</i> and <i>json-c</i> development libraries
-		are installed. Additional functionality will be included
-		if the optional <i>yaml</i> and <i>jwt</i> development
-		libraries are installed.</li>
-<li> <b>sview</b> The sview command will be built only if <i>gtk+-2.0</i>
-		is installed.</li>
-</ul>
-<p>Please see the <a href="download.html">Download</a> page for references to
-required software to build these plugins.</p>
+<p>Note that in most cases, the required package is the corresponding
+development library, whose exact names may vary across different distributions.
+The typical naming convention on RHEL-based distros is <b>NAME-devel</b>, while
+the convention on Debian-based distros is <b>libNAME-dev</b>.</p>
+
+<table class="tlist">
+<tbody>
+<tr>
+<td><strong>Component</strong></td>
+<td><strong>Development library required</strong></td>
+</tr>
+<tr>
+<td><code>acct_gather_energy/ipmi</code>
+<br>Gathers <a href="slurm.conf.html#OPT_AcctGatherEnergyType">energy consumption</a>
+	through IPMI</td>
+<td><i>freeipmi</i></td>
+</tr>
+<tr>
+<td><code>acct_gather_interconnect/ofed</code>
+<br>Gathers <a href="slurm.conf.html#OPT_AcctGatherInterconnectType">traffic data</a>
+	for InfiniBand networks</td>
+<td><i>libibmad</i>
+<br><i>libibumad</i></td>
+</tr>
+<tr>
+<td><code>acct_gather_profile/hdf5</code>
+<br>Gathers <a href="slurm.conf.html#OPT_AcctGatherProfileType">detailed job
+	profiling</a> through HDF5</td>
+<td><i>hdf5</i></td>
+</tr>
+<tr>
+<td><code>accounting_storage/mysql</code>
+<br>Required for <a href="accounting.html">accounting</a>; a currently supported
+	version of MySQL or MariaDB should be used</td>
+<td><i>MySQL</i> or <i>MariaDB</i></td>
+</tr>
+<tr>
+<td><code>auth/slurm</code>
+<br>(alternative to the traditional MUNGE
+	<a href="slurm.conf.html#OPT_AuthType">authentication method</a>)</td>
+<td><i>jwt</i></td>
+</tr>
+<tr>
+<td><code>auth/munge</code>
+<br>(default <a href="slurm.conf.html#OPT_AuthType">authentication method</a>)</td>
+<td><i>MUNGE</i></td>
+</tr>
+<tr>
+<td><code>AutoDetect=nvml</code>
+<br>Provides <a href="gres.conf.html#OPT_AutoDetect">autodetection</a> of NVIDIA
+	GPUs with MIGs and NVlinks (<code>AutoDetect=nvidia</code>, added in 24.11,
+   does not have any prerequisites)</td>
+<td><i>libnvidia-ml</i></td>
+</tr>
+<tr>
+<td><code>AutoDetect=oneapi</code>
+<br>Provides <a href="gres.conf.html#OPT_AutoDetect">autodetection</a> of Intel
+GPUs</td>
+<td><i>libvpl</i></td>
+</tr>
+<tr>
+<td><code>AutoDetect=rsmi</code>
+<br>Provides <a href="gres.conf.html#OPT_AutoDetect">autodetection</a> of AMD
+	GPUs</td>
+<td><i>ROCm</i></td>
+</tr>
+<tr>
+<td><b>HTML man pages</b>
+<br>This dependency is a command that must be present, typically provided by a
+package of the same name.</td>
+<td><i>man2html</i></td>
+</tr>
+<tr>
+<td><b>Lua API</b></td>
+<td><i>lua</i></td>
+</tr>
+<tr>
+<td><b>PAM support</b></td>
+<td><i>PAM</i></td>
+</tr>
+<tr>
+<td><b>PMIx support</b> (requires <code>--with-pmix</code> at build time)</td>
+<td><i>pmix</i></td>
+</tr>
+<tr>
+<td><b>Readline support</b> in <code>scontrol</code> and <code>sacctmgr</code>
+	interactive modes</td>
+<td><i>readline</i></td>
+</tr>
+<tr>
+<td><code>slurmrestd</code>(<a href="#restd">restd node</a>)</td>
+<td><i><a href="related_software.html#httpparser">http_parser</a></i>
+<br><i><a href="related_software.html#json">json-c</a></i>
+<br><i><a href="related_software.html#yaml">yaml</a></i> (optional)
+<br><i><a href="related_software.html#jwt">jwt</a></i> (optional)
+<br><i><a href="tls.html#s2n">s2n</a></i> (optional)</td>
+</tr>
+<tr>
+<td><code>sview</code> (<a href="sview.html">man page</a>)</td>
+<td><i>gtk+-2.0</i></td>
+</tr>
+<tr>
+<td><code>switch/hpe_slingshot</code></td>
+<td><i>cray-libcxi</i>
+<br><i>curl</i>
+<br><i>json-c</i></td>
+</tr>
+<tr>
+<td>NUMA support with <code>task/affinity</code></td>
+<td><i>numa</i></td>
+</tr>
+<tr>
+<td><code>task/cgroup</code>
+<br>Two packages packages are only required for cgroup/v2 support</td>
+<td><i>hwloc</i>
+<br><i>bpf</i> (cgroup/v2)
+<br><i>dbus</i> (cgroup/v2)</td>
+</tr>
+</tbody>
+</table>
+<br>
+
+<p>Please see the <a href="related_software.html">Related Software</a> page for
+references to required software to build these plugins.</p>
 
 <p>If required libraries or header files are in non-standard locations, set
 <code>CFLAGS</code> and <code>LDFLAGS</code> environment variables accordingly.
@@ -202,28 +267,6 @@ Some macro definitions that may be used in building Slurm include:
 %with_munge        "--with-munge=/opt/munge"
 </pre>
 
-<h3 id="rpms">RPMs Installed<a class="slurm_link" href="#rpms"></a></h3>
-
-<p>The RPMs needed on the head node, compute nodes, and slurmdbd node can vary
-by configuration, but here is a suggested starting point:
-<ul>
-<li>Head Node (where the slurmctld daemon runs),<br>
-    Compute and Login Nodes
-	<ul>
-	<li>slurm</li>
-	<li>slurm-perlapi</li>
-	<li>slurm-slurmctld (only on the head node)</li>
-	<li>slurm-slurmd (only on the compute nodes)</li>
-	</ul>
-</li>
-<li>SlurmDBD Node
-	<ul>
-	<li>slurm</li>
-	<li>slurm-slurmdbd</li>
-	</ul>
-</li>
-</ul>
-
 <h3 id="debuild">Building Debian Packages
 <a class="slurm_link" href="#debuild"></a>
 </h3>
@@ -236,7 +279,7 @@ the packages:</p>
 
 <ul>
 <li>Install basic Debian package build requirements:<br>
-<code>apt-get install build-essential fakeroot devscripts</code>
+<code>apt-get install build-essential fakeroot devscripts equivs</code>
 </li>
 <li>Unpack the distributed tarball:<br>
 <code>tar -xaf slurm*tar.bz2</code>
@@ -252,40 +295,84 @@ the packages:</p>
 
 <p>The packages will be in the parent directory after debuild completes.</p>
 
-<h3 id="debinstall">Installing Debian Packages
-<a class="slurm_link" href="#debinstall"></a>
+<h3 id="pkg_install">Installing Packages
+<a class="slurm_link" href="#pkg_install"></a>
 </h3>
 
-<p>The packages needed on the head node, compute nodes, and slurmdbd node can
-vary site to site, but this is a good starting point:</p>
-<ul>
-<li>SlurmDBD Node
-	<ul>
-	<li>slurm-smd</li>
-	<li>slurm-smd-slurmdbd</li>
-	</ul>
-</li>
-<li>Head Node (slurmctld node)
-	<ul>
-	<li>slurm-smd</li>
-	<li>slurm-smd-slurmctld</li>
-	<li>slurm-smd-client</li>
-	</ul>
-</li>
-<li>Compute Nodes (slurmd node)
-	<ul>
-	<li>slurm-smd</li>
-	<li>slurm-smd-slurmd</li>
-	<li>slurm-smd-client</li>
-	</ul>
-</li>
-<li>Login Nodes
-	<ul>
-	<li>slurm-smd</li>
-	<li>slurm-smd-client</li>
-	</ul>
-</li>
-</ul>
+<p>The following packages are recommended to achieve basic functionality for the
+different <a href="#nodes">node types</a>. Other packages may be added to enable
+optional functionality:</p>
+
+<table class="tlist">
+<tbody>
+<tr>
+<td id="rpms"><strong>RPM name</strong></td>
+<td id="debinstall"><strong>DEB name</strong></td>
+<td><a href="#login">Login</a></td>
+<td><a href="#ctld">Controller</a></td>
+<td><a href="#compute">Compute</a></td>
+<td><a href="#dbd">DBD</a></td>
+</tr>
+<tr>
+<td><code>slurm</code></td>
+<td><code>slurm-smd</code></td>
+<td><b>X</b></td>
+<td><b>X</b></td>
+<td><b>X</b></td>
+<td><b>X</b></td>
+</tr>
+<tr>
+<td><code>slurm-perlapi</code></td>
+<td><code>slurm-smd-client</code></td>
+<td><b>X</b></td>
+<td><b>X</b></td>
+<td><b>X</b></td>
+<td></td>
+</tr>
+<tr>
+<td><code>slurm-slurmctld</code></td>
+<td><code>slurm-smd-slurmctld</code></td>
+<td></td>
+<td><b>X</b></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td><code>slurm-slurmd</code></td>
+<td><code>slurm-smd-slurmd</code></td>
+<td></td>
+<td></td>
+<td><b>X</b></td>
+<td></td>
+</tr>
+<tr>
+<td><code>slurm-slurmdbd</code></td>
+<td><code>slurm-smd-slurmdbd</code></td>
+<td></td>
+<td></td>
+<td></td>
+<td><b>X</b></td>
+</tr>
+</tbody>
+</table>
+<br>
+
+<h4 id="dependencies">Handling Dependencies
+<a class="slurm_link" href="#dependencies"></a>
+</h4>
+
+<p>The packages built as described above will have dependencies on external
+packages and on the general <b>slurm</b> package. However, we have observed
+gaps in the enforcement of these dependencies when using the low-level
+<code>dpkg</code> command. For this reason, we recommend avoiding low-level
+commands like <code>dpkg</code> and <code>rpm</code>, and instead using
+high-level commands like <code>dnf</code> and <code>apt</code> for all
+operations.</p>
+
+<p>Users on Debian-based systems should also know that <code>apt</code> is
+willing to automatically remove Slurm packages due to dependency conflicts after
+the transaction. Always read through the transaction summary before instructing
+it to continue.</p>
 
 <h3 id="manual_build">Building Manually
 <a class="slurm_link" href="#manual_build"></a>
@@ -322,9 +409,33 @@ Install architecture-independent files in PREFIX; default value is /usr/local.</
 <p style="margin-left:.2in"><code>--sysconfdir=<i>DIR</i></code><br>
 Specify location of Slurm configuration file. The default value is PREFIX/etc</p>
 
-<h2 id="daemons">Daemons<a class="slurm_link" href="#daemons"></a></h2>
+<h2 id="nodes">Node Types<a class="slurm_link" href="#nodes"></a></h2>
+<p>A cluster consists of many different types of nodes that contribute to
+the overall functionality of the cluster. At least one compute node and
+controller node are required for an operational cluster. Other types of
+nodes can be added to enable optional functionality. It is recommended to have
+single-purpose nodes in a production cluster.</p>
 
-<p><b>slurmctld</b> is sometimes called the &quot;controller&quot;.
+<p>Most Slurm daemons should execute as a non-root service account.
+We recommend you create a Unix user named <i>slurm</i> for use by slurmctld
+and make sure it exists across the cluster. This user should be configured
+as the <b>SlurmUser</b> in the slurm.conf configuration file, and granted
+sufficient permissions to files used by the daemon. Refer to the
+<a href="slurm.conf.html#lbAP">slurm.conf</a> man page for more details.</p>
+
+<p>Below is a brief overview of the different types of nodes Slurm utilizes:</p>
+
+<h3 id="compute">Compute Node<a class="slurm_link" href="#compute"></a></h3>
+<p>Compute nodes (frequently just referred to as &quot;nodes&quot;) perform
+the computational work in the cluster.
+The <a href="slurmd.html">slurmd</a> daemon executes on every compute node.
+It monitors all tasks running on the node, accepts work, launches tasks and
+kills running tasks upon request. Because slurmd
+initiates and manages user jobs, it must execute as the root user.</p>
+
+<h3 id="ctld">Controller Node<a class="slurm_link" href="#ctld"></a></h3>
+<p>The machine running <a href="slurmctld.html">slurmctld</a> is sometimes
+referred to as the &quot;head node&quot; or the &quot;controller&quot;.
 It orchestrates Slurm activities, including queuing of jobs,
 monitoring node states, and allocating resources to jobs. There is an
 optional backup controller that automatically assumes control in the
@@ -338,43 +449,53 @@ startup time.  State changes are saved so that jobs and other state
 information can be preserved when the controller moves (to or from a
 backup controller) or is restarted.</p>
 
-<p>We recommend that you create a Unix user <i>slurm</i> for use by
-<b>slurmctld</b>. This user name will also be specified using the
-<b>SlurmUser</b> in the slurm.conf configuration file.
-This user must exist on all nodes of the cluster.
-Note that files and directories used by <b>slurmctld</b> will need to be
-readable or writable by the user <b>SlurmUser</b> (the Slurm configuration
-files must be readable; the log file directory and state save directory
-must be writable).</p>
+<h3 id="dbd">DBD Node<a class="slurm_link" href="#dbd"></a></h3>
+<p>If you want to save job accounting records to a database, the
+<a href="slurmdbd.html">slurmdbd</a> (Slurm DataBase Daemon) should be used.
+It is good practice to run the slurmdbd daemon on a different machine than the
+controller. On larger systems, we also recommend that the database used by
+<b>slurmdbd</b> be on a separate machine. When getting started with Slurm, we
+recommend that you defer adding accounting support until after basic Slurm
+functionality is established on your system. Refer to the
+<a href="accounting.html">Accounting</a> page for more information.</p>
 
-<p>The <b>slurmd</b> daemon executes on every compute node. It resembles a
-remote shell daemon to export control to Slurm. Because slurmd initiates and
-manages user jobs, it must execute as the user root.</p>
+<h3 id="login">Login Node<a class="slurm_link" href="#login"></a></h3>
+<p>A login node, or submit host, is a shared system used to access a cluster.
+Users can use a login node to stage data, prepare their jobs for submission,
+submit those jobs once they are ready, check the status of their work, and
+perform other cluster related tasks. Workstations can be configured to be able
+to submit jobs, but having separate login nodes can be useful due to operating
+system compatibility or security implications. If users have root access on
+their local machine they would be able to access the security keys directly
+and could run jobs as root on the cluster.</p>
 
-<p>If you want to archive job accounting records to a database, the
-<b>slurmdbd</b> (Slurm DataBase Daemon) should be used. We recommend that
-you defer adding accounting support until after basic Slurm functionality is
-established on your system. An <a href="accounting.html">Accounting</a> web
-page contains more information.</p>
+<p>Login nodes should have access to any Slurm client commands that users are
+expected to use. They should also have the cluster's 'slurm.conf' file and other
+components necessary for the <a href="authentication.html">authentication</a>
+method used in the cluster. They should not be configured to have jobs
+scheduled on them and users should not perform computationally demanding work
+on them while they're logged in. They do not typically need to have any Slurm
+daemons running. If using <i>auth/slurm</i>, <a href="sackd.html">sackd</a>
+should be running to provide authentication. If running in
+<a href="configless_slurm.html">configless mode</a>, and not using
+<i>auth/slurm</i>, a <a href="slurmd.html">slurmd</a> can be configured to
+manage your configuration files.</p>
 
-<p><b>slurmctld</b> and/or <b>slurmd</b> should be initiated at node startup
-time per the Slurm configuration.</p>
+<h3 id="restd">Restd Node<a class="slurm_link" href="#restd"></a></h3>
+<p>The <a href="slurmrestd.html">slurmrestd</a> daemon can be deployed to
+provide a <a href="rest.html">REST API</a> that can be used to interact with the
+Slurm cluster programmatically. See detailed
+<a href="rest_quickstart.html#prereq">prerequisite</a>,
+<a href="rest_quickstart.html#quick_start">installation</a>, and
+<a href="rest_quickstart.html#systemd">systemd configuration</a> guides.
 
-<p>The <b>slurmrestd</b> daemon was introduced in version 20.02 and allows
-clients to communicate with Slurm via the REST API. This is installed by
-default, assuming the <a href="rest.html#prereq">prerequisites</a> are met.
-It has two <a href="slurmrestd.html#SECTION_DESCRIPTION">run modes</a>,
-allowing you to have it run as a traditional Unix service and always listen
-for TCP connections, or you can have it run as an Inet service and only have
-it active when in use.</p>
-
-<h3 id="HA">High Availability<a class="slurm_link" href="#HA"></a></h3>
+<h2 id="HA">High Availability<a class="slurm_link" href="#HA"></a></h2>
 
 <p>Multiple SlurmctldHost entries can be configured, with any entry beyond the
 first being treated as a backup host. Any backup hosts configured should be on
 a different node than the node hosting the primary slurmctld. However, all
 hosts should mount a common file system containing the state information (see
-&quot;StateSaveLocation&quot; in the <a href="#Config">Configuration</a>
+<b>StateSaveLocation</b> in the <a href="#Config">Configuration</a>
 section below).</p>
 
 <p>If more than one host is specified, when the primary fails the second listed
@@ -383,18 +504,12 @@ notifies the backup.  The backup then saves the state and returns to backup
 mode. The primary reads the saved state and resumes normal operation. Likewise,
 if both of the first two listed hosts fail the third SlurmctldHost will take
 over until the primary returns to service. Other than a brief period of non-
-responsiveness, the transition back and forth should go undetected.</p>
-
-<p>Prior to 18.08, Slurm used the <a href="slurm.conf.html#OPT_BackupAddr">
-&quot;BackupAddr&quot;</a> and <a href="slurm.conf.html#OPT_BackupController">
-&quot;BackupController&quot;</a> parameters for High Availability. These
-parameters have been deprecated and are replaced by
-<a href="slurm.conf.html#OPT_SlurmctldHost">&quot;SlurmctldHost&quot;</a>.
-Also see <a href="slurm.conf.html#OPT_SlurmctldPrimaryOnProg">&quot;
-SlurmctldPrimaryOnProg&quot;</a> and
-<a href="slurm.conf.html#OPT_SlurmctldPrimaryOffProg">&quot;
-SlurmctldPrimaryOffProg&quot;</a> to adjust the actions taken when machines
-transition between being the primary controller.</p>
+responsiveness, the transition back and forth should go undetected.
+You can use <a href="slurm.conf.html#OPT_SlurmctldPrimaryOnProg">
+SlurmctldPrimaryOnProg</a> and
+<a href="slurm.conf.html#OPT_SlurmctldPrimaryOffProg">
+SlurmctldPrimaryOffProg</a> to define the actions taken when machines
+transition between primary and backup roles.</p>
 
 <p>Any time the slurmctld daemon or hardware fails before state information
 reaches disk can result in lost state.
@@ -445,7 +560,7 @@ synchronized throughout the cluster, usually done by NTP.</p>
 <a href="authentication.html#slurm">slurm</a>, an internal authentication
 plugin. This plugin has similar requirements to MUNGE, requiring a key file
 shared to all Slurm daemons. The auth/slurm plugin requires installation of the
-jwt pacakge.</p>
+jwt package.</p>
 <p>MUNGE is currently the default and recommended option.
 The configure script in the top-level directory of this distribution will
 determine which authentication plugins may be built.
@@ -789,7 +904,5 @@ cd /usr/ports/sysutils/slurm-wlm && make install
 <p>The binary package installs a minimal Slurm configuration suitable for
 typical compute nodes.  Installing from source allows the user to enable
 options such as mysql and gui tools via a configuration menu.</p>
-
-<p style="text-align:center;">Last modified 24 May 2024</p>
 
 <!--#include virtual="footer.txt"-->

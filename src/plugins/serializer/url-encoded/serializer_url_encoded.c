@@ -39,7 +39,9 @@
 
 #include "src/common/slurm_xlator.h"
 #include "src/common/data.h"
+#include "src/common/http.h"
 #include "src/common/log.h"
+#include "src/common/read_config.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
@@ -48,45 +50,16 @@
 
 #include "src/interfaces/serializer.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - A string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - A string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Serializer URL encoded plugin";
 const char plugin_type[] = "serializer/url-encoded";
 const uint32_t  plugin_version = SLURM_VERSION_NUMBER;
+
+/* Required for serializer plugins: */
 const char *mime_types[] = {
 	"application/x-www-form-urlencoded",
 	NULL
 };
-
-static bool _is_char_hex(char buffer)
-{
-	return (buffer >= '0' && buffer <= '9') ||
-	       (buffer >= 'a' && buffer <= 'f') ||
-	       (buffer >= 'A' && buffer <= 'F');
-}
 
 extern int serialize_p_data_to_string(char **dest, size_t *length,
 				      const data_t *src,
@@ -170,39 +143,16 @@ static bool _is_valid_url_char(char buffer)
 	       buffer == '-' || buffer == '.' || buffer == '_';
 }
 
-/*
- * decodes % sequence.
- * IN ptr pointing to % character
- * RET \0 on error or decoded character
- */
-static unsigned char _decode_seq(const char *ptr)
+extern int serialize_p_init(serializer_flags_t flags)
 {
-	if (_is_char_hex(*(ptr + 1)) && _is_char_hex(*(ptr + 2))) {
-		/* using unsigned char to avoid any rollover */
-		unsigned char high = *(ptr + 1);
-		unsigned char low = *(ptr + 2);
-		unsigned char decoded = (slurm_char_to_hex(high) << 4) +
-					slurm_char_to_hex(low);
+	log_flag(DATA, "loaded");
 
-		//TODO: find more invalid characters?
-		if (decoded == '\0') {
-			error("%s: invalid URL escape sequence for 0x00",
-			      __func__);
-			return '\0';
-		} else if (decoded == 0xff) {
-			error("%s: invalid URL escape sequence for 0xff",
-			      __func__);
-			return '\0';
-		}
+	return SLURM_SUCCESS;
+}
 
-		debug5("%s: URL decoded: 0x%c%c -> %c",
-		       __func__, high, low, decoded);
-
-		return decoded;
-	} else {
-		debug("%s: invalid URL escape sequence: %s", __func__, ptr);
-		return '\0';
-	}
+extern void serialize_p_fini(void)
+{
+	log_flag(DATA, "unloaded");
 }
 
 /*
@@ -233,7 +183,7 @@ extern int serialize_p_string_to_data(data_t **dest, const char *src,
 		switch (*ptr) {
 		case '%': /* rfc3986 */
 		{
-			const char c = _decode_seq(ptr);
+			const char c = url_decode_escape_seq(ptr);
 			if (c != '\0') {
 				/* shift past the hex value */
 				ptr += 2;

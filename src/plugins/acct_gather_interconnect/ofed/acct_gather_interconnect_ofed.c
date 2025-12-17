@@ -55,7 +55,6 @@
 #include "src/interfaces/acct_gather_profile.h"
 
 #include "src/slurmd/slurmd/slurmd.h"
-#include "acct_gather_interconnect_ofed.h"
 
 /*
  * ofed includes for the lib
@@ -67,39 +66,14 @@
 /***************************************************************/
 
 #define ALL_PORTS 0xFF
-
+#define INTERCONNECT_DEFAULT_PORT 1
 
 #define _DEBUG 1
 #define _DEBUG_INTERCONNECT 1
 #define TIMEOUT 20
 #define IB_FREQ 4
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobacct" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobacct/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "AcctGatherInterconnect OFED plugin";
 const char plugin_type[] = "acct_gather_interconnect/ofed";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -316,10 +290,6 @@ static int _update_node_interconnect(void)
 						     ofed_sens.update_time);
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	slurmdb_tres_rec_t tres_rec;
@@ -335,17 +305,15 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	if (!running_in_slurmstepd())
-		return SLURM_SUCCESS;
+		return;
 
 	if (srcport)
 		mad_rpc_close_port(srcport);
 
 	log_flag(INTERCONNECT, "ofed: ended");
-
-	return SLURM_SUCCESS;
 }
 
 extern int acct_gather_interconnect_p_node_update(void)
@@ -401,7 +369,7 @@ extern void acct_gather_interconnect_p_conf_options(
 	return;
 }
 
-extern void acct_gather_interconnect_p_conf_values(List *data)
+extern void acct_gather_interconnect_p_conf_values(list_t **data)
 {
 	xassert(*data);
 	add_key_pair(*data, "InterconnectOFEDPort", "%u", ofed_conf.port);

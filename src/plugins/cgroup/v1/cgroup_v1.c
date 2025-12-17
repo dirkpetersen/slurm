@@ -35,33 +35,11 @@
 
 #define _GNU_SOURCE
 
+#include "src/common/threadpool.h"
+
 #include "cgroup_v1.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "select" for Slurm node selection) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load select plugins if the plugin_type string has a
- * prefix of "select/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Cgroup v1 plugin";
 const char plugin_type[] = "cgroup/v1";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -106,7 +84,7 @@ static pthread_t oom_thread;
 static pthread_mutex_t oom_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Task tracking artifacts */
-List g_task_list[CG_CTL_CNT];
+list_t *g_task_list[CG_CTL_CNT];
 static uint32_t g_max_task_id = 0;
 /*
  * There are potentially multiple tasks on a node, so we want to
@@ -396,6 +374,16 @@ static int _handle_task_cgroup(cgroup_ctl_type_t sub, stepd_step_rec_t *step,
 	common_cgroup_set_param(&task_cg_info->task_cg, "notify_on_release",
 				"0");
 
+	/* Initialize the cpuset cgroup before moving processes into it */
+	if (sub == CG_CPUS) {
+		rc = xcgroup_cpuset_init(&task_cg_info->task_cg);
+		if (rc != SLURM_SUCCESS) {
+			error("Unable to initialize the cpuset cgroup %s",
+			      task_cg_info->task_cg.path);
+			goto end;
+		}
+	}
+
 	/* Attach the pid to the corresponding step_x/task_y cgroup */
 	rc = common_cgroup_move_process(&task_cg_info->task_cg, pid);
 	if (rc != SLURM_SUCCESS)
@@ -405,6 +393,7 @@ static int _handle_task_cgroup(cgroup_ctl_type_t sub, stepd_step_rec_t *step,
 	if (need_to_add)
 		list_append(g_task_list[sub], task_cg_info);
 
+end:
 	xfree(task_cgroup_path);
 	return rc;
 }
@@ -418,6 +407,66 @@ static int _all_tasks_destroy(cgroup_ctl_type_t sub)
 	list_flush(g_task_list[sub]);
 
 	return rc;
+}
+
+static bool _is_root_path(char *path)
+{
+	bool rc = false;
+	char *parent_path = NULL, file_path[PATH_MAX];
+	parent_path = xdirname(path);
+
+	if (snprintf(file_path, PATH_MAX, "%s/cgroup.procs", parent_path) >=
+	    PATH_MAX) {
+		error("Could not generate cgroup path: %s", file_path);
+		goto end;
+	}
+
+	/* If cgroup.procs is not found one level up, we are in the root */
+	if (access(file_path, F_OK))
+		rc = true;
+
+end:
+	xfree(parent_path);
+	return rc;
+}
+
+static void _remove_process_cg_limits(pid_t pid)
+{
+	xcgroup_t cg_cpu = { 0 };
+	xcgroup_t cg_mem = { 0 };
+	xcgroup_ns_t cpu_ns = { 0 };
+	xcgroup_ns_t mem_ns = { 0 };
+
+	/* Try to reset cpuset limits */
+	if (xcgroup_ns_create(&cpu_ns, "", g_cg_name[CG_CPUS])) {
+		log_flag(CGROUP,"Not resetting cpuset, controller not found");
+	} else if (xcgroup_ns_find_by_pid(&cpu_ns, &cg_cpu, pid)) {
+		error("Cannot find slurmd cpu cgroup");
+	} else if (!_is_root_path(cg_cpu.path)) {
+		if (xcgroup_cpuset_init(&cg_cpu)) {
+			error("Cannot reset slurmd cpuset limits");
+		} else {
+			log_flag(CGROUP, "Reset slurmd cpuset limits");
+		}
+	}
+	common_cgroup_destroy(&cg_cpu);
+	common_cgroup_ns_destroy(&cpu_ns);
+
+	/* Try to reset memory limits */
+	if (xcgroup_ns_create(&mem_ns, "", g_cg_name[CG_MEMORY])) {
+		log_flag(CGROUP,"Not resetting memory, controller not found");
+	} else if (xcgroup_ns_find_by_pid(&mem_ns, &cg_mem, pid)) {
+		error("Cannot find slurmd memory cgroup");
+	} else if (!_is_root_path(cg_mem.path)) {
+		if (common_cgroup_set_param(&cg_mem, "memory.limit_in_bytes",
+					    "-1")) {
+			error("Cannot reset slurmd memory limits");
+		} else {
+			log_flag(CGROUP, "Reset slurmd memory limits");
+		}
+	}
+	common_cgroup_destroy(&cg_mem);
+	common_cgroup_ns_destroy(&mem_ns);
 }
 
 extern int init(void)
@@ -437,7 +486,7 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	for (int sub = 0; sub < CG_CTL_CNT; sub++) {
 		FREE_NULL_LIST(g_task_list[sub]);
@@ -446,6 +495,44 @@ extern int fini(void)
 	}
 
 	debug("unloading %s", plugin_name);
+}
+
+extern int cgroup_p_setup_scope(char *scope_path)
+{
+	if (running_in_slurmd())
+		_remove_process_cg_limits(getpid());
+	return SLURM_SUCCESS;
+}
+
+extern char *cgroup_p_get_scope_path(void)
+{
+	return NULL;
+}
+
+extern int cgroup_p_bpf_fsopen(void)
+{
+	error("BPF functions not supported with cgroup/v1");
+	return SLURM_ERROR;
+}
+
+extern int cgroup_p_bpf_fsconfig(int fd)
+{
+	error("BPF functions not supported with cgroup/v1");
+	return SLURM_ERROR;
+}
+
+extern int cgroup_p_bpf_create_token(int fd)
+{
+	error("BPF functions not supported with cgroup/v1");
+	return SLURM_ERROR;
+}
+
+extern void cgroup_p_bpf_set_token(int fd)
+{
+}
+
+extern int cgroup_p_bpf_get_token()
+{
 	return SLURM_SUCCESS;
 }
 
@@ -870,11 +957,51 @@ extern bool cgroup_p_has_pid(pid_t pid)
 	return rc;
 }
 
+static void _get_mem_recursive(xcgroup_t *cg, cgroup_limits_t *limits)
+{
+	char *mem_max = NULL, *tmp_str = NULL;
+	size_t mem_sz;
+	unsigned long mem_lim;
+	unsigned long page_counter_max = LONG_MAX - sysconf(_SC_PAGE_SIZE) + 1;
+
+	if (!xstrcmp(cg->path, "/sys/fs/cgroup"))
+		goto end;
+
+	/* Break when there is no memory controller anymore */
+	if (common_cgroup_get_param(cg, "memory.limit_in_bytes",
+				    &mem_max, &mem_sz) != SLURM_SUCCESS)
+		goto end;
+
+	/* Check ancestor */
+	mem_lim = slurm_atoul(mem_max);
+	if (mem_lim == page_counter_max) {
+		tmp_str = xdirname(cg->path);
+		xfree(cg->path);
+		cg->path = tmp_str;
+		_get_mem_recursive(cg, limits);
+		if (limits->limit_in_bytes != NO_VAL64)
+			goto end;
+	} else {
+		/* found it! */
+		limits->limit_in_bytes = mem_lim;
+	}
+end:
+	xfree(mem_max);
+}
+
 extern cgroup_limits_t *cgroup_p_constrain_get(cgroup_ctl_type_t sub,
 					       cgroup_level_t level)
 {
 	int rc = SLURM_SUCCESS;
-	cgroup_limits_t *limits = xmalloc(sizeof(*limits));
+	cgroup_limits_t *limits;
+	xcgroup_t tmp_cg = { 0 };
+
+	/* Only initialize if not inited */
+	if (!g_cg_ns[sub].mnt_point && (rc = _cgroup_init(sub)))
+		return NULL;
+
+	limits = xmalloc(sizeof(*limits));
+	cgroup_init_limits(limits);
 
 	switch (sub) {
 	case CG_TRACK:
@@ -904,6 +1031,10 @@ extern cgroup_limits_t *cgroup_p_constrain_get(cgroup_ctl_type_t sub,
 			goto fail;
 		break;
 	case CG_MEMORY:
+		tmp_cg.path = xstrdup(int_cg[sub][level].path);
+		_get_mem_recursive(&tmp_cg, limits);
+		xfree(tmp_cg.path);
+		break;
 	case CG_DEVICES:
 		break;
 	default:
@@ -932,6 +1063,11 @@ extern int cgroup_p_constrain_set(cgroup_ctl_type_t sub, cgroup_level_t level,
 	case CG_TRACK:
 		break;
 	case CG_CPUS:
+		/* Do not try to set the cpuset limits of slurmd in this case */
+		if ((level == CG_LEVEL_SYSTEM) &&
+		    (slurm_conf.task_plugin_param & SLURMD_SPEC_OVERRIDE))
+			break;
+
 		if (level == CG_LEVEL_SYSTEM ||
 		    level == CG_LEVEL_USER ||
 		    level == CG_LEVEL_JOB ||
@@ -954,6 +1090,11 @@ extern int cgroup_p_constrain_set(cgroup_ctl_type_t sub, cgroup_level_t level,
 		}
 		break;
 	case CG_MEMORY:
+		/* Do not try to set the cpuset limits of slurmd in this case */
+		if ((level == CG_LEVEL_SYSTEM) &&
+		    (slurm_conf.task_plugin_param & SLURMD_SPEC_OVERRIDE))
+			break;
+
 		if ((level == CG_LEVEL_JOB) &&
 		    (limits->swappiness != NO_VAL64)) {
 			rc = common_cgroup_set_uint64_param(&int_cg[sub][level],
@@ -1176,7 +1317,7 @@ static void *_oom_event_monitor(void *x)
 	return NULL;
 }
 
-extern int cgroup_p_step_start_oom_mgr(void)
+extern int cgroup_p_step_start_oom_mgr(stepd_step_rec_t *step)
 {
 	char *control_file = NULL, *event_file = NULL, *line = NULL;
 	int rc = SLURM_SUCCESS, event_fd = -1, cfd = -1, efd = -1;
@@ -1416,7 +1557,8 @@ extern int cgroup_p_task_addto(cgroup_ctl_type_t sub, stepd_step_rec_t *step,
 extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t taskid)
 {
 	char *cpu_time = NULL, *memory_stat = NULL, *ptr;
-	size_t cpu_time_sz = 0, memory_stat_sz = 0;
+	char *memory_peak = NULL;
+	size_t cpu_time_sz = 0, memory_stat_sz = 0, tmp_sz = 0;
 	cgroup_acct_t *stats = NULL;
 	xcgroup_t *task_cpuacct_cg = NULL;
 	xcgroup_t *task_memory_cg = NULL;
@@ -1453,6 +1595,7 @@ extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t taskid)
 	stats->total_rss = NO_VAL64;
 	stats->total_pgmajfault = NO_VAL64;
 	stats->total_vmem = NO_VAL64;
+	stats->memory_peak = INFINITE64; /* As required in common_jag.c */
 
 	if (common_cgroup_get_param(task_cpuacct_cg, "cpuacct.stat", &cpu_time,
 				    &cpu_time_sz) == SLURM_SUCCESS) {
@@ -1484,8 +1627,22 @@ extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t taskid)
 			stats->total_vmem += total_swap;
 	}
 
+	/* In cgroup/v1, memory.peak is provided by memory.max_usage_in_bytes */
+	if (common_cgroup_get_param(task_memory_cg,
+				    "memory.max_usage_in_bytes",
+				    &memory_peak,
+				    &tmp_sz) != SLURM_SUCCESS) {
+		log_flag(CGROUP, "Cannot read task %d memory.max_usage_in_bytes interface",
+			 taskid);
+	}
+	if (memory_peak) {
+		if (sscanf(memory_peak, "%"PRIu64, &stats->memory_peak) != 1)
+			error("Cannot parse memory.max_usage_in_bytes interface");
+	}
+
 	xfree(cpu_time);
 	xfree(memory_stat);
+	xfree(memory_peak);
 
 	return stats;
 }
@@ -1520,4 +1677,21 @@ extern bool cgroup_p_has_feature(cgroup_ctl_feature_t f)
 	}
 
 	return false;
+}
+
+extern int cgroup_p_signal(int signal)
+{
+	error("%s not implemented in %s", __func__, plugin_name);
+	return SLURM_ERROR;
+}
+
+extern char *cgroup_p_get_task_empty_event_path(uint32_t taskid,
+						bool *on_modify)
+{
+	return NULL;
+}
+
+extern int cgroup_p_is_task_empty(uint32_t taskid)
+{
+	return ESLURM_NOT_SUPPORTED;
 }

@@ -54,6 +54,7 @@
 #include "src/common/ref.h"
 #include "src/common/uid.h"
 #include "src/interfaces/serializer.h"
+#include "src/common/parse_time.h"
 
 #include "src/squeue/squeue.h"
 
@@ -76,6 +77,8 @@
 #define OPT_LONG_HELPFORMAT2  0x116
 #define OPT_LONG_ONLY_JOB_STATE   0x117
 #define OPT_LONG_EXPAND_PATTERNS 0x118
+#define OPT_LONG_R_OVER 0x119
+#define OPT_LONG_R_UNDER 0x120
 
 /* FUNCTIONS */
 static list_t *_build_job_list(char *str);
@@ -99,6 +102,7 @@ static void _filter_nodes(void);
 static list_t *_load_clusters_nodes(void);
 static void _node_info_list_del(void *data);
 static char *_map_node_name(list_t *clusters_node_info, char *name);
+static int _check_only_state(void);
 
 decl_static_data(help_txt);
 decl_static_data(usage_txt);
@@ -146,6 +150,8 @@ extern void parse_command_line(int argc, char **argv)
 		{"priority",   no_argument,       0, 'P'},
 		{"qos",        required_argument, 0, 'q'},
 		{"reservation",required_argument, 0, 'R'},
+		{"running-over", required_argument, 0, OPT_LONG_R_OVER},
+		{"running-under", required_argument, 0, OPT_LONG_R_UNDER},
 		{"sib",        no_argument,       0, OPT_LONG_SIBLING},
 		{"sibling",    no_argument,       0, OPT_LONG_SIBLING},
 		{"sort",       required_argument, 0, 'S'},
@@ -216,6 +222,8 @@ extern void parse_command_line(int argc, char **argv)
 			break;
 		case (int) 'j':
 			if (optarg) {
+				xfree(params.jobs);
+				FREE_NULL_LIST(params.job_list);
 				params.jobs = xstrdup(optarg);
 				params.job_list =
 					_build_job_list(params.jobs);
@@ -290,6 +298,8 @@ extern void parse_command_line(int argc, char **argv)
 			break;
 		case (int) 's':
 			if (optarg) {
+				xfree(params.steps);
+				FREE_NULL_LIST(params.step_list);
 				params.steps = xstrdup(optarg);
 				params.step_list =
 					_build_step_list(params.steps);
@@ -373,15 +383,13 @@ extern void parse_command_line(int argc, char **argv)
 			params.mimetype = MIME_TYPE_JSON;
 			params.data_parser = optarg;
 			params.detail_flag = true;
-			if (serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))
-				fatal("JSON plugin load failure");
+			serializer_required(MIME_TYPE_JSON);
 			break;
 		case OPT_LONG_YAML:
 			params.mimetype = MIME_TYPE_YAML;
 			params.data_parser = optarg;
 			params.detail_flag = true;
-			if (serializer_g_init(MIME_TYPE_YAML_PLUGIN, NULL))
-				fatal("YAML plugin load failure");
+			serializer_required(MIME_TYPE_YAML);
 			break;
 		case OPT_LONG_AUTOCOMP:
 			suggest_completion(long_options, optarg);
@@ -399,14 +407,30 @@ extern void parse_command_line(int argc, char **argv)
 			_help_format2(params.step_flag);
 			exit(0);
 			break;
+		case OPT_LONG_R_OVER:
+			params.time_running_over = time_str2secs(optarg);
+			if (((int32_t) params.time_running_over <= 0) &&
+			    (params.time_running_over != INFINITE))
+				fatal("Invalid time limit specification");
+			break;
+		case OPT_LONG_R_UNDER:
+			params.time_running_under = time_str2secs(optarg);
+			if (((int32_t) params.time_running_under <= 0) &&
+			    (params.time_running_under != INFINITE))
+				fatal("Invalid time limit specification");
+			break;
 		}
 	}
 
 	if (params.long_list && params.format)
 		fatal("Options -o(--format) and -l(--long) are mutually exclusive. Please remove one and retry.");
 
-	if (params.only_state && params.step_flag)
-		fatal("Options --only-job-state and -s(--steps) are mutually exclusive. Please remove one and retry.");
+	/*
+	 * NOTE:
+	 * If the job cache is extended, this flag/functions should be renamed.
+	 */
+	if (params.only_state && (_check_only_state() != SLURM_SUCCESS))
+		fatal("Option --only-job-state only works alone, with -j (--jobs) and/or -t (--states) parameters, parameters for cluster/federation selection, and the printing options.");
 
 	if (!override_format_env) {
 		if ((env_val = getenv("SQUEUE_FORMAT")))
@@ -415,12 +439,15 @@ extern void parse_command_line(int argc, char **argv)
 			params.format_long = xstrdup(env_val);
 	}
 
-	params.cluster_flags = slurmdb_setup_cluster_flags();
 	if (optind < argc) {
 		if (params.job_flag) {
+			xfree(params.jobs);
+			FREE_NULL_LIST(params.job_list);
 			params.jobs = xstrdup(argv[optind++]);
 			params.job_list = _build_job_list(params.jobs);
 		} else if (params.step_flag) {
+			xfree(params.steps);
+			FREE_NULL_LIST(params.step_list);
 			params.steps = xstrdup(argv[optind++]);
 			params.step_list = _build_step_list(params.steps);
 		}
@@ -470,8 +497,7 @@ extern void parse_command_line(int argc, char **argv)
 		params.name_list = _build_str_list( params.names );
 	}
 
-	if ( ( params.partitions == NULL ) &&
-	     ( env_val = getenv("SQUEUE_LICENSES") ) ) {
+	if (!params.licenses && (env_val = getenv("SQUEUE_LICENSES"))) {
 		params.licenses = xstrdup(env_val);
 		params.licenses_list = _build_str_list( params.licenses );
 	}
@@ -528,6 +554,18 @@ extern void parse_command_line(int argc, char **argv)
 		list_iterator_destroy(iterator);
 	}
 
+	if (params.time_running_over && params.time_running_under) {
+		if (params.time_running_over > params.time_running_under) {
+			char buffer_o[32], buffer_u[32];
+			secs2time_str((time_t) params.time_running_over,
+				      buffer_o, sizeof(buffer_o));
+			secs2time_str((time_t) params.time_running_under,
+				      buffer_u, sizeof(buffer_u));
+			fatal("--running-over=%s and --running-under=%s will return 0 jobs.",
+			      buffer_o, buffer_u);
+		}
+	}
+
 	if ( params.verbose )
 		_print_options();
 }
@@ -549,6 +587,8 @@ static const char *_job_state_list(void)
 	xstrcat(state_names, job_state_string(JOB_COMPLETING));
 	xstrcat(state_names, ",");
 	xstrcat(state_names, job_state_string(JOB_CONFIGURING));
+	xstrcat(state_names, ",");
+	xstrcat(state_names, job_state_string(JOB_EXPEDITING));
 	xstrcat(state_names, ",");
 	xstrcat(state_names, job_state_string(JOB_RESIZING));
 	xstrcat(state_names, ",");
@@ -638,6 +678,7 @@ static fmt_data_job_t fmt_data_job[] = {
 	{"CPUsPerTask", 0, _print_job_cpus_per_task, 0},
 	{"cpus-per-task", 0, _print_job_cpus_per_task, 0},
 	{"cpus-per-tres", 0, _print_job_cpus_per_tres, 0},
+	{"CronJob", 0, _print_job_cron_flag, 0},
 	{"Deadline", 0, _print_job_deadline, 0},
 	{"DelayBoot", 0, _print_job_delay_boot, 0},
 	{"Dependency", 'E', _print_job_dependency, 0},
@@ -657,6 +698,7 @@ static fmt_data_job_t fmt_data_job[] = {
 	{"JobId", 'A', _print_job_job_id2, 0},
 	{"LastSchedEval", 0, _print_job_last_sched_eval, 0},
 	{"Licenses", 'W', _print_job_licenses, 0},
+	{"LicensesAlloc", 0, _print_job_licenses_alloc, 0},
 	{"MaxCPUs", 0, _print_job_max_cpus, 0},
 	{"MaxNodes", 0, _print_job_max_nodes, 0},
 	{"mem-per-tres", 0, _print_job_mem_per_tres, 0},
@@ -701,11 +743,13 @@ static fmt_data_job_t fmt_data_job[] = {
 	{"RestartCnt", 0, _print_job_restart_cnt, 0},
 	{"SchedNodes", 'Y', _print_job_schednodes, 0},
 	{"SCT", 'z', _print_job_num_sct, 0},
+	{"SegmentSize", 0, _print_job_segment_size, 0},
 	{"SiblingsActive", 0, _print_job_fed_siblings_active, 0},
 	{"SiblingsActiveRaw", 0, _print_job_fed_siblings_active_raw, 0},
 	{"SiblingsViable", 0, _print_job_fed_siblings_viable, 0},
 	{"SiblingsViableRaw", 0, _print_job_fed_siblings_viable_raw, 0},
 	{"Shared", 'h', _print_job_over_subscribe, FMT_FLAG_HIDDEN},
+	{"SLUID", 's', _print_sluid, 0},
 	{"Sockets", 'H', _print_sockets, 0},
 	{"SPerBoard", 0, _print_job_sockets_per_board, 0},
 	{"StartTime", 'S', _print_job_time_start, 0},
@@ -749,38 +793,30 @@ static fmt_data_step_t fmt_data_step[] = {
 	{"JobId", 0, _print_step_job_id, 0},
 	{"mem-per-tres", 0, _print_step_mem_per_tres, 0},
 	{"Network", 0, _print_step_network, 0},
-	{"Nodes", 0, _print_step_nodes, 0},
+	{"Nodes", 'N', _print_step_nodes, 0},
 	{"NumCPUs", 0, _print_step_num_cpus, 0},
-	{"NumTasks", 0, _print_step_num_tasks, 0},
-	{"Partition", 0, _print_step_partition, 0},
+	{"NumTasks", 'A', _print_step_num_tasks, 0},
+	{"Partition", 'P', _print_step_partition, 0},
 	{"ResvPorts", 0, _print_step_resv_ports, 0},
-	{"StartTime", 0, _print_step_time_start, 0},
-	{"StepId", 0, _print_step_id, 0},
-	{"StepName", 0, _print_step_name, 0},
+	{"StartTime", 'S', _print_step_time_start, 0},
+	{"StdErr", 0, _print_step_std_err, 0},
+	{"StdIn", 0, _print_step_std_in, 0},
+	{"StdOut", 0, _print_step_std_out, 0},
+	{"StepId", 'i', _print_step_id, 0},
+	{"StepName", 'j', _print_step_name, 0},
 	{"StepState", 0, _print_step_state, 0},
-	{"TimeLimit", 0, _print_step_time_limit, 0},
-	{"TimeUsed", 0, _print_step_time_used, 0},
+	{"TimeLimit", 'l', _print_step_time_limit, 0},
+	{"TimeUsed", 'M', _print_step_time_used, 0},
 	{"tres-bind", 0, _print_step_tres_bind, 0},
 	{"tres-freq", 0, _print_step_tres_freq, 0},
 	{"tres-per-job", 0, _print_step_tres_per_step, 0},
-	{"tres-per-node", 0, _print_step_tres_per_node,
+	{"tres-per-node", 'b', _print_step_tres_per_node,
 	 FMT_FLAG_HIDDEN}, /* vestigial */
 	{"tres-per-socket", 0, _print_step_tres_per_socket, 0},
 	{"tres-per-step", 0, _print_step_tres_per_step, 0},
 	{"tres-per-task", 0, _print_step_tres_per_task, 0},
-	{"UserId", 0, _print_step_user_id, 0},
-	{"UserName", 0, _print_step_user_name, 0},
-	{NULL, 'A', _print_step_num_tasks, 0},
-	{NULL, 'b', _print_step_tres_per_node, FMT_FLAG_HIDDEN}, /* vestigial */
-	{NULL, 'i', _print_step_id, 0},
-	{NULL, 'j', _print_step_name, 0},
-	{NULL, 'l', _print_step_time_limit, 0},
-	{NULL, 'M', _print_step_time_used, 0},
-	{NULL, 'N', _print_step_nodes, 0},
-	{NULL, 'P', _print_step_partition, 0},
-	{NULL, 'S', _print_step_time_start, 0},
-	{NULL, 'u', _print_step_user_name, 0},
-	{NULL, 'U', _print_step_user_id, 0},
+	{"UserId", 'U', _print_step_user_id, 0},
+	{"UserName", 'u', _print_step_user_name, 0},
 	{NULL, 0, NULL, 0},
 };
 
@@ -1363,14 +1399,21 @@ static list_t *_build_user_list(char *str)
 	my_user_list = xstrdup(str);
 	user = strtok_r(my_user_list, ",", &tmp_char);
 	while (user) {
+		int rc;
 		uid_t some_uid;
-		if (uid_from_string(user, &some_uid) == 0) {
+
+		/*
+		 * Allow numeric uids that no longer exist on underlying system
+		 * so that any old jobs that still use them can be identified.
+		 */
+		rc = uid_from_string(user, &some_uid);
+		if ((rc != SLURM_SUCCESS) && (rc != ESLURM_USER_ID_UNKNOWN)) {
+			error("Invalid user: %s\n", user);
+		} else {
 			uint32_t *user_id = NULL;
 			user_id = xmalloc(sizeof(uint32_t));
 			*user_id = (uint32_t) some_uid;
 			list_append(my_list, user_id);
-		} else {
-			error("Invalid user: %s\n", user);
 		}
 		user = strtok_r(NULL, ",", &tmp_char);
 	}
@@ -1626,4 +1669,81 @@ static char *_map_node_name(list_t *clusters_node_info, char *name)
 	xfree(nodename);
 	list_iterator_destroy(node_info_itr);
 	return NULL;
+}
+
+static int _check_only_state(void)
+{
+	struct squeue_parameters denied_params_mask, empty_params_mask;
+
+	/* Copy params */
+	memcpy(&denied_params_mask, &params, sizeof(params));
+
+	/*
+	 * Unset the enabled ones.
+	 * NOTE:
+	 * We must add here any parameter we want to allow in the future, if we
+	 * add more information to the cache.
+	 */
+	memset(&denied_params_mask.array_flag, 0,
+	       sizeof(denied_params_mask.array_flag));
+	memset(&denied_params_mask.expand_patterns, 0,
+	       sizeof(denied_params_mask.expand_patterns));
+	memset(&denied_params_mask.format, 0,
+	       sizeof(denied_params_mask.format));
+	memset(&denied_params_mask.format_long, 0,
+	       sizeof(denied_params_mask.format_long));
+	memset(&denied_params_mask.format_list, 0,
+	       sizeof(denied_params_mask.format_list));
+	memset(&denied_params_mask.federation_flag, 0,
+	       sizeof(denied_params_mask.federation_flag));
+	memset(&denied_params_mask.iterate, 0,
+	       sizeof(denied_params_mask.iterate));
+	memset(&denied_params_mask.job_flag, 0,
+	       sizeof(denied_params_mask.job_flag));
+	memset(&denied_params_mask.job_id, 0,
+	       sizeof(denied_params_mask.job_id));
+	memset(&denied_params_mask.job_list, 0,
+	       sizeof(denied_params_mask.job_list));
+	memset(&denied_params_mask.jobs, 0, sizeof(denied_params_mask.jobs));
+	memset(&denied_params_mask.local_flag, 0,
+	       sizeof(denied_params_mask.local_flag));
+	memset(&denied_params_mask.cluster_names, 0,
+	       sizeof(denied_params_mask.cluster_names));
+	memset(&denied_params_mask.convert_flags, 0,
+	       sizeof(denied_params_mask.convert_flags));
+	memset(&denied_params_mask.no_header, 0,
+	       sizeof(denied_params_mask.no_header));
+	memset(&denied_params_mask.only_state, 0,
+	       sizeof(denied_params_mask.only_state));
+	memset(&denied_params_mask.sibling_flag, 0,
+	       sizeof(denied_params_mask.sibling_flag));
+	memset(&denied_params_mask.sort, 0,
+	       sizeof(denied_params_mask.sort));
+	memset(&denied_params_mask.states, 0,
+	       sizeof(denied_params_mask.states));
+	memset(&denied_params_mask.all_states, 0,
+	       sizeof(denied_params_mask.all_states));
+	memset(&denied_params_mask.state_list, 0,
+	       sizeof(denied_params_mask.state_list));
+	memset(&denied_params_mask.verbose, 0,
+	       sizeof(denied_params_mask.verbose));
+	memset(&denied_params_mask.mimetype, 0,
+	       sizeof(denied_params_mask.mimetype));
+	memset(&denied_params_mask.data_parser, 0,
+	       sizeof(denied_params_mask.data_parser));
+	memset(&denied_params_mask.detail_flag, 0,
+	       sizeof(denied_params_mask.detail_flag));
+
+	/* Set the empty mask */
+	memset(&empty_params_mask, 0, sizeof(empty_params_mask));
+
+	/*
+	 * If the original params, after all the allowed params got set to 0,
+	 * are equal to the empty mask, it means the original params has no
+	 * denied option set
+	 */
+	if (!memcmp(&denied_params_mask, &empty_params_mask,
+		    sizeof(empty_params_mask)))
+		return SLURM_SUCCESS;
+	return SLURM_ERROR;
 }

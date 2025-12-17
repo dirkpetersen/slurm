@@ -3,8 +3,8 @@
 dnl Prologue
 dnl
 
-AC_INIT(slurm, m4_esyscmd([perl -ne 'print,exit if s/^\s*VERSION:\s*(\d*.\d*).\S*/\1/i' ./META | sed 's/^v//' | tr '-' '_' | tr -d '\n']), [], [], [https://slurm.schedmd.com])
-AC_PREREQ(2.59)
+AC_INIT([slurm],m4_esyscmd([perl -ne 'print,exit if s/^\s*VERSION:\s*(\d*.\d*).\S*/\1/i' ./META | sed 's/^v//' | tr '-' '_' | tr -d '\n']),[],[],[https://slurm.schedmd.com])
+AC_PREREQ([2.59])
 AC_CONFIG_SRCDIR([configure.ac])
 AC_CONFIG_AUX_DIR([auxdir])
 AC_CONFIG_MACRO_DIR([auxdir])
@@ -65,6 +65,23 @@ AC_DEFINE_UNQUOTED([SLEEP_CMD], ["$SLEEP_CMD"], [Define path to sleep command])
 
 AC_PATH_PROG([SUCMD], [su], [/bin/su])
 AC_DEFINE_UNQUOTED([SUCMD], ["$SUCMD"], [Define path to su command])
+
+
+# Check if the compiler is Clang
+AC_MSG_CHECKING([whether the compiler is Clang])
+AC_COMPILE_IFELSE(
+    [AC_LANG_PROGRAM([], [[
+        #ifndef __clang__
+            not clang
+        #endif
+    ]])],
+    [is_clang=yes],
+    [is_clang=no]
+)
+AC_MSG_RESULT([$is_clang])
+
+# Set a conditional flag if the compiler is Clang
+AM_CONDITIONAL([CLANG], [test "x$is_clang" = "xyes"])
 
 dnl Checks for libraries
 dnl Includes workaround to disable -Werror=builtin-declaration-mismatch which
@@ -156,10 +173,14 @@ X_AC_HTTP_PARSER
 dnl Check for yaml parser
 X_AC_YAML
 
-dnl Checks for compiler characteristics.
-dnl
-AC_PROG_GCC_TRADITIONAL([])
+dnl Check for epoll support
+AX_HAVE_EPOLL()
+if test "x$ax_cv_have_epoll" = "xyes"; then
+	AC_DEFINE(HAVE_EPOLL, 1, [Define to 1 if we have epoll(7) support])
+fi
+AM_CONDITIONAL(HAVE_EPOLL, [test "x$ax_cv_have_epoll" = "xyes" ])
 
+AX_GCC_BUILTIN(__builtin_bswap64)
 AX_GCC_BUILTIN(__builtin_clzll)
 AX_GCC_BUILTIN(__builtin_ctzll)
 AX_GCC_BUILTIN(__builtin_popcountll)
@@ -207,8 +228,6 @@ esac
 LDFLAGS="$LDFLAGS "
 CFLAGS="$CFLAGS $PTHREAD_CFLAGS"
 LIBS="$PTHREAD_LIBS $LIBS"
-
-X_AC_DIMENSIONS
 
 X_AC_OFED
 
@@ -291,6 +310,10 @@ X_AC_MAN2HTML
 AM_CONDITIONAL(HAVE_MAN2HTML, test "x$ac_have_man2html" = "xyes")
 AC_SUBST(HAVE_MAN2HTML)
 
+dnl
+dnl Check bash-completion support
+dnl
+X_AC_BASH_COMPLETION
 
 dnl check if we can use standard printf functions
 dnl
@@ -367,6 +390,7 @@ AC_CONFIG_FILES([Makefile
 		 contribs/seff/Makefile
 		 contribs/sgather/Makefile
 		 contribs/sjobexit/Makefile
+		 contribs/slurm_completion_help/Makefile
 		 contribs/torque/Makefile
 		 doc/Makefile
 		 doc/html/Makefile
@@ -382,6 +406,7 @@ AC_CONFIG_FILES([Makefile
 		 src/bcast/Makefile
 		 src/common/Makefile
 		 src/conmgr/Makefile
+		 src/curl/Makefile
 		 src/database/Makefile
 		 src/interfaces/Makefile
 		 src/lua/Makefile
@@ -416,6 +441,10 @@ AC_CONFIG_FILES([Makefile
 		 src/plugins/burst_buffer/common/Makefile
 		 src/plugins/burst_buffer/datawarp/Makefile
 		 src/plugins/burst_buffer/lua/Makefile
+		 src/plugins/certgen/Makefile
+		 src/plugins/certgen/script/Makefile
+		 src/plugins/certmgr/Makefile
+		 src/plugins/certmgr/script/Makefile
 		 src/plugins/cgroup/Makefile
 		 src/plugins/cgroup/common/Makefile
 		 src/plugins/cgroup/v1/Makefile
@@ -430,13 +459,15 @@ AC_CONFIG_FILES([Makefile
 		 src/plugins/cred/munge/Makefile
 		 src/plugins/cred/none/Makefile
 		 src/plugins/data_parser/Makefile
-		 src/plugins/data_parser/v0.0.40/Makefile
-		 src/plugins/data_parser/v0.0.41/Makefile
 		 src/plugins/data_parser/v0.0.42/Makefile
+		 src/plugins/data_parser/v0.0.43/Makefile
+		 src/plugins/data_parser/v0.0.44/Makefile
+		 src/plugins/data_parser/v0.0.45/Makefile
 		 src/plugins/gpu/Makefile
 		 src/plugins/gpu/common/Makefile
 		 src/plugins/gpu/generic/Makefile
 		 src/plugins/gpu/nrt/Makefile
+		 src/plugins/gpu/nvidia/Makefile
 		 src/plugins/gpu/nvml/Makefile
 		 src/plugins/gpu/oneapi/Makefile
 		 src/plugins/gpu/rsmi/Makefile
@@ -450,8 +481,8 @@ AC_CONFIG_FILES([Makefile
 		 src/plugins/hash/common_xkcp/Makefile
 		 src/plugins/hash/k12/Makefile
 		 src/plugins/hash/sha3/Makefile
-		 src/plugins/job_container/Makefile
-		 src/plugins/job_container/tmpfs/Makefile
+		 src/plugins/http_parser/Makefile
+		 src/plugins/http_parser/libhttp_parser/Makefile
 		 src/plugins/job_submit/Makefile
 		 src/plugins/job_submit/all_partitions/Makefile
 		 src/plugins/job_submit/defaults/Makefile
@@ -476,14 +507,19 @@ AC_CONFIG_FILES([Makefile
 		 src/plugins/mcs/Makefile
 		 src/plugins/mcs/account/Makefile
 		 src/plugins/mcs/group/Makefile
+		 src/plugins/mcs/label/Makefile
 		 src/plugins/mcs/user/Makefile
+		 src/plugins/metrics/Makefile
+		 src/plugins/metrics/openmetrics/Makefile
 		 src/plugins/mpi/Makefile
 		 src/plugins/mpi/cray_shasta/Makefile
 		 src/plugins/mpi/pmi2/Makefile
 		 src/plugins/mpi/pmix/Makefile
+		 src/plugins/namespace/Makefile
+		 src/plugins/namespace/linux/Makefile
+		 src/plugins/namespace/tmpfs/Makefile
 		 src/plugins/node_features/Makefile
 		 src/plugins/node_features/helpers/Makefile
-		 src/plugins/node_features/knl_generic/Makefile
 		 src/plugins/preempt/Makefile
 		 src/plugins/preempt/partition_prio/Makefile
 		 src/plugins/preempt/qos/Makefile
@@ -518,10 +554,9 @@ AC_CONFIG_FILES([Makefile
 		 src/plugins/tls/none/Makefile
 		 src/plugins/tls/s2n/Makefile
 		 src/plugins/topology/Makefile
-		 src/plugins/topology/3d_torus/Makefile
 		 src/plugins/topology/block/Makefile
 		 src/plugins/topology/common/Makefile
-		 src/plugins/topology/default/Makefile
+		 src/plugins/topology/flat/Makefile
 		 src/plugins/topology/tree/Makefile
 		 src/sacct/Makefile
 		 src/sackd/Makefile
@@ -550,6 +585,7 @@ AC_CONFIG_FILES([Makefile
 		 src/slurmrestd/plugins/openapi/Makefile
 		 src/slurmrestd/plugins/openapi/slurmctld/Makefile
 		 src/slurmrestd/plugins/openapi/slurmdbd/Makefile
+		 src/slurmrestd/plugins/openapi/util/Makefile
 		 src/sprio/Makefile
 		 src/squeue/Makefile
 		 src/sreport/Makefile
@@ -563,6 +599,7 @@ AC_CONFIG_FILES([Makefile
 		 testsuite/testsuite.conf.sample
 		 testsuite/expect/Makefile
 		 testsuite/slurm_unit/Makefile
+		 testsuite/slurm_unit/backfill/Makefile
 		 testsuite/slurm_unit/common/Makefile
 		 testsuite/slurm_unit/common/bitstring/Makefile
 		 testsuite/slurm_unit/common/hostlist/Makefile
@@ -570,6 +607,7 @@ AC_CONFIG_FILES([Makefile
 		 testsuite/slurm_unit/common/slurm_protocol_pack/Makefile
 		 testsuite/slurm_unit/common/slurmdb_defs/Makefile
 		 testsuite/slurm_unit/common/slurmdb_pack/Makefile
+		 testsuite/slurm_unit/topology/Makefile
 		 ]
 )
 

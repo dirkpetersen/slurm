@@ -37,9 +37,6 @@ set accounting_storage_enforce [get_config_param "AccountingStorageEnforce"]
 if {[param_contains $accounting_storage_enforce "nosteps"] || [param_contains $accounting_storage_enforce "nojobs"]} {
 	skip "This test can not be run with nosteps or nojobs (AccountingStorageEnforce)"
 }
-if {[get_config_param "FrontendName"] ne "MISSING"} {
-	skip "This test is incompatible with front-end systems"
-}
 if {[get_config_param "SlurmdUser"] ne "root(0)"} {
 	skip "This test is incompatible with SlurmdUser != root"
 }
@@ -51,7 +48,7 @@ proc cleanup {} {
 }
 
 #
-# Build input script file that broacasts a file
+# Build input script file that broadcasts a file
 #
 set pid         [pid]
 set file1       "/tmp/test.$pid.1.$test_id"

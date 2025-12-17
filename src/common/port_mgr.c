@@ -340,10 +340,9 @@ static int _resv_port_alloc(uint16_t resv_port_cnt,
 	char port_str[16];
 	hostlist_t *hl;
 	static int last_port_alloc = 0;
-	static int dims = -1;
 
-	if (dims == -1)
-		dims = slurmdb_setup_cluster_dims();
+	xassert(!*resv_ports);
+	xassert(!*resv_port_array);
 
 	if (resv_port_cnt > port_resv_cnt)
 		return ESLURM_PORTS_INVALID;
@@ -377,7 +376,7 @@ static int _resv_port_alloc(uint16_t resv_port_cnt,
 	}
 	hostlist_sort(hl);
 	/* get the ranged string with no brackets on it */
-	*resv_ports = hostlist_ranged_string_xmalloc_dims(hl, dims, 0);
+	*resv_ports = hostlist_ranged_string_xmalloc_dims(hl, 1, 0);
 	hostlist_destroy(hl);
 	*resv_port_array = port_array;
 
@@ -388,6 +387,28 @@ extern int resv_port_step_alloc(step_record_t *step_ptr)
 {
 	int rc;
 	int port_inx;
+
+	if (step_ptr->resv_port_array || step_ptr->resv_ports) {
+		/*
+		 * Both resv_ports and resv_port_array need to be NULL.
+		 * If they are not that could lead to resv_ports never being
+		 * freed on nodes, eventually making those nodes unable to
+		 * schedule jobs since their ports could have been allocated
+		 * without being freed. By setting resv_ports and
+		 * resv_port_array to NULL in job_array_split() guarantees that,
+		 * but try to catch this issue if it happens in future.
+		 */
+		error("%pS allocated reserved ports while it already had reserved ports %s",
+		       step_ptr, step_ptr->resv_ports);
+
+		/*
+		 * We can't just call _resv_port_free() because it is not
+		 * guaranteed that the node_bitmap or resv_port_cnt is the same
+		 * from when resv_port_array was allocated.
+		 */
+		xfree(step_ptr->resv_port_array);
+		xfree(step_ptr->resv_ports);
+	}
 
 	rc = _resv_port_alloc(step_ptr->resv_port_cnt,
 			      step_ptr->step_node_bitmap, &step_ptr->resv_ports,
@@ -407,6 +428,29 @@ extern int resv_port_job_alloc(job_record_t *job_ptr)
 {
 	int rc;
 	int port_inx;
+
+	if (job_ptr->resv_port_array || job_ptr->resv_ports) {
+		/*
+		 * Both resv_ports and resv_port_array need to be NULL.
+		 * If they are not that could lead to resv_ports never being
+		 * freed on nodes, eventually making those nodes unable to
+		 * schedule jobs since their ports could have been allocated
+		 * without being freed. By setting resv_ports and
+		 * resv_port_array to NULL in job_array_split() guarantees that,
+		 * but try to catch this issue if it happens in future.
+		 */
+		error("%pJ allocated reserved ports while it already had reserved ports %s. Ports may be lost, which will require a restart of the slurmctld daemon to resolve.",
+		       job_ptr, job_ptr->resv_ports);
+
+		/*
+		 * We can't just call _resv_port_free() because it is not
+		 * guaranteed that the node_bitmap or resv_port_cnt is the same
+		 * from when resv_port_array was allocated. A restart of the
+		 * controller will restore any lost ports.
+		 */
+		xfree(job_ptr->resv_port_array);
+		xfree(job_ptr->resv_ports);
+	}
 
 	rc = _resv_port_alloc(job_ptr->resv_port_cnt,
 			      job_ptr->node_bitmap, &job_ptr->resv_ports,
@@ -440,7 +484,7 @@ extern int resv_port_check_job_request_cnt(job_record_t *job_ptr)
 	return SLURM_SUCCESS;
 }
 
-extern int resv_port_get_resv_port_cnt()
+extern int resv_port_get_resv_port_cnt(void)
 {
 	return port_resv_cnt;
 }

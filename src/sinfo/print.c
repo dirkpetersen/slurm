@@ -75,14 +75,14 @@ static void  _print_reservation(reserve_info_t *resv_ptr, int width);
 static int   _print_secs(long time, int width, bool right, bool cut_output);
 static int   _print_str(const char *str, int width, bool right, bool cut_output);
 static int   _resv_name_width(reserve_info_t *resv_ptr);
-static void  _set_node_field_size(List sinfo_list);
-static void  _set_part_field_size(List sinfo_list);
+static void _set_node_field_size(list_t *sinfo_list);
+static void _set_part_field_size(list_t *sinfo_list);
 static char *_str_tolower(char *upper_str);
 
 /*****************************************************************************
  * Global Print Functions
  *****************************************************************************/
-int print_sinfo_list(List sinfo_list)
+int print_sinfo_list(list_t *sinfo_list)
 {
 	list_itr_t *i = list_iterator_create(sinfo_list);
 	sinfo_data_t *current;
@@ -258,8 +258,13 @@ _build_min_max_32_string(char *buffer, int buf_size,
 			 uint32_t min, uint32_t max,
 			 bool range, bool use_suffix)
 {
-	char tmp_min[8];
-	char tmp_max[8];
+	/*
+	 * 11: A uint32_t can have 10 digits, plus a \n. The longest string that
+	 * we are generating here with the sum of both is still below buf_size,
+	 * which is normally FORMAT_STRING_SIZE.
+	 */
+	char tmp_min[11];
+	char tmp_max[11];
 
 	if (use_suffix) {
 		convert_num_unit((float)min, tmp_min, sizeof(tmp_min),
@@ -344,9 +349,9 @@ _build_free_mem_min_max_64(char *buffer, int buf_size,
 		return snprintf(buffer, buf_size, "%s+", tmp_min);
 }
 
-int
-format_add_function(List list, int width, bool right, char *suffix,
-			int (*function) (sinfo_data_t *, int, bool, char*))
+int format_add_function(
+	list_t *list, int width, bool right, char *suffix,
+	int (*function) (sinfo_data_t *, int, bool, char *))
 {
 	sinfo_format_t *tmp =
 		(sinfo_format_t *) xmalloc(sizeof(sinfo_format_t));
@@ -359,9 +364,9 @@ format_add_function(List list, int width, bool right, char *suffix,
 	return SLURM_SUCCESS;
 }
 
-int
-format_prepend_function(List list, int width, bool right, char *suffix,
-			int (*function) (sinfo_data_t *, int, bool, char*))
+int format_prepend_function(
+	list_t *list, int width, bool right, char *suffix,
+	int (*function) (sinfo_data_t *, int, bool, char *))
 {
 	sinfo_format_t *tmp =
 		(sinfo_format_t *) xmalloc(sizeof(sinfo_format_t));
@@ -374,7 +379,7 @@ format_prepend_function(List list, int width, bool right, char *suffix,
 	return SLURM_SUCCESS;
 }
 
-static void _set_node_field_size(List sinfo_list)
+static void _set_node_field_size(list_t *sinfo_list)
 {
 	char *tmp = NULL;
 	list_itr_t *i = list_iterator_create(sinfo_list);
@@ -391,7 +396,7 @@ static void _set_node_field_size(List sinfo_list)
 	params.node_field_size = max_width;
 }
 
-static void _set_part_field_size(List sinfo_list)
+static void _set_part_field_size(list_t *sinfo_list)
 {
 	list_itr_t *i = list_iterator_create(sinfo_list);
 	sinfo_data_t *current;

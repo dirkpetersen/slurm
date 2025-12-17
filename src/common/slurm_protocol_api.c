@@ -51,10 +51,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "slurm/slurm_errno.h"
 
 #include "src/common/assoc_mgr.h"
 #include "src/common/fd.h"
@@ -66,16 +69,20 @@
 #include "src/common/read_config.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_common.h"
+#include "src/common/slurm_protocol_defs.h"
 #include "src/common/slurm_protocol_pack.h"
 #include "src/common/slurm_protocol_socket.h"
+#include "src/common/stepd_proxy.h"
 #include "src/common/strlcpy.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 
 #include "src/interfaces/accounting_storage.h"
 #include "src/interfaces/auth.h"
+#include "src/interfaces/conn.h"
 #include "src/interfaces/hash.h"
-#include "src/interfaces/topology.h"
+
+#include "src/conmgr/conmgr.h"
 
 #include "src/slurmdbd/read_config.h"
 
@@ -97,12 +104,10 @@ strong_alias(get_unit_type, slurm_get_unit_type);
 /* #DEFINES */
 
 /* STATIC VARIABLES */
-static int message_timeout = -1;
 
 /* STATIC FUNCTIONS */
 static char *_global_auth_key(void);
 static void  _remap_slurmctld_errno(void);
-static uid_t _unpack_msg_uid(buf_t *buffer, uint16_t protocol_version);
 
 /* define slurmdbd_conf here so we can treat its existence as a flag */
 slurmdbd_conf_t *slurmdbd_conf = NULL;
@@ -636,16 +641,16 @@ slurm_get_srun_port_range(void)
 /* Change general slurm communication errors to slurmctld specific errors */
 static void _remap_slurmctld_errno(void)
 {
-	int err = slurm_get_errno();
+	int err = errno;
 
 	if (err == SLURM_COMMUNICATIONS_CONNECTION_ERROR)
-		slurm_seterrno(SLURMCTLD_COMMUNICATIONS_CONNECTION_ERROR);
+		errno = SLURMCTLD_COMMUNICATIONS_CONNECTION_ERROR;
 	else if (err ==  SLURM_COMMUNICATIONS_SEND_ERROR)
-		slurm_seterrno(SLURMCTLD_COMMUNICATIONS_SEND_ERROR);
+		errno = SLURMCTLD_COMMUNICATIONS_SEND_ERROR;
 	else if (err == SLURM_COMMUNICATIONS_RECEIVE_ERROR)
-		slurm_seterrno(SLURMCTLD_COMMUNICATIONS_RECEIVE_ERROR);
+		errno = SLURMCTLD_COMMUNICATIONS_RECEIVE_ERROR;
 	else if (err == SLURM_COMMUNICATIONS_SHUTDOWN_ERROR)
-		slurm_seterrno(SLURMCTLD_COMMUNICATIONS_SHUTDOWN_ERROR);
+		errno = SLURMCTLD_COMMUNICATIONS_SHUTDOWN_ERROR;
 }
 
 /**********************************************************************\
@@ -696,17 +701,44 @@ int slurm_init_msg_engine_ports(uint16_t *ports)
  * msg connection establishment functions used by msg clients
 \**********************************************************************/
 
-/*
- * Creates a SOCK_STREAM (TCP) socket and calls connect() on it.
- * Will only receive messages from the address (w/port) argument.
- * IN slurm_address	- slurm_addr_t of the connection destination
- * RET slurm_fd		- file descriptor of the connection created
- */
-int slurm_open_msg_conn(slurm_addr_t * slurm_address)
+static void *_open_msg_conn(slurm_addr_t *addr, char *tls_cert, bool maybe)
 {
-	int fd = slurm_open_stream(slurm_address, false);
+	int fd;
+	void *conn = NULL;
+	conn_args_t conn_args = {
+		.mode = CONN_CLIENT,
+		.cert = tls_cert,
+		.maybe = maybe,
+	};
 
-	return fd;
+	if ((fd = slurm_open_stream(addr, false)) < 0) {
+		log_flag(NET, "Unable to connect to address %pA: %m", addr);
+		return NULL;
+	}
+
+	conn_args.input_fd = conn_args.output_fd = fd;
+
+	if (!(conn = conn_g_create(&conn_args))) {
+		log_flag(NET, "Unable to create client TLS connection to address %pA on fd %d: %m",
+			 addr, fd);
+		fd_close(&fd);
+		return NULL;
+	}
+
+	log_flag(NET, "Successfully opened connection to %pA on fd %d",
+		 addr, fd);
+
+	return conn;
+}
+
+extern void *slurm_open_msg_conn(slurm_addr_t *addr, char *tls_cert)
+{
+	return _open_msg_conn(addr, tls_cert, false);
+}
+
+extern void *slurm_open_msg_conn_maybe(slurm_addr_t *addr, char *tls_cert)
+{
+	return _open_msg_conn(addr, tls_cert, true);
 }
 
 /*
@@ -716,23 +748,30 @@ int slurm_open_msg_conn(slurm_addr_t * slurm_address)
  * IN/OUT index      - IN: which controller to start from
  *                   - OUT: which controller is connected
  * IN comm_cluster_rec	- Communication record (host/port/version)/
- * RET slurm_fd	- file descriptor of the connection created
+ * RET conn or NULL on error
  */
-static int _open_controller(slurm_addr_t *addr, int *index,
-			    slurmdb_cluster_rec_t *comm_cluster_rec)
+static void *_open_controller(int *index,
+			      slurmdb_cluster_rec_t *comm_cluster_rec)
 {
-	int fd = -1;
+	void *conn = NULL;
+	int retry = false;
+	time_t start;
 	slurm_protocol_config_t *proto_conf = NULL;
 
 	if (!comm_cluster_rec) {
 		/* This means the addr wasn't set up already */
 		if (!(proto_conf = _slurm_api_get_comm_config()))
-			return SLURM_ERROR;
+			return NULL;
 	}
 
-	for (int retry = 0; retry < slurm_conf.msg_timeout; retry++) {
-		if (retry)
+	start = time(NULL);
+	while (true) {
+		if (retry) {
+			if ((time(NULL) - start) >= slurm_conf.msg_timeout)
+				break;
 			sleep(1);
+		}
+		retry = true;
 		if (comm_cluster_rec) {
 			if (slurm_addr_is_unspec(
 				&comm_cluster_rec->control_addr)) {
@@ -741,16 +780,15 @@ static int _open_controller(slurm_addr_t *addr, int *index,
 					comm_cluster_rec->control_port,
 					comm_cluster_rec->control_host);
 			}
-			addr = &comm_cluster_rec->control_addr;
 
-			fd = slurm_open_msg_conn(addr);
-			if (fd >= 0)
+			if ((conn = slurm_open_msg_conn(
+				     &comm_cluster_rec->control_addr, NULL)))
 				goto end_it;
 			log_flag(NET, "%s: Failed to contact controller(%pA): %m",
-				 __func__, addr);
+				 __func__, &comm_cluster_rec->control_addr);
 		} else if (proto_conf->vip_addr_set) {
-			fd = slurm_open_msg_conn(&proto_conf->vip_addr);
-			if (fd >= 0)
+			if ((conn = slurm_open_msg_conn(&proto_conf->vip_addr,
+							NULL)))
 				goto end_it;
 			log_flag(NET, "%s: Failed to contact controller(%pA): %m",
 				 __func__, &proto_conf->vip_addr);
@@ -761,8 +799,9 @@ static int _open_controller(slurm_addr_t *addr, int *index,
 					&proto_conf->controller_addr[inx];
 				if (slurm_addr_is_unspec(ctrl_addr))
 					continue;
-				fd = slurm_open_msg_conn(ctrl_addr);
-				if (fd >= 0) {
+
+				if ((conn = slurm_open_msg_conn(ctrl_addr,
+								NULL))) {
 					log_flag(NET, "%s: Contacted SlurmctldHost[%d](%pA)",
 						 __func__, inx, ctrl_addr);
 					*index = inx;
@@ -774,13 +813,13 @@ static int _open_controller(slurm_addr_t *addr, int *index,
 			*index = 0;
 		}
 	}
-	addr = NULL;
 	_slurm_api_free_comm_config(proto_conf);
-	slurm_seterrno_ret(SLURMCTLD_COMMUNICATIONS_CONNECTION_ERROR);
+	errno = SLURMCTLD_COMMUNICATIONS_CONNECTION_ERROR;
+	return NULL;
 
 end_it:
 	_slurm_api_free_comm_config(proto_conf);
-	return fd;
+	return conn;
 }
 
 /*
@@ -788,14 +827,14 @@ end_it:
  *	primary or backup slurmctld message engine
  * IN dest      - controller to contact (0=primary, 1=backup, 2=backup2, etc.)
  * IN comm_cluster_rec	- Communication record (host/port/version)/
- * RET int      - file descriptor of the connection created
+ * RET conn or NULL
  */
-extern int slurm_open_controller_conn_spec(int dest,
-				      slurmdb_cluster_rec_t *comm_cluster_rec)
+extern void *slurm_open_controller(int dest,
+				   slurmdb_cluster_rec_t *comm_cluster_rec)
 {
 	slurm_protocol_config_t *proto_conf = NULL;
-	slurm_addr_t *addr;
-	int rc;
+	slurm_addr_t *addr = NULL;
+	void *conn = NULL;
 
 	if (comm_cluster_rec) {
 		if (slurm_addr_is_unspec(&comm_cluster_rec->control_addr)) {
@@ -808,25 +847,26 @@ extern int slurm_open_controller_conn_spec(int dest,
 	} else {	/* Some backup slurmctld */
 		if (!(proto_conf = _slurm_api_get_comm_config())) {
 			debug3("Error: Unable to set default config");
-			return SLURM_ERROR;
+			return NULL;
 		}
 		addr = NULL;
 		if ((dest >= 0) && (dest <= proto_conf->control_cnt))
 			addr = &proto_conf->controller_addr[dest];
-		if (!addr) {
-			rc = SLURM_ERROR;
+		if (!addr)
 			goto fini;
-		}
 	}
 
-	rc = slurm_open_msg_conn(addr);
-	if (rc == -1) {
+	xassert(addr);
+
+	if (!(conn = slurm_open_msg_conn(addr, NULL))) {
 		log_flag(NET, "%s: slurm_open_msg_conn(%pA): %m",
 			 __func__, addr);
 		_remap_slurmctld_errno();
 	}
-fini:	_slurm_api_free_comm_config(proto_conf);
-	return rc;
+
+fini:
+	_slurm_api_free_comm_config(proto_conf);
+	return conn;
 }
 
 extern int slurm_unpack_received_msg(slurm_msg_t *msg, int fd, buf_t *buffer)
@@ -844,10 +884,8 @@ extern int slurm_unpack_received_msg(slurm_msg_t *msg, int fd, buf_t *buffer)
 		peer = fd_resolve_peer(fd);
 	}
 
-	if (unpack_header(&header, buffer) == SLURM_ERROR) {
-		rc = SLURM_COMMUNICATIONS_RECEIVE_ERROR;
+	if ((rc = unpack_header(&header, buffer)))
 		goto total_return;
-	}
 
 	log_flag(NET_RAW, "%s: [%s] header version=0x%hx flags=0x%hx msg_type=%s(0x%hx) body_length=%ub ret_cnt=%hx forward.cnt=%hu forward.init=0x%hx forward.nodelist=%s forward.timeout=%u forward.tree_width=%hu orig_addr=%pA",
 		 __func__, peer, header.version, header.flags,
@@ -857,20 +895,6 @@ extern int slurm_unpack_received_msg(slurm_msg_t *msg, int fd, buf_t *buffer)
 		 header.forward.timeout, header.forward.tree_width,
 		 &header.orig_addr);
 
-	if (check_header_version(&header) < 0) {
-		uid_t uid = _unpack_msg_uid(buffer, header.version);
-
-		/* peer may have not been resolved already */
-		if (!peer)
-			peer = fd_resolve_peer(fd);
-
-		error("%s: [%s] Invalid Protocol Version %u from uid=%u: %m",
-		      __func__, peer, header.version, uid);
-
-		rc = SLURM_PROTOCOL_VERSION_ERROR;
-		goto total_return;
-	}
-	//info("ret_cnt = %d",header.ret_cnt);
 	if (header.ret_cnt > 0) {
 		/* peer may have not been resolved already */
 		if (!peer)
@@ -889,11 +913,16 @@ extern int slurm_unpack_received_msg(slurm_msg_t *msg, int fd, buf_t *buffer)
 		if (!peer)
 			peer = fd_resolve_peer(fd);
 
-		error("%s: [%s] We need to forward this to other nodes use slurm_receive_msg_and_forward instead",
+		error("%s: [%s] We need to forward this to other nodes use slurm_unpack_msg_and_forward instead",
 		      __func__, peer);
 		header.forward.cnt = 0;
 		xfree(header.forward.nodelist);
 	}
+
+	/* Copy over header info before attempting auth */
+	msg->protocol_version = header.version;
+	msg->msg_type = header.msg_type;
+	msg->flags = header.flags;
 
 	if (header.flags & SLURM_NO_AUTH_CRED)
 		goto skip_auth;
@@ -938,10 +967,6 @@ skip_auth:
 	/*
 	 * Unpack message body
 	 */
-	msg->protocol_version = header.version;
-	msg->msg_type = header.msg_type;
-	msg->flags = header.flags;
-
 	msg->body_offset =  get_buf_offset(buffer);
 
 	if ((header.body_length != remaining_buf(buffer)) ||
@@ -959,7 +984,7 @@ skip_auth:
 total_return:
 	destroy_forward(&header.forward);
 
-	slurm_seterrno(rc);
+	errno = rc;
 	if (rc != SLURM_SUCCESS) {
 		msg->auth_cred = NULL;
 		/* peer may have not been resolved already */
@@ -980,13 +1005,14 @@ total_return:
 /*
  * NOTE: memory is allocated for the returned msg must be freed at
  *       some point using the slurm_free_functions.
- * IN fd	- file descriptor to receive msg on
+ * IN conn
  * OUT msg	- a slurm_msg struct to be filled in by the function
  * IN timeout	- how long to wait in milliseconds
  * RET int	- returns 0 on success, -1 on failure and sets errno
  */
-int slurm_receive_msg(int fd, slurm_msg_t *msg, int timeout)
+extern int slurm_receive_msg(void *conn, slurm_msg_t *msg, int timeout)
 {
+	int fd = -1;
 	char *buf = NULL;
 	size_t buflen = 0;
 	int rc;
@@ -996,17 +1022,22 @@ int slurm_receive_msg(int fd, slurm_msg_t *msg, int timeout)
 	if (msg->flags & SLURM_MSG_KEEP_BUFFER)
 		keep_buffer = true;
 
-	if (msg->conn) {
+	if (msg->pcon) {
 		persist_msg_t persist_msg;
 
-		buffer = slurm_persist_recv_msg(msg->conn);
+		if ((rc = slurm_msg_t_init_address(msg)))
+			log_flag(NET, "%s: [%s:%hu] Unable to resolve persistent msg peer: %s",
+				 __func__, msg->pcon->rem_host,
+				 msg->pcon->rem_port, slurm_strerror(rc));
+
+		buffer = slurm_persist_recv_msg(msg->pcon);
 		if (!buffer) {
 			error("%s: No response to persist_init", __func__);
-			slurm_persist_conn_close(msg->conn);
+			slurm_persist_conn_close(msg->pcon);
 			return SLURM_ERROR;
 		}
 		memset(&persist_msg, 0, sizeof(persist_msg_t));
-		rc = slurm_persist_msg_unpack(msg->conn, &persist_msg, buffer);
+		rc = slurm_persist_msg_unpack(msg->pcon, &persist_msg, buffer);
 
 		if (keep_buffer)
 			msg->buffer = buffer;
@@ -1015,7 +1046,7 @@ int slurm_receive_msg(int fd, slurm_msg_t *msg, int timeout)
 
 		if (rc) {
 			error("%s: Failed to unpack persist msg", __func__);
-			slurm_persist_conn_close(msg->conn);
+			slurm_persist_conn_close(msg->pcon);
 			return SLURM_ERROR;
 		}
 
@@ -1025,9 +1056,13 @@ int slurm_receive_msg(int fd, slurm_msg_t *msg, int timeout)
 		return SLURM_SUCCESS;
 	}
 
-	xassert(fd >= 0);
+	fd = conn_g_get_fd(conn);
 
-	msg->conn_fd = fd;
+	msg->conn = conn;
+
+	if ((rc = slurm_msg_t_init_address(msg)))
+		log_flag(NET, "%s: [fd:%d] Unable to resolve msg peer: %s",
+			 __func__, fd, slurm_strerror(rc));
 
 	if (timeout <= 0) {
 		/* convert secs to msec */
@@ -1047,7 +1082,7 @@ int slurm_receive_msg(int fd, slurm_msg_t *msg, int timeout)
 	 *  length and allocate space on the heap for a buffer containing
 	 *  the message.
 	 */
-	if (slurm_msg_recvfrom_timeout(fd, &buf, &buflen, timeout) < 0) {
+	if (slurm_msg_recvfrom_timeout(conn, &buf, &buflen, timeout) < 0) {
 		rc = errno;
 		if (!rc)
 			rc = SLURMCTLD_COMMUNICATIONS_RECEIVE_ERROR;
@@ -1064,8 +1099,11 @@ int slurm_receive_msg(int fd, slurm_msg_t *msg, int timeout)
 	else
 		FREE_NULL_BUFFER(buffer);
 
+	log_flag(NET, "Received message %s from %pA on fd %d",
+		 rpc_num2string(msg->msg_type), &msg->address, fd);
+
 endit:
-	slurm_seterrno(rc);
+	errno = rc;
 
 	/*
 	 * We just set errno, we need to return SLURM_ERROR if not SLURM_SUCCESS
@@ -1079,15 +1117,16 @@ endit:
 /*
  * NOTE: memory is allocated for the returned list
  *       and must be freed at some point using the list_destroy function.
- * IN open_fd	- file descriptor to receive msg on
+ * IN conn
  * IN steps	- how many steps down the tree we have to wait for
  * IN timeout	- how long to wait in milliseconds
  * RET List	- List containing the responses of the children (if any) we
  *		  forwarded the message to. List containing type
  *		  (ret_data_info_t).
  */
-List slurm_receive_msgs(int fd, int steps, int timeout)
+extern list_t *slurm_receive_msgs(void *conn, int steps, int timeout)
 {
+	int fd = -1;
 	char *buf = NULL;
 	size_t buflen = 0;
 	header_t header;
@@ -1096,11 +1135,11 @@ List slurm_receive_msgs(int fd, int steps, int timeout)
 	slurm_msg_t msg;
 	buf_t *buffer;
 	ret_data_info_t *ret_data_info = NULL;
-	List ret_list = NULL;
+	list_t *ret_list = NULL;
 	int orig_timeout = timeout;
 	char *peer = NULL;
 
-	xassert(fd >= 0);
+	fd = conn_g_get_fd(conn);
 
 	if (slurm_conf.debug_flags & (DEBUG_FLAG_NET | DEBUG_FLAG_NET_RAW)) {
 		/*
@@ -1111,7 +1150,6 @@ List slurm_receive_msgs(int fd, int steps, int timeout)
 	}
 
 	slurm_msg_t_init(&msg);
-	msg.conn_fd = fd;
 
 	if (timeout <= 0) {
 		/* convert secs to msec */
@@ -1119,10 +1157,7 @@ List slurm_receive_msgs(int fd, int steps, int timeout)
 		orig_timeout = timeout;
 	}
 	if (steps) {
-		if (message_timeout < 0)
-			message_timeout = slurm_conf.msg_timeout * 1000;
-		orig_timeout = (timeout -
-				(message_timeout*(steps-1)))/steps;
+		orig_timeout = timeout / (2 * steps);
 		steps--;
 	}
 
@@ -1146,7 +1181,7 @@ List slurm_receive_msgs(int fd, int steps, int timeout)
 	 *  length and allocate space on the heap for a buffer containing
 	 *  the message.
 	 */
-	if (slurm_msg_recvfrom_timeout(fd, &buf, &buflen, timeout) < 0) {
+	if (slurm_msg_recvfrom_timeout(conn, &buf, &buflen, timeout) < 0) {
 		forward_init(&header.forward);
 		rc = errno;
 		goto total_return;
@@ -1155,27 +1190,11 @@ List slurm_receive_msgs(int fd, int steps, int timeout)
 	log_flag_hex(NET_RAW, buf, buflen, "%s: [%s] read", __func__, peer);
 	buffer = create_buf(buf, buflen);
 
-	if (unpack_header(&header, buffer) == SLURM_ERROR) {
+	if ((rc = unpack_header(&header, buffer))) {
 		FREE_NULL_BUFFER(buffer);
-		rc = SLURM_COMMUNICATIONS_RECEIVE_ERROR;
 		goto total_return;
 	}
 
-	if (check_header_version(&header) < 0) {
-		uid_t uid = _unpack_msg_uid(buffer, header.version);
-
-		/* peer may have not been resolved already */
-		if (!peer)
-			peer = fd_resolve_peer(fd);
-
-		error("%s: [%s] Invalid Protocol Version %u from uid=%u: %m",
-		      __func__, peer, header.version, uid);
-
-		FREE_NULL_BUFFER(buffer);
-		rc = SLURM_PROTOCOL_VERSION_ERROR;
-		goto total_return;
-	}
-	//info("ret_cnt = %d",header.ret_cnt);
 	if (header.ret_cnt > 0) {
 		if (header.ret_list)
 			ret_list = header.ret_list;
@@ -1191,7 +1210,7 @@ List slurm_receive_msgs(int fd, int steps, int timeout)
 		if (!peer)
 			peer = fd_resolve_peer(fd);
 
-		error("%s: [%s] We need to forward this to other nodes use slurm_receive_msg_and_forward instead",
+		error("%s: [%s] We need to forward this to other nodes use slurm_unpack_msg_and_forward instead",
 		      __func__, peer);
 	}
 
@@ -1289,8 +1308,9 @@ total_return:
 
 }
 
-extern List slurm_receive_resp_msgs(int fd, int steps, int timeout)
+extern list_t *slurm_receive_resp_msgs(void *conn, int steps, int timeout)
 {
+	int fd = -1;
 	char *buf = NULL;
 	size_t buflen = 0;
 	header_t header;
@@ -1299,11 +1319,11 @@ extern List slurm_receive_resp_msgs(int fd, int steps, int timeout)
 	slurm_msg_t msg;
 	buf_t *buffer;
 	ret_data_info_t *ret_data_info = NULL;
-	List ret_list = NULL;
+	list_t *ret_list = NULL;
 	int orig_timeout = timeout;
 	char *peer = NULL;
 
-	xassert(fd >= 0);
+	fd = conn_g_get_fd(conn);
 
 	if (slurm_conf.debug_flags & (DEBUG_FLAG_NET | DEBUG_FLAG_NET_RAW)) {
 		/*
@@ -1314,7 +1334,6 @@ extern List slurm_receive_resp_msgs(int fd, int steps, int timeout)
 	}
 
 	slurm_msg_t_init(&msg);
-	msg.conn_fd = fd;
 
 	if (timeout <= 0) {
 		/* convert secs to msec */
@@ -1323,10 +1342,7 @@ extern List slurm_receive_resp_msgs(int fd, int steps, int timeout)
 	}
 
 	if (steps) {
-		if (message_timeout < 0)
-			message_timeout = slurm_conf.msg_timeout * 1000;
-		orig_timeout = timeout - (message_timeout * (steps - 1));
-		orig_timeout /= steps;
+		orig_timeout = timeout / (2 * steps);
 		steps--;
 	}
 
@@ -1350,7 +1366,7 @@ extern List slurm_receive_resp_msgs(int fd, int steps, int timeout)
 	 * length and allocate space on the heap for a buffer containing the
 	 * message.
 	 */
-	if (slurm_msg_recvfrom_timeout(fd, &buf, &buflen, timeout) < 0) {
+	if (slurm_msg_recvfrom_timeout(conn, &buf, &buflen, timeout) < 0) {
 		forward_init(&header.forward);
 		rc = errno;
 		goto total_return;
@@ -1359,22 +1375,8 @@ extern List slurm_receive_resp_msgs(int fd, int steps, int timeout)
 	log_flag_hex(NET_RAW, buf, buflen, "%s: [%s] read", __func__, peer);
 	buffer = create_buf(buf, buflen);
 
-	if (unpack_header(&header, buffer) == SLURM_ERROR) {
+	if ((rc = unpack_header(&header, buffer))) {
 		FREE_NULL_BUFFER(buffer);
-		rc = SLURM_COMMUNICATIONS_RECEIVE_ERROR;
-		goto total_return;
-	}
-
-	if (check_header_version(&header) < 0) {
-		/* peer may have not been resolved already */
-		if (!peer)
-			peer = fd_resolve_peer(fd);
-
-		error("%s: [%s] Invalid Protocol Version %u: %m",
-		      __func__, peer, header.version);
-
-		FREE_NULL_BUFFER(buffer);
-		rc = SLURM_PROTOCOL_VERSION_ERROR;
 		goto total_return;
 	}
 
@@ -1393,7 +1395,7 @@ extern List slurm_receive_resp_msgs(int fd, int steps, int timeout)
 		if (!peer)
 			peer = fd_resolve_peer(fd);
 
-		error("%s: [%s] We need to forward this to other nodes use slurm_receive_msg_and_forward instead",
+		error("%s: [%s] We need to forward this to other nodes use slurm_unpack_msg_and_forward instead",
 		      __func__, peer);
 	}
 
@@ -1466,49 +1468,14 @@ total_return:
 	return ret_list;
 }
 
-/*
- * Try to determine the UID associated with a message with different
- * message header version, return INFINITE ((uid_t) -1) if we can't tell.
- */
-static uid_t _unpack_msg_uid(buf_t *buffer, uint16_t protocol_version)
+extern int slurm_unpack_msg_and_forward(slurm_msg_t *msg,
+					slurm_addr_t *orig_addr, int fd,
+					buf_t *buffer)
 {
-	uid_t uid = INFINITE;
-	void *auth_cred = NULL;
-
-	if (!(auth_cred = auth_g_unpack(buffer, protocol_version)))
-		return uid;
-	if (auth_g_verify(auth_cred, slurm_conf.authinfo))
-		return uid;
-
-	uid = auth_g_get_uid(auth_cred);
-	auth_g_destroy(auth_cred);
-
-	return uid;
-}
-
-/*
- * NOTE: memory is allocated for the returned msg and the returned list
- *       both must be freed at some point using the slurm_free_functions
- *       and list_destroy function.
- * IN open_fd	- file descriptor to receive msg on
- * IN/OUT msg	- a slurm_msg struct to be filled in by the function
- *		  we use the orig_addr from this var for forwarding.
- * RET int	- returns 0 on success, -1 on failure and sets errno
- */
-int slurm_receive_msg_and_forward(int fd, slurm_addr_t *orig_addr,
-				  slurm_msg_t *msg)
-{
-	char *buf = NULL;
-	size_t buflen = 0;
 	header_t header;
 	int rc;
 	void *auth_cred = NULL;
-	buf_t *buffer;
 	char *peer = NULL;
-	bool keep_buffer = false;
-
-	if (msg->flags & SLURM_MSG_KEEP_BUFFER)
-		keep_buffer = true;
 
 	xassert(fd >= 0);
 
@@ -1520,57 +1487,20 @@ int slurm_receive_msg_and_forward(int fd, slurm_addr_t *orig_addr,
 		peer = fd_resolve_peer(fd);
 	}
 
-	if (msg->forward.init != FORWARD_INIT)
-		slurm_msg_t_init(msg);
-	/* set msg connection fd to accepted fd. This allows
-	 *  possibility for slurmd_req () to close accepted connection
-	 */
-	msg->conn_fd = fd;
-	/* this always is the connection */
+	/* this is the direct peer connection */
 	memcpy(&msg->address, orig_addr, sizeof(slurm_addr_t));
 
-	/* where the connection originated from, this
-	 * might change based on the header we receive */
+	/*
+	 * Where the connection originated from. This will change to the
+	 * originator if the header is unpacked successfully later.
+	 */
 	memcpy(&msg->orig_addr, orig_addr, sizeof(slurm_addr_t));
 
 	msg->ret_list = list_create(destroy_data_info);
 
-
-	/*
-	 * Receive a msg. slurm_msg_recvfrom() will read the message
-	 *  length and allocate space on the heap for a buffer containing
-	 *  the message.
-	 */
-	if (slurm_msg_recvfrom_timeout(fd, &buf, &buflen,
-				       (slurm_conf.msg_timeout * 1000)) < 0) {
-		forward_init(&header.forward);
-		rc = errno;
+	if ((rc = unpack_header(&header, buffer)))
 		goto total_return;
-	}
 
-	log_flag_hex(NET_RAW, buf, buflen, "%s: [%s] read", __func__, peer);
-	buffer = create_buf(buf, buflen);
-
-	if (unpack_header(&header, buffer) == SLURM_ERROR) {
-		FREE_NULL_BUFFER(buffer);
-		rc = SLURM_COMMUNICATIONS_RECEIVE_ERROR;
-		goto total_return;
-	}
-
-	if (check_header_version(&header) < 0) {
-		uid_t uid = _unpack_msg_uid(buffer, header.version);
-
-		/* peer may have not been resolved already */
-		if (!peer)
-			peer = fd_resolve_peer(fd);
-
-		error("%s: [%s] Invalid Protocol Version %u from uid=%u: %m",
-		      __func__, peer, header.version, uid);
-
-		FREE_NULL_BUFFER(buffer);
-		rc = SLURM_PROTOCOL_VERSION_ERROR;
-		goto total_return;
-	}
 	if (header.ret_cnt > 0) {
 		/* peer may have not been resolved already */
 		if (!peer)
@@ -1584,12 +1514,12 @@ int slurm_receive_msg_and_forward(int fd, slurm_addr_t *orig_addr,
 	}
 
 	/*
-	 * header.orig_addr will be set to where the first message
-	 * came from if this is a forward else we set the
-	 * header.orig_addr to our addr just in case we need to send it off.
+	 * Update orig_addr to where the connection originated from before
+	 * the forwarding subsystem relayed it to us.
 	 */
 	if (!slurm_addr_is_unspec(&header.orig_addr)) {
-		memcpy(&msg->orig_addr, &header.orig_addr, sizeof(slurm_addr_t));
+		memcpy(&msg->orig_addr, &header.orig_addr,
+		       sizeof(slurm_addr_t));
 	} else {
 		memcpy(&header.orig_addr, orig_addr, sizeof(slurm_addr_t));
 	}
@@ -1610,15 +1540,7 @@ int slurm_receive_msg_and_forward(int fd, slurm_addr_t *orig_addr,
 		       msg->forward_struct->buf_len);
 
 		msg->forward_struct->ret_list = msg->ret_list;
-		/* take out the amount of timeout from this hop */
-		msg->forward_struct->timeout = header.forward.timeout;
-		if (!msg->forward_struct->timeout)
-			msg->forward_struct->timeout = message_timeout;
 		msg->forward_struct->fwd_cnt = header.forward.cnt;
-
-		log_flag(NET, "%s: [%s] forwarding messages to %u nodes with timeout of %d",
-			 __func__, peer, msg->forward_struct->fwd_cnt,
-			 msg->forward_struct->timeout);
 
 		if (forward_msg(msg->forward_struct, &header) == SLURM_ERROR) {
 			/* peer may have not been resolved already */
@@ -1640,7 +1562,6 @@ int slurm_receive_msg_and_forward(int fd, slurm_addr_t *orig_addr,
 
 		error("%s: [%s] auth_g_unpack: %s has authentication error: %m",
 		      __func__, peer, rpc_num2string(header.msg_type));
-		FREE_NULL_BUFFER(buffer);
 		rc = ESLURM_PROTOCOL_INCOMPLETE_PACKET;
 		goto total_return;
 	}
@@ -1659,7 +1580,6 @@ int slurm_receive_msg_and_forward(int fd, slurm_addr_t *orig_addr,
 		error("%s: [%s] auth_g_verify: %s has authentication error: %m",
 		      __func__, peer, rpc_num2string(header.msg_type));
 		auth_g_destroy(auth_cred);
-		FREE_NULL_BUFFER(buffer);
 		rc = SLURM_PROTOCOL_AUTHENTICATION_ERROR;
 		goto total_return;
 	}
@@ -1668,9 +1588,7 @@ int slurm_receive_msg_and_forward(int fd, slurm_addr_t *orig_addr,
 	msg->auth_ids_set = true;
 
 skip_auth:
-	/*
-	 * Unpack message body
-	 */
+	/* Unpack message body */
 	msg->protocol_version = header.version;
 	msg->msg_type = header.msg_type;
 	msg->flags = header.flags;
@@ -1679,41 +1597,35 @@ skip_auth:
 
 	if ((header.body_length != remaining_buf(buffer)) ||
 	    _check_hash(buffer, &header, msg, auth_cred) ||
-	     (unpack_msg(msg, buffer) != SLURM_SUCCESS) ) {
+	    (unpack_msg(msg, buffer) != SLURM_SUCCESS)) {
 		auth_g_destroy(auth_cred);
-		FREE_NULL_BUFFER(buffer);
 		rc = ESLURM_PROTOCOL_INCOMPLETE_PACKET;
 		goto total_return;
 	}
 	msg->auth_cred = auth_cred;
 
-	if (keep_buffer)
-		msg->buffer = buffer;
-	else
-		FREE_NULL_BUFFER(buffer);
 	rc = SLURM_SUCCESS;
 
 total_return:
 	destroy_forward(&header.forward);
 
-	slurm_seterrno(rc);
+	errno = rc;
 	if (rc != SLURM_SUCCESS) {
-		msg->msg_type = RESPONSE_FORWARD_FAILED;
-		msg->auth_cred = NULL;
-		msg->data = NULL;
 		/* peer may have not been resolved already */
 		if (!peer)
 			peer = fd_resolve_peer(fd);
 
+		msg->msg_type = RESPONSE_FORWARD_FAILED;
+		msg->auth_cred = NULL;
+		msg->data = NULL;
+
 		error("%s: [%s] failed: %s",
 		      __func__, peer, slurm_strerror(rc));
-		usleep(10000);	/* Discourage brute force attack */
-	} else {
-		rc = 0;
+		usleep(10000); /* Discourage brute force attack */
 	}
+
 	xfree(peer);
 	return rc;
-
 }
 
 /**********************************************************************\
@@ -1849,34 +1761,48 @@ skip_auth2:
  * Send a slurm message over an open file descriptor `fd'
  * Returns the size of the message sent in bytes, or -1 on failure.
  */
-extern int slurm_send_node_msg(int fd, slurm_msg_t *msg)
+extern int slurm_send_node_msg(void *conn, slurm_msg_t *msg)
 {
+	int fd = -1;
 	msg_bufs_t buffers = { 0 };
 	int rc;
 
-	if (msg->conn) {
+	if (msg->pcon) {
 		persist_msg_t persist_msg;
 		buf_t *buffer;
 		char *peer = NULL;
+		int persist_fd = conn_g_get_fd(msg->pcon->conn);
+
+		if ((rc = slurm_msg_t_init_address(msg)))
+			log_flag(NET, "%s: [%s:%hu] Resolving peer address failed: %s",
+				 __func__, msg->pcon->rem_host,
+				 msg->pcon->rem_port, slurm_strerror(rc));
+
+		log_flag(NET, "Sending persist_msg_t %s to %pA on fd %d",
+			 rpc_num2string(msg->msg_type), &msg->address,
+			 persist_fd);
 
 		memset(&persist_msg, 0, sizeof(persist_msg_t));
 		persist_msg.msg_type  = msg->msg_type;
 		persist_msg.data      = msg->data;
 
-		buffer = slurm_persist_msg_pack(msg->conn, &persist_msg);
+		buffer = slurm_persist_msg_pack(msg->pcon, &persist_msg);
 		if (!buffer)    /* pack error */
 			return SLURM_ERROR;
 
-		rc = slurm_persist_send_msg(msg->conn, buffer);
+		rc = slurm_persist_send_msg(msg->pcon, buffer);
 		FREE_NULL_BUFFER(buffer);
 
-		if ((rc < 0) && (errno == ENOTCONN)) {
+		if ((rc != SLURM_SUCCESS) && (fd < 0))
+			fd = persist_fd;
+
+		if ((rc != SLURM_SUCCESS) && (errno == ENOTCONN)) {
 			if (slurm_conf.debug_flags & DEBUG_FLAG_NET)
 				peer = fd_resolve_peer(fd);
 
 			log_flag(NET, "%s: [%s] persistent connection has disappeared for msg_type=%s",
 				__func__, peer, rpc_num2string(msg->msg_type));
-		} else if (rc < 0) {
+		} else if (rc != SLURM_SUCCESS) {
 			peer = fd_resolve_peer(fd);
 			error("%s: [%s] slurm_persist_send_msg(msg_type=%s) failed: %m",
 			      __func__, peer, rpc_num2string(msg->msg_type));
@@ -1886,13 +1812,22 @@ extern int slurm_send_node_msg(int fd, slurm_msg_t *msg)
 		return rc;
 	}
 
+	fd = conn_g_get_fd(conn);
+
+	if ((rc = slurm_msg_t_init_address(msg)))
+		log_flag(NET, "%s: [fd:%d] Resolving peer address failed: %s",
+			 __func__, fd, slurm_strerror(rc));
+
+	log_flag(NET, "Sending message %s to %pA on fd %d",
+		 rpc_num2string(msg->msg_type), &msg->address, fd);
+
 	/*
 	 * Pack and send message
 	 */
 	if ((rc = slurm_buffers_pack_msg(msg, &buffers, true)))
 		goto cleanup;
 
-	rc = slurm_bufs_sendto(fd, &buffers);
+	rc = slurm_bufs_sendto(conn, &buffers);
 
 	if (rc >= 0) {
 		/* sent successfully */
@@ -1919,36 +1854,58 @@ cleanup:
 	return rc;
 }
 
+/*
+ * Send a slurm message over an open connection ignoring any errors.
+ * Not usable for persistent connections.
+ */
+static void _send_node_msg_maybe(void *conn, slurm_msg_t *msg)
+{
+	msg_bufs_t buffers = { 0 };
+
+	if (!msg->pcon) {
+		/* Pack and send message */
+		if (slurm_buffers_pack_msg(msg, &buffers, true))
+			goto cleanup;
+
+		slurm_bufs_sendto(conn, &buffers);
+	}
+
+cleanup:
+	FREE_NULL_BUFFER(buffers.header);
+	FREE_NULL_BUFFER(buffers.auth);
+	FREE_NULL_BUFFER(buffers.body);
+}
+
 /**********************************************************************\
  * stream functions
 \**********************************************************************/
 
 /* slurm_write_stream
  * writes a buffer out a stream file descriptor
- * IN open_fd		- file descriptor to write on
+ * IN conn
  * IN buffer		- buffer to send
  * IN size		- size of buffer send
  * IN timeout		- how long to wait in milliseconds
- * RET size_t		- bytes sent , or -1 on errror
+ * RET size_t		- bytes sent , or -1 on error
  */
-size_t slurm_write_stream(int open_fd, char *buffer, size_t size)
+extern size_t slurm_write_stream(void *conn, char *buffer, size_t size)
 {
-	return slurm_send_timeout(open_fd, buffer, size,
-	                          (slurm_conf.msg_timeout * 1000));
+	return slurm_send_timeout(conn, buffer, size,
+				  (slurm_conf.msg_timeout * 1000));
 }
 
 /* slurm_read_stream
  * read into buffer grom a stream file descriptor
- * IN open_fd	- file descriptor to read from
+ * IN conn
  * OUT buffer   - buffer to receive into
  * IN size	- size of buffer
  * IN timeout	- how long to wait in milliseconds
- * RET size_t	- bytes read , or -1 on errror
+ * RET size_t	- bytes read , or -1 on error
  */
-size_t slurm_read_stream(int open_fd, char *buffer, size_t size)
+extern size_t slurm_read_stream(void *conn, char *buffer, size_t size)
 {
-	return slurm_recv_timeout(open_fd, buffer, size,
-	                          (slurm_conf.msg_timeout * 1000));
+	return slurm_recv_timeout(conn, buffer, size,
+				  (slurm_conf.msg_timeout * 1000));
 }
 
 /**********************************************************************\
@@ -1979,10 +1936,12 @@ void slurm_get_ip_str(slurm_addr_t *addr, char *ip, unsigned int buf_len)
  */
 int slurm_get_peer_addr(int fd, slurm_addr_t * slurm_address)
 {
-	slurm_addr_t name = {0};
-	socklen_t namelen = (socklen_t) sizeof(name);
+	slurm_addr_t name = {
+		.ss_family = AF_UNSPEC,
+	};
+	socklen_t namelen = sizeof(name);
 
-	if (getpeername((int) fd, (struct sockaddr *) &name, &namelen))
+	if (getpeername(fd, (struct sockaddr *) &name, &namelen))
 		return errno;
 	memcpy(slurm_address, &name, sizeof(slurm_addr_t));
 	return 0;
@@ -2012,7 +1971,7 @@ extern void slurm_pack_addr_array(slurm_addr_t *addr_array, uint32_t size_val,
  * unpacks an array of slurm_addrs from a buffer
  * OUT addr_array_ptr	- slurm_addr_t[] to unpack to
  * IN/OUT size_val  	- how many to unpack
- * IN/OUT buffer	- buffer to upack the slurm_addr_t from
+ * IN/OUT buffer	- buffer to unpack the slurm_addr_t from
  * returns		- Slurm error code
  */
 extern int slurm_unpack_addr_array(slurm_addr_t **addr_array_ptr,
@@ -2037,13 +1996,19 @@ unpack_error:
 	return SLURM_ERROR;
 }
 
-extern void response_init(slurm_msg_t *resp_msg, slurm_msg_t *msg,
-			  uint16_t msg_type, void *data)
+/**********************************************************************\
+ * simplified communication routines
+ * They open a connection do work then close the connection all within
+ * the function
+\**********************************************************************/
+
+extern void slurm_resp_msg_init(slurm_msg_t *resp_msg, slurm_msg_t *msg,
+				uint16_t msg_type, void *data)
 {
 	slurm_msg_t_init(resp_msg);
 	resp_msg->address = msg->address;
 	resp_msg->auth_index = msg->auth_index;
-	resp_msg->conn = msg->conn;
+	resp_msg->pcon = msg->pcon;
 	resp_msg->data = data;
 	resp_msg->flags = msg->flags;
 	resp_msg->forward = msg->forward;
@@ -2079,11 +2044,43 @@ extern void response_init(slurm_msg_t *resp_msg, slurm_msg_t *msg,
 	resp_msg->flags |= SLURM_NO_AUTH_CRED;
 }
 
-/**********************************************************************\
- * simplified communication routines
- * They open a connection do work then close the connection all within
- * the function
-\**********************************************************************/
+extern int send_msg_response(slurm_msg_t *source_msg, slurm_msg_type_t msg_type,
+			     void *data)
+{
+	int rc;
+	slurm_msg_t resp_msg;
+
+	slurm_resp_msg_init(&resp_msg, source_msg, msg_type, data);
+
+	if (source_msg->conmgr_con) {
+		rc = conmgr_con_queue_write_msg(source_msg->conmgr_con,
+						&resp_msg);
+
+		if (rc)
+			log_flag(NET, "%s: [%s] write response RPC %s failure: %s",
+				 __func__,
+				 conmgr_con_get_name(source_msg->conmgr_con),
+				 rpc_num2string(msg_type), slurm_strerror(rc));
+
+		return rc;
+	}
+
+	resp_msg.pcon = source_msg->pcon;
+
+	rc = slurm_send_node_msg(source_msg->conn, &resp_msg);
+
+	if (rc >= 0)
+		return SLURM_SUCCESS;
+
+	rc = errno;
+	log_flag(NET, "%s: [fd:%d] write response RPC %s failed: %s",
+		 __func__, (source_msg->pcon ?
+			    conn_g_get_fd(source_msg->pcon->conn) :
+			    conn_g_get_fd(source_msg->conn)),
+		 rpc_num2string(msg_type), slurm_strerror(rc));
+
+	return rc;
+}
 
 /* slurm_send_rc_msg
  * given the original request message this function sends a
@@ -2093,19 +2090,16 @@ extern void response_init(slurm_msg_t *resp_msg, slurm_msg_t *msg,
  */
 int slurm_send_rc_msg(slurm_msg_t *msg, int rc)
 {
-	slurm_msg_t resp_msg;
-	return_code_msg_t rc_msg;
+	return_code_msg_t rc_msg = {
+		.return_code = rc,
+	};
 
-	if (msg->conn_fd < 0) {
-		slurm_seterrno(ENOTCONN);
+	if ((rc = send_msg_response(msg, RESPONSE_SLURM_RC, &rc_msg))) {
+		errno = rc;
 		return SLURM_ERROR;
 	}
-	rc_msg.return_code = rc;
 
-	response_init(&resp_msg, msg, RESPONSE_SLURM_RC, &rc_msg);
-
-	/* send message */
-	return slurm_send_node_msg(msg->conn_fd, &resp_msg);
+	return SLURM_SUCCESS;
 }
 
 /* slurm_send_rc_err_msg
@@ -2117,20 +2111,32 @@ int slurm_send_rc_msg(slurm_msg_t *msg, int rc)
  */
 int slurm_send_rc_err_msg(slurm_msg_t *msg, int rc, char *err_msg)
 {
-	slurm_msg_t resp_msg;
-	return_code2_msg_t rc_msg;
+	return_code2_msg_t rc_msg = {
+		.return_code = rc,
+		.err_msg = err_msg,
+	};
 
-	if (msg->conn_fd < 0) {
-		slurm_seterrno(ENOTCONN);
+	if ((rc = send_msg_response(msg, RESPONSE_SLURM_RC_MSG, &rc_msg))) {
+		errno = rc;
 		return SLURM_ERROR;
 	}
-	rc_msg.return_code = rc;
-	rc_msg.err_msg     = err_msg;
 
-	response_init(&resp_msg, msg, RESPONSE_SLURM_RC_MSG, &rc_msg);
+	return SLURM_SUCCESS;
+}
 
-	/* send message */
-	return slurm_send_node_msg(msg->conn_fd, &resp_msg);
+extern void slurm_send_msg_maybe(slurm_msg_t *req)
+{
+	void *conn = NULL;
+
+	if (!(conn = slurm_open_msg_conn_maybe(&req->address, req->tls_cert))) {
+		log_flag(NET, "%s: slurm_open_msg_conn_maybe(%pA): %m",
+			 __func__, &req->address);
+		return;
+	}
+
+	_send_node_msg_maybe(conn, req);
+
+	conn_g_destroy(conn, true);
 }
 
 /*
@@ -2144,36 +2150,32 @@ int slurm_send_reroute_msg(slurm_msg_t *msg,
 			   slurmdb_cluster_rec_t *cluster_rec,
 			   char *stepmgr)
 {
-	slurm_msg_t resp_msg;
-	reroute_msg_t reroute_msg = {0};
+	int rc;
+	reroute_msg_t reroute_msg = {
+		.working_cluster_rec = cluster_rec,
+		.stepmgr = stepmgr,
+	};
 
-	if (msg->conn_fd < 0) {
-		slurm_seterrno(ENOTCONN);
+	if ((rc = send_msg_response(msg, RESPONSE_SLURM_REROUTE_MSG,
+				    &reroute_msg))) {
+		errno = rc;
 		return SLURM_ERROR;
 	}
 
-	/* Don't free the cluster_rec, it's pointing to the actual object. */
-	reroute_msg.working_cluster_rec = cluster_rec;
-	reroute_msg.stepmgr = stepmgr;
-
-	response_init(&resp_msg, msg, RESPONSE_SLURM_REROUTE_MSG,
-			&reroute_msg);
-
-	/* send message */
-	return slurm_send_node_msg(msg->conn_fd, &resp_msg);
+	return SLURM_SUCCESS;
 }
 
 /*
  * Send and recv a slurm request and response on the open slurm descriptor
  * Doesn't close the connection.
- * IN fd	- file descriptor to receive msg on
+ * IN conn
  * IN req	- a slurm_msg struct to be sent by the function
  * OUT resp	- a slurm_msg struct to be filled in by the function
  * IN timeout	- how long to wait in milliseconds
  * RET int	- returns 0 on success, -1 on failure and sets errno
  */
-extern int slurm_send_recv_msg(int fd, slurm_msg_t *req,
-			       slurm_msg_t *resp, int timeout)
+extern int slurm_send_recv_msg(void *conn, slurm_msg_t *req, slurm_msg_t *resp,
+			       int timeout)
 {
 	slurm_msg_t_init(resp);
 
@@ -2181,12 +2183,11 @@ extern int slurm_send_recv_msg(int fd, slurm_msg_t *req,
 	 * actually want.  This should be the correct one already, but just make
 	 * sure.
 	 */
-	if (req->conn) {
-		fd = req->conn->fd;
-		resp->conn = req->conn;
+	if (req->pcon) {
+		resp->pcon = req->pcon;
 	}
 
-	if (slurm_send_node_msg(fd, req) < 0)
+	if (slurm_send_node_msg(conn, req) < 0)
 		return -1;
 
 	/*
@@ -2194,83 +2195,21 @@ extern int slurm_send_recv_msg(int fd, slurm_msg_t *req,
 	 * expecting anything other than one message. The default timeout will
 	 * be used if it is set to 0.
 	 */
-	if (slurm_receive_msg(fd, resp, timeout))
+	if (slurm_receive_msg(conn, resp, timeout))
 		return -1;
 
 	return 0;
 }
 
-/*
- * Send and recv a slurm request and response on the open slurm descriptor
- * Closes the connection.
- * IN fd	- file descriptor to receive msg on
- * IN req	- a slurm_msg struct to be sent by the function
- * OUT resp	- a slurm_msg struct to be filled in by the function
- * IN timeout	- how long to wait in milliseconds
- * RET int	- returns 0 on success, -1 on failure and sets errno
- */
-static int
-_send_and_recv_msg(int fd, slurm_msg_t *req,
-		   slurm_msg_t *resp, int timeout)
+static int _foreach_ret_list_hostname_set(void *x, void *arg)
 {
-	int rc = slurm_send_recv_msg(fd, req, resp, timeout);
+	ret_data_info_t *ret_data_info = x;
+	char *name = arg;
 
-	if (close(fd))
-		error("%s: closing fd:%d error: %m",
-		      __func__, fd);
+	if (!ret_data_info->node_name)
+		ret_data_info->node_name = xstrdup(name);
 
-	return rc;
-}
-
-/*
- * Send and recv a slurm request and response on the open slurm descriptor
- * with a list containing the responses of the children (if any) we
- * forwarded the message to. List containing type (ret_data_info_t).
- * IN fd	- file descriptor to receive msg on
- * IN req	- a slurm_msg struct to be sent by the function
- * IN timeout	- how long to wait in milliseconds
- * RET List	- List containing the responses of the children (if any) we
- *		  forwarded the message to. List containing type
- *		  (ret_data_info_t).
- */
-static List
-_send_and_recv_msgs(int fd, slurm_msg_t *req, int timeout)
-{
-	List ret_list = NULL;
-	int steps = 0;
-
-	if (!req->forward.timeout) {
-		if (!timeout)
-			timeout = slurm_conf.msg_timeout * 1000;
-		req->forward.timeout = timeout;
-	}
-	if (slurm_send_node_msg(fd, req) >= 0) {
-		if (req->forward.cnt > 0) {
-			/* figure out where we are in the tree and set
-			 * the timeout for to wait for our children
-			 * correctly
-			 * (timeout+message_timeout sec per step)
-			 * to let the child timeout */
-			if (message_timeout < 0)
-				message_timeout =
-					slurm_conf.msg_timeout * 1000;
-			steps = req->forward.cnt + 1;
-			if (!req->forward.tree_width)
-				req->forward.tree_width =
-					slurm_conf.tree_width;
-			if (req->forward.tree_width)
-				steps /= req->forward.tree_width;
-			timeout = (message_timeout * steps);
-			steps++;
-
-			timeout += (req->forward.timeout*steps);
-		}
-		ret_list = slurm_receive_msgs(fd, steps, timeout);
-	}
-
-	(void) close(fd);
-
-	return ret_list;
+	return 0;
 }
 
 /*
@@ -2286,13 +2225,11 @@ extern int slurm_send_recv_controller_msg(slurm_msg_t * request_msg,
 				slurm_msg_t * response_msg,
 				slurmdb_cluster_rec_t *comm_cluster_rec)
 {
-	int fd = -1;
 	int rc = 0;
 	time_t start_time = time(NULL);
 	slurm_conf_t *conf;
 	bool have_backup;
 	uint16_t slurmctld_timeout;
-	slurm_addr_t ctrl_addr;
 	static int index = 0;
 	slurmdb_cluster_rec_t *save_comm_cluster_rec = comm_cluster_rec;
 	int ratelimited = 0;
@@ -2317,13 +2254,25 @@ tryagain:
 	slurm_conf_unlock();
 
 	while (true) {
-		if ((fd = _open_controller(&ctrl_addr, &index,
-					   comm_cluster_rec)) < 0) {
+		void *conn = NULL;
+
+		if (!(conn = _open_controller(&index, comm_cluster_rec))) {
 			rc = -1;
 			break;
 		}
 
-		rc = _send_and_recv_msg(fd, request_msg, response_msg, 0);
+		if (comm_cluster_rec)
+			request_msg->protocol_version =
+				comm_cluster_rec->rpc_version;
+
+		request_msg->conn = conn;
+		if (slurm_conf.debug_flags & DEBUG_FLAG_NET)
+			(void) slurm_msg_t_init_address(request_msg);
+
+		rc = slurm_send_recv_msg(conn, request_msg, response_msg, 0);
+
+		conn_g_destroy(conn, true);
+
 		if (response_msg->auth_cred)
 			auth_g_destroy(response_msg->auth_cred);
 
@@ -2375,7 +2324,7 @@ tryagain:
 
 		if (rr_msg->working_cluster_rec) {
 			/*
-			 * Don't expect mutliple hops but in the case it does
+			 * Don't expect multiple hops but in the case it does
 			 * happen, free the previous rr cluster_rec.
 			 */
 			if (comm_cluster_rec &&
@@ -2408,17 +2357,22 @@ tryagain:
  */
 int slurm_send_recv_node_msg(slurm_msg_t *req, slurm_msg_t *resp, int timeout)
 {
-	int fd = -1;
+	void *conn = NULL;
+	int rc;
 
 	resp->auth_cred = NULL;
-	if ((fd = slurm_open_msg_conn(&req->address)) < 0) {
+
+	if (!(conn = slurm_open_msg_conn(&req->address, req->tls_cert))) {
 		log_flag(NET, "%s: slurm_open_msg_conn(%pA): %m",
 			 __func__, &req->address);
 		return -1;
 	}
 
-	return _send_and_recv_msg(fd, req, resp, timeout);
+	rc = slurm_send_recv_msg(conn, req, resp, timeout);
 
+	conn_g_destroy(conn, true);
+
+	return rc;
 }
 
 /* slurm_send_only_controller_msg
@@ -2432,30 +2386,28 @@ int slurm_send_recv_node_msg(slurm_msg_t *req, slurm_msg_t *resp, int timeout)
 extern int slurm_send_only_controller_msg(slurm_msg_t *req,
 				slurmdb_cluster_rec_t *comm_cluster_rec)
 {
-	int      rc = SLURM_SUCCESS;
-	int fd = -1;
-	slurm_addr_t ctrl_addr;
+	void *conn = NULL;
+	int rc = SLURM_SUCCESS;
 	int index = 0;
 
 	/*
 	 *  Open connection to Slurm controller:
 	 */
-	if ((fd = _open_controller(&ctrl_addr, &index,
-				   comm_cluster_rec)) < 0) {
+	if (!(conn = _open_controller(&index, comm_cluster_rec))) {
 		rc = SLURM_ERROR;
 		goto cleanup;
 	}
 
 	slurm_msg_set_r_uid(req, slurm_conf.slurm_user_id);
 
-	if ((rc = slurm_send_node_msg(fd, req)) < 0) {
+	if ((rc = slurm_send_node_msg(conn, req)) < 0) {
 		rc = SLURM_ERROR;
 	} else {
 		log_flag(NET, "%s: sent %d", __func__, rc);
 		rc = SLURM_SUCCESS;
 	}
 
-	(void) close(fd);
+	conn_g_destroy(conn, true);
 
 cleanup:
 	if (rc != SLURM_SUCCESS)
@@ -2491,19 +2443,21 @@ cleanup:
  */
 int slurm_send_only_node_msg(slurm_msg_t *req)
 {
+	void *conn = NULL;
 	int rc = SLURM_SUCCESS;
 	int fd = -1;
 	struct pollfd pfd;
 	int value = -1;
 	int pollrc;
 
-	if ((fd = slurm_open_msg_conn(&req->address)) < 0) {
+	if (!(conn = slurm_open_msg_conn(&req->address, req->tls_cert))) {
 		log_flag(NET, "%s: slurm_open_msg_conn(%pA): %m",
 			 __func__, &req->address);
 		return SLURM_ERROR;
 	}
+	fd = conn_g_get_fd(conn);
 
-	if ((rc = slurm_send_node_msg(fd, req)) < 0) {
+	if ((rc = slurm_send_node_msg(conn, req)) < 0) {
 		rc = SLURM_ERROR;
 	} else {
 		log_flag(NET, "%s: sent %d", __func__, rc);
@@ -2518,12 +2472,15 @@ int slurm_send_only_node_msg(slurm_msg_t *req)
 	 * the poll() should hit POLLERR which gives the TICOUTQ count as an
 	 * additional diagnostic element.
 	 *
-	 * The steps below may result in a false-positive on occassion, in
+	 * The steps below may result in a false-positive on occasion, in
 	 * which case the code path above may opt to retransmit an already
 	 * received message. If this is a concern, you should not be using
 	 * this function.
+	 *
+	 * Skip this if running with TLS enabled as it may mess up the internal
+	 * session state.
 	 */
-	if (shutdown(fd, SHUT_WR))
+	if (!conn_tls_enabled() && shutdown(fd, SHUT_WR))
 		log_flag(NET, "%s: shutdown call failed: %m", __func__);
 
 again:
@@ -2534,7 +2491,7 @@ again:
 		if (errno == EINTR)
 			goto again;
 		log_flag(NET, "%s: poll error: %m", __func__);
-		(void) close(fd);
+		conn_g_destroy(conn, true);
 		return SLURM_ERROR;
 	}
 
@@ -2544,7 +2501,7 @@ again:
 				 __func__);
 		log_flag(NET, "%s: poll timed out with %d outstanding: %m",
 			 __func__, value);
-		(void) close(fd);
+		conn_g_destroy(conn, true);
 		return SLURM_ERROR;
 	}
 
@@ -2563,38 +2520,17 @@ again:
 			log_flag(NET, "%s: poll error with %d outstanding: %s",
 				 __func__, value, slurm_strerror(err));
 
-		(void) close(fd);
+		conn_g_destroy(conn, true);
 		return SLURM_ERROR;
 	}
 
-	(void) close(fd);
+	conn_g_destroy(conn, true);
 
 	return rc;
 }
 
 /*
- * Open a connection to the "address" specified in the slurm msg `req'
- * Then, immediately close the connection w/out waiting for a reply.
- * Ignore any errors. This should only be used when you do not care if
- * the message is ever received.
- */
-void slurm_send_msg_maybe(slurm_msg_t *req)
-{
-	int fd = -1;
-
-	if ((fd = slurm_open_msg_conn(&req->address)) < 0) {
-		log_flag(NET, "%s: slurm_open_msg_conn(%pA): %m",
-			 __func__, &req->address);
-		return;
-	}
-
-	(void) slurm_send_node_msg(fd, req);
-
-	(void) close(fd);
-}
-
-/*
- *  Send a message to the nodelist specificed using fanout
+ *  Send a message to the nodelist specified using fanout
  *    Then return List containing type (ret_data_info_t).
  * IN nodelist	  - list of nodes to send to.
  * IN msg	  - a slurm_msg struct to be sent by the function
@@ -2603,21 +2539,10 @@ void slurm_send_msg_maybe(slurm_msg_t *req)
  *		    (if any) we forwarded the message to. List
  *		    containing type (ret_data_info_t).
  */
-List slurm_send_recv_msgs(const char *nodelist, slurm_msg_t *msg, int timeout)
+list_t *slurm_send_recv_msgs(const char *nodelist, slurm_msg_t *msg, int timeout)
 {
-	List ret_list = NULL;
+	list_t *ret_list = NULL;
 	hostlist_t *hl = NULL;
-
-	if (!running_in_daemon()) {
-		/*
-		 * Load topo plugin here to make it so the api can do
-		 * it easily
-		 */
-		if (topology_g_init() != SLURM_SUCCESS) {
-			error("failed to initialize route plugins");
-			return NULL;
-		}
-	}
 
 	if (!nodelist || !strlen(nodelist)) {
 		error("slurm_send_recv_msgs: no nodelist given");
@@ -2645,43 +2570,37 @@ List slurm_send_recv_msgs(const char *nodelist, slurm_msg_t *msg, int timeout)
  *		    (if any) we forwarded the message to. List
  *		    containing type (ret_types_t).
  */
-List slurm_send_addr_recv_msgs(slurm_msg_t *msg, char *name, int timeout)
+list_t *slurm_send_addr_recv_msgs(slurm_msg_t *msg, char *name, int timeout)
 {
-	static pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
-	static uint16_t conn_timeout = NO_VAL16, tcp_timeout = 2;
-	List ret_list = NULL;
-	int fd = -1;
-	ret_data_info_t *ret_data_info = NULL;
-	list_itr_t *itr;
-	int i;
+	time_t start, now;
+	uint16_t conn_timeout = MIN(slurm_conf.msg_timeout, 10);
+	void *conn = NULL;
+	list_t *ret_list = NULL;
+	bool first = true;
 
-	slurm_mutex_lock(&conn_lock);
-
-	if (conn_timeout == NO_VAL16) {
-		conn_timeout = MIN(slurm_conf.msg_timeout, 10);
-		tcp_timeout = MAX(0, slurm_conf.tcp_timeout - 1);
-	}
-	slurm_mutex_unlock(&conn_lock);
-
+	start = now = time(NULL);
 	/* This connect retry logic permits Slurm hierarchical communications
 	 * to better survive slurmd restarts */
-	for (i = 0; i <= conn_timeout; i++) {
-		fd = slurm_open_msg_conn(&msg->address);
-		if ((fd >= 0) || (errno != ECONNREFUSED && errno != ETIMEDOUT))
+	while ((now - start) < conn_timeout) {
+		if ((conn = slurm_open_msg_conn(&msg->address, msg->tls_cert)))
+			break;
+		if ((errno != ECONNREFUSED) && (errno != ETIMEDOUT))
 			break;
 		if (errno == ETIMEDOUT) {
-			if (i == 0)
+			if (first)
 				log_flag(NET, "Timed out connecting to %pA, retrying...",
 					 &msg->address);
-			i += tcp_timeout;
 		} else {
-			if (i == 0)
+			if (first)
 				log_flag(NET, "Connection refused by %pA, retrying...",
 					 &msg->address);
 			sleep(1);
 		}
+		first = false;
+		now = time(NULL);
 	}
-	if (fd < 0) {
+
+	if (!conn) {
 		log_flag(NET, "Failed to connect to %pA, %m", &msg->address);
 		mark_as_failed_forward(&ret_list, name,
 				       SLURM_COMMUNICATIONS_CONNECTION_ERROR);
@@ -2691,18 +2610,23 @@ List slurm_send_addr_recv_msgs(slurm_msg_t *msg, char *name, int timeout)
 
 	msg->ret_list = NULL;
 	msg->forward_struct = NULL;
-	if (!(ret_list = _send_and_recv_msgs(fd, msg, timeout))) {
+
+	if (slurm_send_node_msg(conn, msg) >= 0)
+		ret_list = slurm_receive_msgs(conn, msg->forward.tree_depth,
+					      msg->forward.timeout);
+
+	if (!ret_list) {
 		mark_as_failed_forward(&ret_list, name, errno);
+		conn_g_destroy(conn, true);
 		errno = SLURM_COMMUNICATIONS_CONNECTION_ERROR;
 		return ret_list;
-	} else {
-		itr = list_iterator_create(ret_list);
-		while ((ret_data_info = list_next(itr)))
-			if (!ret_data_info->node_name) {
-				ret_data_info->node_name = xstrdup(name);
-			}
-		list_iterator_destroy(itr);
 	}
+
+	(void) list_for_each(
+			ret_list, _foreach_ret_list_hostname_set, name);
+
+	conn_g_destroy(conn, true);
+
 	return ret_list;
 }
 
@@ -2717,7 +2641,6 @@ List slurm_send_addr_recv_msgs(slurm_msg_t *msg, char *name, int timeout)
  */
 int slurm_send_recv_rc_msg_only_one(slurm_msg_t *req, int *rc, int timeout)
 {
-	int fd = -1;
 	int ret_c = 0;
 	slurm_msg_t resp;
 
@@ -2731,12 +2654,7 @@ int slurm_send_recv_rc_msg_only_one(slurm_msg_t *req, int *rc, int timeout)
 	req->ret_list = NULL;
 	req->forward_struct = NULL;
 
-	if ((fd = slurm_open_msg_conn(&req->address)) < 0) {
-		log_flag(NET, "%s: slurm_open_msg_conn(%pA): %m",
-			 __func__, &req->address);
-		return -1;
-	}
-	if (!_send_and_recv_msg(fd, req, &resp, timeout)) {
+	if (!slurm_send_recv_node_msg(req, &resp, timeout)) {
 		if (resp.auth_cred)
 			auth_g_destroy(resp.auth_cred);
 		*rc = slurm_get_return_code(resp.msg_type, resp.data);
@@ -2750,7 +2668,7 @@ int slurm_send_recv_rc_msg_only_one(slurm_msg_t *req, int *rc, int timeout)
 /*
  * Send message to controller and get return code.
  * Make use of slurm_send_recv_controller_msg(), which handles
- * support for backup controller and retry during transistion.
+ * support for backup controller and retry during transition.
  * IN req - request to send
  * OUT rc - return code
  * IN comm_cluster_rec	- Communication record (host/port/version)/
@@ -2774,17 +2692,21 @@ extern int slurm_send_recv_controller_rc_msg(slurm_msg_t *req, int *rc,
 }
 
 /*
- * Free a slurm message's memebers but not the message itself
+ * Free a slurm message's members but not the message itself
  */
 extern void slurm_free_msg_members(slurm_msg_t *msg)
 {
-	if (msg) {
-		if (msg->auth_cred)
-			auth_g_destroy(msg->auth_cred);
-		FREE_NULL_BUFFER(msg->buffer);
-		slurm_free_msg_data(msg->msg_type, msg->data);
-		FREE_NULL_LIST(msg->ret_list);
-	}
+	if (!msg)
+		return;
+
+	FREE_NULL_AUTH(msg->auth_cred);
+	FREE_NULL_BUFFER(msg->buffer);
+	FREE_NULL_MSG_DATA(msg->msg_type, msg->data);
+	msg->msg_type = NO_VAL16;
+	FREE_NULL_LIST(msg->ret_list);
+	xfree(msg->tls_cert);
+	/* msg->tls_conn is always a symlink and not free()ed */
+	CONMGR_CON_UNLINK(msg->conmgr_con);
 }
 
 /*
@@ -2970,7 +2892,7 @@ extern int get_unit_type(char unit)
 extern int slurm_forward_data(
 	char **nodelist, char *address, uint32_t len, const char *data)
 {
-	List ret_list = NULL;
+	list_t *ret_list = NULL;
 	int temp_rc = 0, rc = 0;
 	ret_data_info_t *ret_data_info = NULL;
 	slurm_msg_t msg;

@@ -1,6 +1,5 @@
 /*****************************************************************************\
- *  slurm_acct_gather_interconnect.c - implementation-independent job interconnect
- *  accounting plugin definitions
+ *  acct_gather_interconnect.c - job interconnect accounting plugin definitions
  *****************************************************************************
  *  Copyright (C) 2013 Bull.
  *  Written by Yiannis Georgiou <yiannis.georgiou@bull.net>
@@ -51,6 +50,7 @@
 #include "src/common/plugin.h"
 #include "src/common/plugrack.h"
 #include "src/common/slurm_protocol_api.h"
+#include "src/common/threadpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 #include "src/interfaces/acct_gather_interconnect.h"
@@ -62,7 +62,7 @@ typedef struct slurm_acct_gather_interconnect_ops {
 	void (*conf_options)	(s_p_options_t **full_options,
 				 int *full_options_cnt);
 	void (*conf_set)	(s_p_hashtbl_t *tbl);
-	void (*conf_values)      (List *data);
+	void (*conf_values)     (list_t **data);
 	int (*get_data)		(acct_gather_data_t *data);
 } slurm_acct_gather_interconnect_ops_t;
 /*
@@ -179,6 +179,12 @@ extern int acct_gather_interconnect_fini(void)
 	int i;
 
 	slurm_mutex_lock(&g_context_lock);
+
+	if (!init_run) {
+		slurm_mutex_unlock(&g_context_lock);
+		return SLURM_SUCCESS;
+	}
+
 	init_run = false;
 
 	if (watch_node_thread_id) {
@@ -187,6 +193,7 @@ extern int acct_gather_interconnect_fini(void)
 		slurm_cond_signal(&profile_timer->notify);
 		slurm_mutex_unlock(&profile_timer->notify_mutex);
 		slurm_thread_join(watch_node_thread_id);
+		watch_node_thread_id = 0;
 		slurm_mutex_lock(&g_context_lock);
 	}
 

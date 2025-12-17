@@ -80,7 +80,7 @@ extern void squeue_filter_jobs_for_json(job_info_msg_t *job_info);
 /*****************************************************************************
  * Job Line Format Options
  *****************************************************************************/
-int job_format_add_function(List list, int width, bool right_justify,
+int job_format_add_function(list_t *list, int width, bool right_justify,
 			    char *suffix,
 			    int (*function) (job_info_t *, int, bool, char*));
 #define job_format_add_prefix(list,wid,right,prefix) \
@@ -124,6 +124,8 @@ int _print_job_name(job_info_t * job, int width, bool right_justify,
 			char* suffix);
 int _print_job_licenses(job_info_t * job, int width, bool right_justify,
 			char* suffix);
+int _print_job_licenses_alloc(job_info_t *job, int width, bool right,
+			      char *suffix);
 int _print_job_wckey(job_info_t * job, int width, bool right_justify,
 			char* suffix);
 int _print_job_user_id(job_info_t * job, int width, bool right_justify,
@@ -182,6 +184,7 @@ int _print_job_contiguous(job_info_t * job, int width, bool right_justify,
 			  char* suffix);
 int _print_pn_min_cpus(job_info_t * job, int width, bool right_justify,
 		       char* suffix);
+int _print_sluid(job_info_t *job, int width, bool right_justify, char *suffix);
 int _print_sockets(job_info_t * job, int width, bool right_justify,
 		   char* suffix);
 int _print_cores(job_info_t * job, int width, bool right_justify, char* suffix);
@@ -241,6 +244,8 @@ int _print_job_cpus_per_task(job_info_t * job, int width, bool right_justify,
 			     char* suffix);
 int _print_job_cpus_per_task(job_info_t * job, int width, bool right_justify,
 			     char* suffix);
+int _print_job_cron_flag(job_info_t *job, int width, bool right_justify,
+			 char *suffix);
 int _print_job_derived_ec(job_info_t * job, int width, bool right_justify,
 			  char* suffix);
 int _print_job_eligible_time(job_info_t * job, int width, bool right_justify,
@@ -289,6 +294,8 @@ int _print_job_resize_time(job_info_t * job, int width,
 			   bool right_justify, char* suffix);
 int _print_job_restart_cnt(job_info_t * job, int width,
 			   bool right_justify, char* suffix);
+int _print_job_segment_size(job_info_t *job, int width, bool right_justify,
+			    char *suffix);
 int _print_job_sockets_per_board(job_info_t * job, int width,
 				 bool right_justify, char* suffix);
 int _print_job_std_err(job_info_t * job, int width,
@@ -332,7 +339,7 @@ int _print_job_het_job_id_set(job_info_t * job, int width,
 /*****************************************************************************
  * Step Print Format Functions
  *****************************************************************************/
-int step_format_add_function(List list, int width, bool right_justify,
+int step_format_add_function(list_t *list, int width, bool right_justify,
 			     char * suffix,
 		int (*function) (job_step_info_t *, int, bool, char *));
 
@@ -359,6 +366,12 @@ int _print_step_partition(job_step_info_t * step, int width,
 			  bool right_justify, char *suffix);
 int _print_step_prefix(job_step_info_t * step, int width,
 		       bool right_justify, char *suffix);
+int _print_step_std_err(job_step_info_t *step, int width, bool right_justify,
+			char *suffix);
+int _print_step_std_in(job_step_info_t *step, int width, bool right_justify,
+		       char *suffix);
+int _print_step_std_out(job_step_info_t *step, int width, bool right_justify,
+			char *suffix);
 int _print_step_user_id(job_step_info_t * step, int width,
 			bool right_justify, char *suffix);
 int _print_step_user_name(job_step_info_t * step, int width,

@@ -44,7 +44,7 @@
 
 static void _dump_wckeys(ctxt_t *ctxt, slurmdb_wckey_cond_t *wckey_cond)
 {
-	List wckey_list = NULL;
+	list_t *wckey_list = NULL;
 
 	if (!db_query_list(ctxt, &wckey_list, slurmdb_wckeys_get, wckey_cond))
 		DUMP_OPENAPI_RESP_SINGLE(OPENAPI_WCKEY_RESP, wckey_list, ctxt);
@@ -54,7 +54,7 @@ static void _dump_wckeys(ctxt_t *ctxt, slurmdb_wckey_cond_t *wckey_cond)
 
 static void _delete_wckey(ctxt_t *ctxt, slurmdb_wckey_cond_t *wckey_cond)
 {
-	List wckey_list = NULL;
+	list_t *wckey_list = NULL;
 
 	if (!db_query_list(ctxt, &wckey_list, slurmdb_wckeys_remove,
 			   wckey_cond))
@@ -85,7 +85,7 @@ static void _update_wckeys(ctxt_t *ctxt)
 
 		if (!wckey_list || list_is_empty(wckey_list)) {
 			resp_warn(ctxt, __func__,
-				  "ignoring empty or non-existant wckeys array for update");
+				  "ignoring empty or non-existent wckeys array for update");
 		} else {
 			update_wckeys(ctxt, true, wckey_list);
 		}
@@ -150,6 +150,6 @@ extern int op_handler_wckeys(ctxt_t *ctxt)
 	}
 
 cleanup:
-	slurmdb_destroy_wckey_rec(wckey_cond);
+	slurmdb_destroy_wckey_cond(wckey_cond);
 	return SLURM_SUCCESS;
 }

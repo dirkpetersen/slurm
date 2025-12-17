@@ -51,6 +51,9 @@
 #define DATA_LIST_MAGIC 0x1992F89F
 #define DATA_LIST_NODE_MAGIC 0x1921F89F
 
+/* max chars PRId64 could printf(). strlen("-9223372036854775808") = 20 */
+#define INT64_CHAR_MAX 20
+
 typedef struct data_list_s data_list_t;
 typedef struct data_list_node_s data_list_node_t;
 
@@ -143,6 +146,14 @@ typedef struct {
 	type_t match;
 } convert_args_t;
 
+#define CONVERT_DATA_FOREACH_LIST_DICT_ARGS_MAGIC 0x139414ab
+
+typedef struct {
+	int magic; /* CONVERT_DATA_FOREACH_LIST_DICT_ARGS_MAGIC */
+	data_t *src;
+	int64_t index;
+} convert_data_foreach_list_dict_args_t;
+
 static void _check_magic(const data_t *data);
 static void _release(data_t *data);
 static void _release_data_list_node(data_list_t *dl, data_list_node_t *dn);
@@ -171,27 +182,29 @@ static void _check_data_list_node_magic(const data_list_node_t *dn)
 static void _check_data_list_magic(const data_list_t *dl)
 {
 #ifndef NDEBUG
-	data_list_node_t *end = NULL;
-
 	xassert(dl);
 	xassert(dl->magic == DATA_LIST_MAGIC);
 
-	if (dl->begin) {
-		/* walk forwards verify */
-		int c = 0;
-		data_list_node_t *i = dl->begin;
+	if (slurm_conf.debug_flags & DEBUG_FLAG_DATA) {
+		data_list_node_t *end = NULL;
 
-		while (i) {
-			c++;
-			_check_data_list_node_magic(i);
-			end = i;
-			i = i->next;
+		if (dl->begin) {
+			/* walk forwards verify */
+			int c = 0;
+			data_list_node_t *i = dl->begin;
+
+			while (i) {
+				c++;
+				_check_data_list_node_magic(i);
+				end = i;
+				i = i->next;
+			}
+
+			xassert(c == dl->count);
 		}
 
-		xassert(c == dl->count);
+		xassert(end == dl->end);
 	}
-
-	xassert(end == dl->end);
 #endif /* !NDEBUG */
 }
 
@@ -200,15 +213,17 @@ static void _check_data_list_node_parent(const data_list_t *dl,
 					 const data_list_node_t *dn)
 {
 #ifndef NDEBUG
-	data_list_node_t *i = dl->begin;
-	while (i) {
-		if (i == dn)
-			return;
-		i = i->next;
-	}
+	if (slurm_conf.debug_flags & DEBUG_FLAG_DATA) {
+		data_list_node_t *i = dl->begin;
+		while (i) {
+			if (i == dn)
+				return;
+			i = i->next;
+		}
 
-	/* found an orphan? */
-	fatal_abort("%s: unexpected orphan node", __func__);
+		/* found an orphan? */
+		fatal_abort("%s: unexpected orphan node", __func__);
+	}
 #endif /* !NDEBUG */
 }
 
@@ -393,17 +408,17 @@ static void _check_magic(const data_t *data)
 	if (!data)
 		return;
 
-	xassert(data->type > TYPE_START);
-	xassert(data->type < TYPE_MAX);
 	xassert(data->magic == DATA_MAGIC);
 
-	if (data->type == TYPE_NULL)
-		/* make sure NULL type has a NULL value */
-		xassert(data->data.list_u == NULL);
-	if (data->type == TYPE_LIST)
-		_check_data_list_magic(data->data.list_u);
-	if (data->type == TYPE_DICT)
-		_check_data_list_magic(data->data.dict_u);
+	if (slurm_conf.debug_flags & DEBUG_FLAG_DATA) {
+		xassert(data->type > TYPE_START);
+		xassert(data->type < TYPE_MAX);
+
+		if (data->type == TYPE_LIST)
+			_check_data_list_magic(data->data.list_u);
+		if (data->type == TYPE_DICT)
+			_check_data_list_magic(data->data.dict_u);
+	}
 }
 
 static void _release(data_t *data)
@@ -426,8 +441,6 @@ static void _release(data_t *data)
 	}
 
 	data->type = TYPE_NONE;
-	/* always zero data in debug mode */
-	xassert(memset(&data->data, 0, sizeof(data->data)));
 }
 
 extern void data_free(data_t *data)
@@ -481,7 +494,6 @@ extern data_t *data_set_null(data_t *data)
 	_release(data);
 
 	data->type = TYPE_NULL;
-	xassert((memset(&data->data, 0, sizeof(data->data))));
 
 	log_flag(DATA, "%s: set %pD=null", __func__, data);
 
@@ -589,17 +601,19 @@ extern data_t *_data_set_string_own(data_t *data, char **value_ptr)
 	}
 
 #ifndef NDEBUG
-	char *old_value = value;
+	if (slurm_conf.debug_flags & DEBUG_FLAG_DATA) {
+		char *old_value = value;
 
-	/* check that the string was xmalloc()ed and actually has contents */
-	xassert(xsize(value) > 0);
-	/*
-	 * catch use after free by the caller by using the existing xfree()
-	 * functionality
-	 */
-	value = xstrdup(value);
-	/* releasing original string instead of NULLing original pointer */
-	xfree(old_value);
+		/* check that the string was xmalloc()ed and actually has contents */
+		xassert(xsize(value) > 0);
+		/*
+		 * catch use after free by the caller by using the existing xfree()
+		 * functionality
+		 */
+		value = xstrdup(value);
+		/* releasing original string instead of NULLing original pointer */
+		xfree(old_value);
+	}
 #endif
 
 	if ((len = strlen(value)) < sizeof(data->data.string_inline_u)) {
@@ -791,12 +805,11 @@ extern data_t *data_key_get(data_t *data, const char *key)
 
 extern data_t *data_key_get_int(data_t *data, int64_t key)
 {
-	char *key_str = xstrdup_printf("%"PRId64, key);
-	data_t *node = data_key_get(data, key_str);
+	char key_str[INT64_CHAR_MAX + 1];
 
-	xfree(key_str);
+	(void) snprintf(key_str, sizeof(key_str), "%"PRId64, key);
 
-	return node;
+	return data_key_get(data, key_str);
 }
 
 extern data_t *data_list_find_first(
@@ -901,12 +914,11 @@ extern data_t *data_key_set(data_t *data, const char *key)
 
 extern data_t *data_key_set_int(data_t *data, int64_t key)
 {
-	char *key_str = xstrdup_printf("%"PRId64, key);
-	data_t *node = data_key_set(data, key_str);
+	char key_str[INT64_CHAR_MAX + 1];
 
-	xfree(key_str);
+	(void) snprintf(key_str, sizeof(key_str), "%"PRId64, key);
 
-	return node;
+	return data_key_set(data, key_str);
 }
 
 extern bool data_key_unset(data_t *data, const char *key)
@@ -1209,11 +1221,10 @@ static data_for_each_cmd_t _foreach_join_str(const data_t *data, void *arg)
 	char *b = NULL;
 	merge_path_strings_t *args = arg;
 
-	data_get_string_converted(data, &b);
-
-	xstrfmtcatat(args->path, &args->at, "%s%s%s",
-		     (!args->path ? args->token : ""),
-		     (args->at ? args->token : ""), b);
+	if (!data_get_string_converted(data, &b))
+		xstrfmtcatat(args->path, &args->at, "%s%s%s",
+			     (!args->path ? args->token : ""),
+			     (args->at ? args->token : ""), b);
 
 	xfree(b);
 
@@ -1448,42 +1459,38 @@ extern int data_dict_for_each(data_t *d, DataDictForF f, void *arg)
 	return count;
 }
 
-static int _convert_data_string(data_t *data)
+static void _convert_data_string(data_t *data)
 {
 	_check_magic(data);
 
 	switch (data->type) {
 	case TYPE_STRING_INLINE:
 	case TYPE_STRING_PTR:
-		return SLURM_SUCCESS;
+		break;
 	case TYPE_BOOL:
 		data_set_string(data, (data->data.bool_u ? "true" : "false"));
-		return SLURM_SUCCESS;
+		break;
 	case TYPE_NULL:
 		data_set_string(data, "");
-		return SLURM_SUCCESS;
+		break;
 	case TYPE_FLOAT:
 	{
 		char *str = xstrdup_printf("%lf", data->data.float_u);
-		data_set_string(data, str);
-		xfree(str);
-		return SLURM_SUCCESS;
+		data_set_string_own(data, str);
+		break;
 	}
 	case TYPE_INT_64:
 	{
 		char *str = xstrdup_printf("%"PRId64, data->data.int_u);
-		data_set_string(data, str);
-		xfree(str);
-		return SLURM_SUCCESS;
+		data_set_string_own(data, str);
+		break;
 	}
 	default:
-		return ESLURM_DATA_CONV_FAILED;
+		break;
 	}
-
-	return ESLURM_DATA_CONV_FAILED;
 }
 
-static int _convert_data_force_bool(data_t *data)
+static void _convert_data_force_bool(data_t *data)
 {
 	_check_magic(data);
 
@@ -1495,23 +1502,21 @@ static int _convert_data_force_bool(data_t *data)
 	case TYPE_STRING_PTR:
 		/* non-empty string but not recognized format */
 		data_set_bool(data, true);
-		return SLURM_SUCCESS;
+		break;
 	case TYPE_BOOL:
-		return SLURM_SUCCESS;
+		break;
 	case TYPE_NULL:
 		data_set_bool(data, false);
-		return SLURM_SUCCESS;
+		break;
 	case TYPE_FLOAT:
 		data_set_bool(data, data->data.float_u != 0);
-		return SLURM_SUCCESS;
+		break;
 	case TYPE_INT_64:
 		data_set_bool(data, data->data.int_u != 0);
-		return SLURM_SUCCESS;
+		break;
 	default:
-		return ESLURM_DATA_CONV_FAILED;
+		break;
 	}
-
-	return ESLURM_DATA_CONV_FAILED;
 }
 
 static int _convert_data_null(data_t *data)
@@ -1812,6 +1817,66 @@ static int _convert_data_float(data_t *data)
 	return ESLURM_DATA_CONV_FAILED;
 }
 
+static data_for_each_cmd_t _convert_data_foreach_dict_list(const char *key,
+							   data_t *data,
+							   void *arg)
+{
+	data_t *src = arg;
+
+	_check_magic(src);
+
+	(void) data_move(data_list_append(src), data);
+
+	return DATA_FOR_EACH_CONT;
+}
+
+static int _convert_data_dict_list(data_t *src)
+{
+	int rc = SLURM_SUCCESS;
+	data_t *dict = data_new();
+
+	(void) data_move(dict, src);
+	(void) data_set_list(src);
+
+	if (data_dict_for_each(dict, _convert_data_foreach_dict_list, src) < 0)
+		rc = ESLURM_DATA_CONV_FAILED;
+
+	FREE_NULL_DATA(dict);
+	return rc;
+}
+
+static data_for_each_cmd_t _convert_data_foreach_list_dict(data_t *data,
+							   void *arg)
+{
+	convert_data_foreach_list_dict_args_t *args = arg;
+	xassert(args->magic == CONVERT_DATA_FOREACH_LIST_DICT_ARGS_MAGIC);
+
+	(void) data_move(data_key_set_int(args->src, args->index), data);
+	args->index++;
+
+	return DATA_FOR_EACH_CONT;
+}
+
+static int _convert_data_list_dict(data_t *src)
+{
+	int rc = SLURM_SUCCESS;
+	convert_data_foreach_list_dict_args_t args = {
+		.magic = CONVERT_DATA_FOREACH_LIST_DICT_ARGS_MAGIC,
+		.src = src,
+	};
+	data_t *list = data_new();
+
+	(void) data_move(list, src);
+	(void) data_set_dict(src);
+
+	if (data_list_for_each(list, _convert_data_foreach_list_dict, &args) <
+	    0)
+		rc = ESLURM_DATA_CONV_FAILED;
+
+	FREE_NULL_DATA(list);
+	return rc;
+}
+
 extern data_type_t data_convert_type(data_t *data, data_type_t match)
 {
 	_check_magic(data);
@@ -1821,47 +1886,54 @@ extern data_type_t data_convert_type(data_t *data, data_type_t match)
 
 	switch (match) {
 	case DATA_TYPE_STRING:
-		return _convert_data_string(data) ? DATA_TYPE_NONE :
-						    DATA_TYPE_STRING;
-	case DATA_TYPE_BOOL:
-		return _convert_data_force_bool(data) ? DATA_TYPE_NONE :
-							DATA_TYPE_BOOL;
-	case DATA_TYPE_INT_64:
-		return _convert_data_int(data, true) ? DATA_TYPE_NONE :
-						       DATA_TYPE_INT_64;
-	case DATA_TYPE_FLOAT:
-		return _convert_data_float(data) ? DATA_TYPE_NONE :
-						   DATA_TYPE_FLOAT;
-	case DATA_TYPE_NULL:
-		return _convert_data_null(data) ? DATA_TYPE_NONE :
-						  DATA_TYPE_NULL;
-	case DATA_TYPE_NONE:
-		if (!_convert_data_null(data))
-			return DATA_TYPE_NULL;
-
-		if (!_convert_data_int(data, false))
-			return DATA_TYPE_INT_64;
-
-		if (!_convert_data_float(data))
-			return DATA_TYPE_FLOAT;
-
-		if (!_convert_data_int(data, true))
-			return DATA_TYPE_INT_64;
-
-		if (!_convert_data_bool(data))
-			return DATA_TYPE_BOOL;
-
-		return DATA_TYPE_NONE;
-	case DATA_TYPE_DICT:
-	case DATA_TYPE_LIST:
-		/* data_parser should be used for this conversion instead. */
-		return DATA_TYPE_NONE;
-	case DATA_TYPE_MAX:
+		_convert_data_string(data);
 		break;
+	case DATA_TYPE_BOOL:
+		_convert_data_force_bool(data);
+		break;
+	case DATA_TYPE_INT_64:
+		(void) _convert_data_int(data, true);
+		break;
+	case DATA_TYPE_FLOAT:
+		(void) _convert_data_float(data);
+		break;
+	case DATA_TYPE_NULL:
+		(void) _convert_data_null(data);
+		break;
+	case DATA_TYPE_NONE:
+		/* If a conversion succeeds skip calling the others */
+		if (!_convert_data_null(data) ||
+		    !_convert_data_int(data, false) ||
+		    !_convert_data_float(data) ||
+		    !_convert_data_int(data, true) || !_convert_data_bool(data))
+			; /* blank on purpose */
+
+		break;
+	case DATA_TYPE_DICT:
+		if (data->type == TYPE_DICT)
+			return DATA_TYPE_DICT;
+		else if ((data->type == TYPE_LIST) &&
+			 !_convert_data_list_dict(data))
+			return DATA_TYPE_DICT;
+
+		/* data_parser should be used for this conversion instead. */
+		break;
+	case DATA_TYPE_LIST:
+		if (data->type == TYPE_LIST)
+			return DATA_TYPE_LIST;
+		else if ((data->type == TYPE_DICT) &&
+			 !_convert_data_dict_list(data))
+			return DATA_TYPE_LIST;
+
+		/* data_parser should be used for this conversion instead. */
+		break;
+	case DATA_TYPE_MAX:
+		fatal_abort("%s: unexpected data type", __func__);
+	default:
+		fatal_abort("%s: invalid conversion requested", __func__);
 	}
 
-	xassert(false);
-	return DATA_TYPE_NONE;
+	return data_get_type(data);
 }
 
 static data_for_each_cmd_t _convert_list_entry(data_t *data, void *arg)
@@ -2189,7 +2261,7 @@ extern const data_t *data_resolve_dict_path_const(const data_t *data,
 		xstrtrim(token);
 
 		if (!found || (found->type != TYPE_DICT)) {
-			found = false;
+			found = NULL;
 			break;
 		}
 
@@ -2332,7 +2404,6 @@ extern data_t *data_move(data_t *dest, data_t *src)
 	memmove(&dest->data, &src->data, sizeof(src->data));
 	dest->type = src->type;
 	src->type = TYPE_NULL;
-	xassert((memset(&src->data, 0, sizeof(src->data))));
 
 	return dest;
 }

@@ -28,7 +28,8 @@ modifications for it operation and is relatively self-contained.
 
 <p>Slurm is written in the C language and uses a GNU <b>autoconf</b> configuration
 engine. While initially written for Linux, other UNIX-like operating systems should
-be easy porting targets. Code should adhere to the <a href="coding_style.pdf">
+be easy porting targets. Code should adhere to the
+<a href="https://www.kernel.org/doc/html/latest/process/coding-style.html">
 Linux kernel coding style</a>. <i>(Some components of Slurm have been taken from
 various sources. Some of these components do not conform to the Linux kernel
 coding style. However, new code written for Slurm should follow these standards.)</i>
@@ -198,7 +199,7 @@ It will also manage these daemons: starting, signaling, restarting, and stopping
 
 <h2 id="Test-Suite">Test Suite<a class="slurm_link" href="#Test-Suite"></a></h2>
 <p>The <b>testsuite</b> files use Check, Expect and Pytest for testing Slurm in
-differents ways.</p>
+different ways.</p>
 
 <p>The Check tests are designed to unit test C code. Only with
 <i>make check</i>, without Slurm installed, they will validate that key C
@@ -208,7 +209,7 @@ functions work correctly.</p>
 directory.  These tests are executed after Slurm has been installed
 and the daemons initiated. These tests exercise all Slurm commands
 and options including stress tests.  The file <b>testsuite/expect/globals</b>
-contains the Expect test framewrok for all of the individual tests.  At
+contains the Expect test framework for all of the individual tests.  At
 the very least, you will need to set the <i>slurm_dir</i> variable to the correct
 value.  To avoid conflicts with other developers, you can override variable settings
 in a separate file named <b>testsuite/expect/globals.local</b>.</p>
@@ -235,20 +236,6 @@ Update <b>Makefile.am</b> files as needed then execute
 <h2 id="Tricks-of-the-Trade">Tricks of the Trade
 <a class="slurm_link" href="#Tricks-of-the-Trade"></a>
 </h2>
-<h3 id="front_end">HAVE_FRONT_END
-<a class="slurm_link" href="#front_end"></a>
-</h3>
-<p>You can make a single node appear to Slurm as a Linux cluster by running
-<i>configure</i> with the <i>--enable-front-end</i> option. This
-defines <b>HAVE_FRONT_END</b> with a non-zero value in the file <b>config.h</b>.
-All (fake) nodes should be defined in the <b>slurm.conf</b> file.
-These nodes should be configured with a single <b>NodeAddr</b> value
-indicating the node on which single <span class="commandline">slurmd</span> daemon
-executes.  Initiate one <span class="commandline">slurmd</span> and one
-<span class="commandline">slurmctld</span> daemon. Do not initiate too many
-simultaneous job steps to avoid overloading the
-<span class="commandline">slurmd</span> daemon executing them all.</p>
-
 <h3 id="multiple_slurmd_support">Multiple slurmd support
 <a class="slurm_link" href="#multiple_slurmd_support"></a>
 </h3>
@@ -336,7 +323,5 @@ systemctl start/stop/restart slurmd@nodeXYZ
 </pre>
 
 </p>
-
-<p style="text-align:center;">Last modified 6 August 2021</p>
 
 <!--#include virtual="footer.txt"-->

@@ -1,5 +1,5 @@
 /*****************************************************************************\
- *  src/common/switch.c - Generic switch (switch_g) for slurm
+ *  switch.c - Generic switch (switch_g) for slurm
  *****************************************************************************
  *  Copyright (C) 2002-2007 The Regents of the University of California.
  *  Copyright (C) 2008 Lawrence Livermore National Security.
@@ -58,24 +58,26 @@ typedef struct slurm_switch_ops {
 	uint32_t     (*plugin_id);
 	int          (*state_save)        ( void );
 	int          (*state_restore)     ( bool recover );
-	void         (*pack_jobinfo)      ( void *switch_jobinfo,
+	void         (*jobinfo_pack)      ( void *switch_jobinfo,
 					    buf_t *buffer,
 					    uint16_t protocol_version );
-	int          (*unpack_jobinfo)    ( void **switch_jobinfo,
+	int          (*jobinfo_unpack)    ( void **switch_jobinfo,
 					    buf_t *buffer,
 					    uint16_t protocol_version );
-	int          (*build_stepinfo)    ( switch_stepinfo_t **stepinfo,
-					    slurm_step_layout_t *step_layout,
+	void (*jobinfo_free)(void *switch_jobinfo);
+	int          (*stepinfo_build)    ( switch_stepinfo_t **stepinfo,
+					    void *switch_jobinfo,
 					    step_record_t *step_ptr );
-	void         (*duplicate_stepinfo)( switch_stepinfo_t *source,
+	void         (*stepinfo_duplicate)( switch_stepinfo_t *source,
 					    switch_stepinfo_t **dest);
-	void         (*free_stepinfo)     ( switch_stepinfo_t *stepinfo );
-	void         (*pack_stepinfo)     ( switch_stepinfo_t *stepinfo,
+	void         (*stepinfo_free)     ( switch_stepinfo_t *stepinfo );
+	void         (*stepinfo_pack)     ( switch_stepinfo_t *stepinfo,
 					    buf_t *buffer,
 					    uint16_t protocol_version );
-	int          (*unpack_stepinfo)   ( switch_stepinfo_t **stepinfo,
+	int          (*stepinfo_unpack)   ( switch_stepinfo_t **stepinfo,
 					    buf_t *buffer,
 					    uint16_t protocol_version );
+	bool (*setup_special_steps)(void);
 	int          (*job_preinit)       ( stepd_step_rec_t *step );
 	int          (*job_init)          ( stepd_step_rec_t *step );
 	int          (*job_postfini)      ( stepd_step_rec_t *step);
@@ -85,9 +87,11 @@ typedef struct slurm_switch_ops {
 					    uint32_t nprocs, uint32_t rank);
 	int          (*step_complete)     ( switch_stepinfo_t *stepinfo,
 					    char *nodelist );
-	void         (*job_start)         ( job_record_t *job_ptr );
+	int (*job_start)(job_record_t *job_ptr, bool test_only);
 	void         (*job_complete)      ( job_record_t *job_ptr );
+	uint32_t (*job_channel)(job_record_t *job_ptr, char *node_name);
 	int          (*fs_init)           ( stepd_step_rec_t *step );
+	void	     (*extern_step_fini)  ( uint32_t job_id);
 } slurm_switch_ops_t;
 
 /*
@@ -98,13 +102,15 @@ static const char *syms[] = {
 	"plugin_id",
 	"switch_p_save",
 	"switch_p_restore",
-	"switch_p_pack_jobinfo",
-	"switch_p_unpack_jobinfo",
-	"switch_p_build_stepinfo",
-	"switch_p_duplicate_stepinfo",
-	"switch_p_free_stepinfo",
-	"switch_p_pack_stepinfo",
-	"switch_p_unpack_stepinfo",
+	"switch_p_jobinfo_pack",
+	"switch_p_jobinfo_unpack",
+	"switch_p_jobinfo_free",
+	"switch_p_stepinfo_build",
+	"switch_p_stepinfo_duplicate",
+	"switch_p_stepinfo_free",
+	"switch_p_stepinfo_pack",
+	"switch_p_stepinfo_unpack",
+	"switch_p_setup_special_steps",
 	"switch_p_job_preinit",
 	"switch_p_job_init",
 	"switch_p_job_postfini",
@@ -112,7 +118,9 @@ static const char *syms[] = {
 	"switch_p_job_step_complete",
 	"switch_p_job_start",
 	"switch_p_job_complete",
+	"switch_p_job_channel",
 	"switch_p_fs_init",
+	"switch_p_extern_step_fini",
 };
 
 static slurm_switch_ops_t  *ops            = NULL;
@@ -162,7 +170,7 @@ extern int switch_g_init(bool only_default)
 	int retval = SLURM_SUCCESS;
 	char *plugin_type = "switch";
 	int i, j, plugin_cnt;
-	List plugin_names = NULL;
+	list_t *plugin_names = NULL;
 	_plugin_args_t plugin_args = {0};
 
 	slurm_mutex_lock( &context_lock );
@@ -265,75 +273,72 @@ extern int switch_g_restore(bool recover)
  * These are designed so that the payload will be skipped if the plugin
  * is unavailable.
  */
-extern void switch_g_pack_jobinfo(void *switch_jobinfo, buf_t *buffer,
+extern void switch_g_jobinfo_pack(void *switch_jobinfo, buf_t *buffer,
 				  uint16_t protocol_version)
 {
-	uint32_t length_position = 0, start = 0, end = 0;
+	dynamic_plugin_data_t plugin_data = {
+		.data = switch_jobinfo,
+	};
 
-	length_position = get_buf_offset(buffer);
-	pack32(0, buffer);
+	if (!switch_context_cnt) {
+		dynamic_plugin_data_pack(NULL, NULL, buffer, protocol_version);
+		return;
+	}
 
+	plugin_data.plugin_id = *ops[switch_context_default].plugin_id;
+
+	dynamic_plugin_data_pack(&plugin_data,
+				 *(ops[switch_context_default].jobinfo_pack),
+				 buffer, protocol_version);
+}
+
+static dynamic_plugin_data_unpack_func _get_unpack_func(
+	uint32_t plugin_id)
+{
+	if (plugin_id != *(ops[switch_context_default].plugin_id))
+		return NULL;
+
+	return *(ops[switch_context_default].jobinfo_unpack);
+}
+
+extern int switch_g_jobinfo_unpack(void **switch_jobinfo, buf_t *buffer,
+				   uint16_t protocol_version)
+{
+	dynamic_plugin_data_t *plugin_data = NULL;
+	int rc;
+
+	if (!switch_context_cnt) {
+		return dynamic_plugin_data_unpack(NULL, NULL, buffer,
+						  protocol_version);
+	}
+
+	rc = dynamic_plugin_data_unpack(&plugin_data, _get_unpack_func, buffer,
+					protocol_version);
+
+	if ((rc == SLURM_SUCCESS) && plugin_data) {
+		*switch_jobinfo = plugin_data->data;
+	}
+
+	xfree(plugin_data);
+
+	return rc;
+}
+
+/* Free switch_jobinfo struct when switch_g_job_complete can't be used */
+extern void switch_g_jobinfo_free(job_record_t *job_ptr)
+{
+	xassert(switch_context_cnt >= 0);
 	if (!switch_context_cnt)
 		return;
 
-	start = get_buf_offset(buffer);
-	pack32(*(ops[switch_context_default].plugin_id), buffer);
-	(*(ops[switch_context_default].pack_jobinfo))(switch_jobinfo, buffer,
-						      protocol_version);
-	end = get_buf_offset(buffer);
-	set_buf_offset(buffer, length_position);
-	pack32(end - start, buffer);
-	set_buf_offset(buffer, end);
+	(*(ops[switch_context_default].jobinfo_free))(job_ptr);
 }
 
-extern int switch_g_unpack_jobinfo(void **switch_jobinfo, buf_t *buffer,
-				   uint16_t protocol_version)
-{
-	uint32_t length = 0, switch_jobinfo_end = 0;
-	uint32_t plugin_id = 0;
-
-	safe_unpack32(&length, buffer);
-
-	if (remaining_buf(buffer) < length)
-		return SLURM_ERROR;
-
-	switch_jobinfo_end = get_buf_offset(buffer) + length;
-
-	if (!length || !switch_context_cnt) {
-		debug("%s: skipping switch_jobinfo data (%u)", __func__, length);
-		set_buf_offset(buffer, switch_jobinfo_end);
-		return SLURM_SUCCESS;
-	}
-
-	safe_unpack32(&plugin_id, buffer);
-
-	if (plugin_id != *(ops[switch_context_default].plugin_id)) {
-		debug("%s: skipping switch_jobinfo data", __func__);
-		set_buf_offset(buffer, switch_jobinfo_end);
-		return SLURM_SUCCESS;
-	}
-
-	if ((*(ops[switch_context_default].unpack_jobinfo))(switch_jobinfo,
-							    buffer,
-							    protocol_version))
-		goto unpack_error;
-
-	if (get_buf_offset(buffer) != switch_jobinfo_end) {
-		error("%s: plugin did not unpack until switch_jobinfo end",
-		      __func__);
-		return SLURM_ERROR;
-	}
-	return SLURM_SUCCESS;
-
-unpack_error:
-	return SLURM_ERROR;
-}
-
-extern int switch_g_build_stepinfo(dynamic_plugin_data_t **stepinfo,
-				   slurm_step_layout_t *step_layout,
+extern int switch_g_stepinfo_build(dynamic_plugin_data_t **stepinfo,
+				   void *switch_jobinfo,
 				   step_record_t *step_ptr)
 {
-	void **data = NULL;
+	void **stepinfo_data = NULL;
 	uint32_t plugin_id = switch_context_default;
 
 	xassert(switch_context_cnt >= 0);
@@ -342,13 +347,13 @@ extern int switch_g_build_stepinfo(dynamic_plugin_data_t **stepinfo,
 		return SLURM_SUCCESS;
 
 	*stepinfo = _create_dynamic_plugin_data(plugin_id);
-	data = &(*stepinfo)->data;
+	stepinfo_data = &(*stepinfo)->data;
 
-	return (*(ops[plugin_id].build_stepinfo))((switch_stepinfo_t **) data,
-						  step_layout, step_ptr);
+	return (*(ops[plugin_id].stepinfo_build))(
+		(switch_stepinfo_t **) stepinfo_data, switch_jobinfo, step_ptr);
 }
 
-extern void switch_g_duplicate_stepinfo(dynamic_plugin_data_t *source,
+extern void switch_g_stepinfo_duplicate(dynamic_plugin_data_t *source,
 					dynamic_plugin_data_t **dest)
 {
 	dynamic_plugin_data_t *dest_ptr = NULL;
@@ -362,80 +367,87 @@ extern void switch_g_duplicate_stepinfo(dynamic_plugin_data_t *source,
 	dest_ptr = _create_dynamic_plugin_data(plugin_id);
 	*dest = dest_ptr;
 
-	(*(ops[plugin_id].duplicate_stepinfo))
+	(*(ops[plugin_id].stepinfo_duplicate))
 		(source->data, (switch_stepinfo_t **) &dest_ptr->data);
 }
 
-extern void switch_g_free_stepinfo(dynamic_plugin_data_t *stepinfo)
+extern void switch_g_stepinfo_free(dynamic_plugin_data_t *stepinfo)
 {
-	xassert(switch_context_cnt >= 0);
-
 	if (!switch_context_cnt)
 		return;
 
 	if (stepinfo) {
 		if (stepinfo->data)
-			(*(ops[stepinfo->plugin_id].free_stepinfo))
+			(*(ops[stepinfo->plugin_id].stepinfo_free))
 				(stepinfo->data);
 		xfree(stepinfo);
 	}
 }
 
-extern void switch_g_pack_stepinfo(dynamic_plugin_data_t *stepinfo,
+extern void switch_g_stepinfo_pack(dynamic_plugin_data_t *stepinfo,
 				   buf_t *buffer, uint16_t protocol_version)
 {
 	void *data = NULL;
-	uint32_t plugin_id;
+	uint32_t length_position = 0, start = 0, end = 0, plugin_id;
 
 	xassert(switch_context_cnt >= 0);
 
-	if (!switch_context_cnt) {
-		/* Remove when 23.02 is no longer supported. */
-		if (protocol_version <= SLURM_23_02_PROTOCOL_VERSION)
-			pack32(SWITCH_PLUGIN_NONE, buffer);
-		return;
-	}
-
-	if (stepinfo) {
-		data = stepinfo->data;
-		plugin_id = stepinfo->plugin_id;
-	} else
-		plugin_id = switch_context_default;
-
 	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
+		length_position = get_buf_offset(buffer);
+		pack32(0, buffer);
+		start = get_buf_offset(buffer);
+
+		if (!switch_context_cnt) {
+			return;
+		}
+
+		if (stepinfo) {
+			data = stepinfo->data;
+			plugin_id = stepinfo->plugin_id;
+		} else
+			plugin_id = switch_context_default;
+
 		pack32(*(ops[plugin_id].plugin_id), buffer);
+
+		(*(ops[plugin_id].stepinfo_pack))(
+			data, buffer, protocol_version);
+
+		end = get_buf_offset(buffer);
+		set_buf_offset(buffer, length_position);
+		pack32(end - start, buffer);
+		set_buf_offset(buffer, end);
 	} else {
 		error("%s: protocol_version %hu not supported",
 		      __func__, protocol_version);
 		return;
 	}
-
-	(*(ops[plugin_id].pack_stepinfo))(data, buffer, protocol_version);
 }
 
-extern int switch_g_unpack_stepinfo(dynamic_plugin_data_t **stepinfo,
+extern int switch_g_stepinfo_unpack(dynamic_plugin_data_t **stepinfo,
 				    buf_t *buffer, uint16_t protocol_version)
 {
+	int i;
+	uint32_t length = 0, switch_stepinfo_end = 0, plugin_id;
 	dynamic_plugin_data_t *stepinfo_ptr = NULL;
 
 	xassert(switch_context_cnt >= 0);
 
-	if (!switch_context_cnt) {
-		/* Remove when 23.02 is no longer supported. */
-		if (protocol_version <= SLURM_23_02_PROTOCOL_VERSION) {
-			uint32_t plugin_id;
-			safe_unpack32(&plugin_id, buffer);
-			*stepinfo = NULL;
-		}
-		return SLURM_SUCCESS;
-	}
-
-	stepinfo_ptr = xmalloc(sizeof(dynamic_plugin_data_t));
-	*stepinfo = stepinfo_ptr;
+	if (protocol_version < SLURM_MIN_PROTOCOL_VERSION)
+		goto unpack_error;
 
 	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		int i;
-		uint32_t plugin_id;
+		safe_unpack32(&length, buffer);
+		switch_stepinfo_end = get_buf_offset(buffer) + length;
+		if (!(running_in_slurmstepd() || running_in_slurmctld()) ||
+		    !length || !switch_context_cnt)
+			goto skip_buf;
+
+		if (remaining_buf(buffer) < length)
+			return SLURM_ERROR;
+
+		stepinfo_ptr = xmalloc(sizeof(dynamic_plugin_data_t));
+		*stepinfo = stepinfo_ptr;
+
 		safe_unpack32(&plugin_id, buffer);
 		for (i = 0; i < switch_context_cnt; i++) {
 			if (*(ops[i].plugin_id) == plugin_id) {
@@ -443,17 +455,21 @@ extern int switch_g_unpack_stepinfo(dynamic_plugin_data_t **stepinfo,
 				break;
 			}
 		}
-		if (i >= switch_context_cnt) {
-			error("we don't have switch plugin type %u", plugin_id);
-			goto unpack_error;
-		}
-	} else
-		goto unpack_error;
 
-	if ((*(ops[stepinfo_ptr->plugin_id].unpack_stepinfo))
-	     ((switch_stepinfo_t **) &stepinfo_ptr->data, buffer,
-	      protocol_version))
-		goto unpack_error;
+		if (i >= switch_context_cnt) {
+			/*
+			 * We were sent a plugin that we don't know how to
+			 * handle so skip it if possible.
+			 */
+			debug("we don't have switch plugin type %u", plugin_id);
+			goto skip_buf;
+		}
+
+		if ((*(ops[stepinfo_ptr->plugin_id].stepinfo_unpack))
+		    ((switch_stepinfo_t **) &stepinfo_ptr->data, buffer,
+		     protocol_version))
+			goto unpack_error;
+	}
 
 	/*
 	 * Free nodeinfo_ptr if it is different from local cluster as it is not
@@ -461,18 +477,35 @@ extern int switch_g_unpack_stepinfo(dynamic_plugin_data_t **stepinfo,
 	 */
 	if ((stepinfo_ptr->plugin_id != switch_context_default) &&
 	    running_in_slurmctld()) {
-		switch_g_free_stepinfo(stepinfo_ptr);
+		switch_g_stepinfo_free(stepinfo_ptr);
 		*stepinfo = _create_dynamic_plugin_data(switch_context_default);
 	}
 
+	return SLURM_SUCCESS;
 
+skip_buf:
+	if (length) {
+		debug("%s: skipping switch_stepinfo data (%u)",
+		      __func__, length);
+		set_buf_offset(buffer, switch_stepinfo_end);
+	}
 	return SLURM_SUCCESS;
 
 unpack_error:
-	switch_g_free_stepinfo(stepinfo_ptr);
+	switch_g_stepinfo_free(stepinfo_ptr);
 	*stepinfo = NULL;
 	error("%s: unpack error", __func__);
 	return SLURM_ERROR;
+}
+
+extern bool switch_g_setup_special_steps(void)
+{
+	xassert(switch_context_cnt >= 0);
+
+	if (!switch_context_cnt)
+		return false;
+
+	return (*(ops[switch_context_default].setup_special_steps))();
 }
 
 extern int switch_g_job_preinit(stepd_step_rec_t *step)
@@ -547,14 +580,14 @@ extern int switch_g_job_step_complete(dynamic_plugin_data_t *stepinfo,
 	return (*(ops[plugin_id].step_complete))(data, nodelist);
 }
 
-extern void switch_g_job_start(job_record_t *job_ptr)
+extern int switch_g_job_start(job_record_t *job_ptr, bool test_only)
 {
 	xassert(switch_context_cnt >= 0);
 
 	if (!switch_context_cnt)
-		return;
+		return SLURM_SUCCESS;
 
-	(*(ops[switch_context_default].job_start))(job_ptr);
+	return (*(ops[switch_context_default].job_start))(job_ptr, test_only);
 }
 
 extern void switch_g_job_complete(job_record_t *job_ptr)
@@ -567,6 +600,16 @@ extern void switch_g_job_complete(job_record_t *job_ptr)
 	(*(ops[switch_context_default].job_complete))(job_ptr);
 }
 
+extern uint32_t switch_g_job_channel(job_record_t *job_ptr, char *node_name)
+{
+	xassert(switch_context_cnt >= 0);
+
+	if (!switch_context_cnt)
+		return NO_VAL;
+
+	return (*(ops[switch_context_default].job_channel))(job_ptr, node_name);
+}
+
 extern int switch_g_fs_init(stepd_step_rec_t *step)
 {
 	xassert(switch_context_cnt >= 0);
@@ -575,4 +618,14 @@ extern int switch_g_fs_init(stepd_step_rec_t *step)
 		return SLURM_SUCCESS;
 
 	return (*(ops[switch_context_default].fs_init))(step);
+}
+
+extern void switch_g_extern_step_fini(uint32_t job_id)
+{
+	xassert(switch_context_cnt >= 0);
+
+	if (!switch_context_cnt)
+		return;
+
+	(*(ops[switch_context_default].extern_step_fini))(job_id);
 }

@@ -46,8 +46,23 @@
 
 #include "src/common/macros.h"
 
-/* close all FDs >= a specified value */
+/*
+ * Close all FDs >= a specified value
+ * NOTE: logging file descriptors will be skipped
+ * WARNING: Will skip close()ing any open logging file descriptors
+ * IN fd - start closing file descriptors at fd
+ */
 extern void closeall(int fd);
+
+/*
+ * close all FDs >= a specified value except FDs in skipped array
+ * NOTE: logging file descriptors will be skipped
+ * WARNING: Will skip close()ing any open logging file descriptors
+ * IN fd - start closing file descriptors at fd
+ * IN skipped - array of file descriptors to skip (or NULL)
+ *              array must be terminated by -1 if provided
+ */
+extern void closeall_except(int fd, int *skipped);
 
 /* Close a specific file descriptor and replace it with -1 */
 extern void fd_close(int *fd);
@@ -68,6 +83,10 @@ void fd_set_nonblocking(int fd);
  */
 
 void fd_set_blocking(int fd);
+
+/* True is fd has O_NONBLOCK flag active */
+bool fd_is_nonblocking(int fd);
+
 /*
  * Sets the file descriptor (fd) for blocking I/O.
  */
@@ -97,9 +116,6 @@ pid_t fd_is_read_lock_blocked(int fd);
  *    (ie, if a write-lock is already being held on the file),
  *    returns the pid of the process holding the lock; o/w, returns 0.
  */
-
-/* return true if fd is writable right now */
-extern bool fd_is_writable(int fd);
 
 extern int wait_fd_readable(int fd, int time_limit);
 /* Wait for a file descriptor to be readable (up to time_limit seconds).
@@ -157,10 +173,11 @@ extern void fd_set_oob(int fd, int value);
 extern char *poll_revents_to_str(const short revents);
 
 /*
- * Pass an open fd back over a pipe.
+ * Pass an open fd back over a socket.
  */
-extern void send_fd_over_pipe(int socket, int fd);
-extern int receive_fd_over_pipe(int socket);
+extern void send_fd_over_socket(int socket, int fd);
+extern void send_fd_over_socket_payload(int socket, int fd, char *payload);
+extern int receive_fd_over_socket(int socket);
 
 /*
  * Make full directory path.
@@ -197,6 +214,18 @@ extern int rmdir_recursive(const char *path, bool remove_top);
  */
 extern int fd_get_readable_bytes(int fd, int *readable_ptr,
 				 const char *con_name);
+
+/*
+ * Use ioctl(TIOCOUTQ) to get number of bytes in buffer waiting for kernel to
+ * send to destination
+ * IN fd - file descriptor to query
+ * IN/OUT bytes_ptr - Pointer to populate if ioctl() is able to query
+ *	successfully. Only changed if RET=SLURM_SUCCESS.
+ * IN con_name - descriptive name for fd connection (for logging)
+ * RET SLURM_SUCCESS or error
+ */
+extern int fd_get_buffered_output_bytes(int fd, int *bytes_ptr,
+					const char *con_name);
 
 /*
  * Get TCP MSS (Max Segment Size) of a given socket

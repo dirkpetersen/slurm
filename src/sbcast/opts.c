@@ -66,10 +66,117 @@
 /* getopt_long options, integers but not characters */
 
 /* FUNCTIONS */
+static void _fill_in_selected_step_from_controller();
+static void _fill_in_selected_step_from_env(void);
+static void _fill_in_selected_steps_from_env(char *het_size_str);
 static void     _help( void );
+static bool _need_hetjob_components(job_info_msg_t **job_info_msg);
 static uint32_t _map_size( char *buf );
 static void     _print_options( void );
 static void     _usage( void );
+
+static bool _need_hetjob_components(job_info_msg_t **job_info_msg)
+{
+	slurm_job_info_t *jobs = NULL;
+	int rc;
+
+	/* If <jobid>+<offset> specified we target single component. */
+	if (params.selected_step->het_job_offset != NO_VAL)
+		return false;
+
+	if (!job_info_msg) {
+		error("job_info_msg pointer is NULL before calling slurm_load_job().");
+		exit(1);
+	}
+
+	if ((rc = slurm_load_job(job_info_msg,
+				 params.selected_step->step_id.job_id,
+				 SHOW_ALL)) != SLURM_SUCCESS) {
+		error("Failed to load JobId=%u: '%s'",
+		      params.selected_step->step_id.job_id,
+		      slurm_strerror(rc));
+		exit(1);
+	} else if (!*job_info_msg || (((*job_info_msg)->record_count) <= 0)) {
+		error("Failed to load JobId=%u: No jobs returned.",
+		      params.selected_step->step_id.job_id);
+		exit(1);
+	}
+
+	jobs = (*job_info_msg)->job_array;
+
+	if (jobs->step_id.job_id != jobs->het_job_id)
+		return false;
+
+	if ((*job_info_msg)->record_count < 2)
+		fatal("slurm_load_job(%u) returned less than 2 records",
+		      params.selected_step->step_id.job_id);
+
+	/* <jobid> without +<offset> and its HetJob leader */
+	return true;
+}
+
+static void _fill_in_selected_step_from_controller()
+{
+	job_info_msg_t *job_info_msg = NULL;
+	slurm_job_info_t *job = NULL;
+	char *job_id_str = NULL;
+
+	if (!_need_hetjob_components(&job_info_msg))
+		return;
+
+	job = job_info_msg->job_array;
+	params.selected_steps = list_create(slurm_destroy_selected_step);
+
+	for (int i = 0; i < job_info_msg->record_count; i++, job++) {
+		job_id_str = xstrdup_printf("%u+%u", job->het_job_id,
+					    job->het_job_offset);
+		list_append(params.selected_steps,
+			    slurm_parse_step_str(job_id_str));
+		xfree(job_id_str);
+	}
+
+	xassert(list_count(params.selected_steps) >= 2);
+}
+
+static void _fill_in_selected_steps_from_env(char *het_size_str)
+{
+	char *name = NULL, *job_id_str = NULL;
+	uint32_t het_size;
+
+	if (parse_uint32(het_size_str, &het_size) || (het_size < 2))
+		fatal("Invalid environment SLURM_HET_SIZE value: %s",
+		      het_size_str);
+
+	params.selected_steps = list_create(slurm_destroy_selected_step);
+
+	for (int i = 0; i < het_size; i++) {
+		name = xstrdup_printf("SLURM_JOB_ID_HET_GROUP_%d", i);
+		if (!(job_id_str = getenv(name)))
+			fatal("getenv(%s) returned NULL", name);
+		xfree(name);
+		list_append(params.selected_steps,
+			    slurm_parse_step_str(job_id_str));
+	}
+}
+
+static void _fill_in_selected_step_from_env(void)
+{
+	char *env_val = NULL;
+
+	if ((env_val = getenv("SLURM_HET_SIZE"))) {
+		_fill_in_selected_steps_from_env(env_val);
+		return;
+	}
+
+	if (!(env_val = getenv("SLURM_JOB_ID"))) {
+		error("Need a job id to run this command.  "
+		      "Run from within a Slurm job or use the "
+		      "--jobid option.");
+		exit(1);
+	}
+	slurm_destroy_selected_step(params.selected_step);
+	params.selected_step = slurm_parse_step_str(env_val);
+}
 
 /*
  * parse_command_line, fill in params data structure with data
@@ -87,6 +194,8 @@ extern void parse_command_line(int argc, char **argv)
 		{"treewidth",    required_argument, 0, OPT_LONG_TREE_WIDTH},
 		{"force",     no_argument,       0, 'f'},
 		{"jobid",     required_argument, 0, 'j'},
+		{"no-allocation", optional_argument, 0, 'Z'},
+		{"nodelist",  optional_argument, 0, 'w'},
 		{"send-libs", optional_argument, 0, OPT_LONG_SEND_LIBS},
 		{"preserve",  no_argument,       0, 'p'},
 		{"size",      required_argument, 0, 's'},
@@ -148,7 +257,7 @@ extern void parse_command_line(int argc, char **argv)
 		params.timeout = (atoi(env_val) * 1000);
 
 	optind = 0;
-	while ((opt_char = getopt_long(argc, argv, "C::fF:j:ps:t:vV",
+	while ((opt_char = getopt_long(argc, argv, "C::fF:j:ps:t:vVw:Z",
 			long_options, &option_index)) != -1) {
 		switch (opt_char) {
 		case (int)'?':
@@ -174,6 +283,7 @@ extern void parse_command_line(int argc, char **argv)
 				params.tree_width = atoi(optarg);
 			break;
 		case (int)'j':
+			slurm_destroy_selected_step(params.selected_step);
 			params.selected_step = slurm_parse_step_str(optarg);
 			break;
 		case (int)'p':
@@ -201,6 +311,13 @@ extern void parse_command_line(int argc, char **argv)
 		case (int) 'V':
 			print_slurm_version();
 			exit(0);
+		case (int) 'w':
+			xfree(params.node_list);
+			params.node_list = xstrdup(optarg);
+			break;
+		case (int) 'Z':
+			params.flags |= BCAST_FLAG_NO_JOB;
+			break;
 		case (int) OPT_LONG_HELP:
 			_help();
 			exit(0);
@@ -221,16 +338,14 @@ extern void parse_command_line(int argc, char **argv)
 		exit(1);
 	}
 
-	if (!params.selected_step ||
-	    (params.selected_step->step_id.job_id == NO_VAL)) {
-		if (!(env_val = getenv("SLURM_JOB_ID"))) {
-			error("Need a job id to run this command.  "
-			      "Run from within a Slurm job or use the "
-			      "--jobid option.");
-			exit(1);
-		}
-		slurm_destroy_selected_step(params.selected_step);
-		params.selected_step = slurm_parse_step_str(env_val);
+	if ((!params.selected_step ||
+	     (params.selected_step->step_id.job_id == NO_VAL)) &&
+	    !(params.flags & BCAST_FLAG_NO_JOB)) {
+		_fill_in_selected_step_from_env();
+	} else if ((params.selected_step &&
+		    params.selected_step->step_id.job_id != NO_VAL) &&
+		   !(params.flags & BCAST_FLAG_NO_JOB)) {
+		_fill_in_selected_step_from_controller();
 	}
 
 	params.src_fname = xstrdup(argv[optind]);
@@ -254,6 +369,16 @@ extern void parse_command_line(int argc, char **argv)
 
 	if (params.dst_fname[strlen(params.dst_fname) - 1] == '/') {
 		error("Target filename cannot be a directory.");
+		exit(1);
+	}
+
+	if ((params.flags & BCAST_FLAG_NO_JOB) && (params.selected_step)) {
+		error("--no-allocation/-Z and --jobid/-j options are mutually exclusive");
+		exit(1);
+	}
+
+	if ((params.flags & BCAST_FLAG_NO_JOB) && (!params.node_list)) {
+		error("--nodelist/-w is required with --no-allocation/-Z.");
 		exit(1);
 	}
 

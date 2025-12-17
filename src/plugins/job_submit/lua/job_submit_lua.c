@@ -66,34 +66,10 @@
 #define _DEBUG 0
 #define MIN_ACCTG_FREQUENCY 30
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-const char plugin_name[]       	= "Job submit lua plugin";
-const char plugin_type[]       	= "job_submit/lua";
-const uint32_t plugin_version   = SLURM_VERSION_NUMBER;
+/* Required Slurm plugin symbols: */
+const char plugin_name[] = "Job submit lua plugin";
+const char plugin_type[] = "job_submit/lua";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
 static char *lua_script_path;
 static time_t lua_script_last_loaded = (time_t) 0;
@@ -117,18 +93,6 @@ typedef struct {
 	uint32_t user_id;
 } foreach_part_list_args_t;
 
-/* These are defined here so when we link with something other than
- * the slurmctld we will have these symbols defined.  They will get
- * overwritten when linking with the slurmctld.
- */
-#if defined (__APPLE__)
-extern uint16_t accounting_enforce __attribute__((weak_import));
-extern void *acct_db_conn  __attribute__((weak_import));
-#else
-uint16_t accounting_enforce = 0;
-void *acct_db_conn = NULL;
-#endif
-
 /*****************************************************************************\
  * We've provided a simple example of the type of things you can do with this
  * plugin. If you develop another plugin that may be of interest to others
@@ -143,11 +107,29 @@ static char *_get_default_account(uint32_t user_id)
 	memset(&user, 0, sizeof(slurmdb_user_rec_t));
 	user.uid = user_id;
 	if (assoc_mgr_fill_in_user(acct_db_conn, &user, accounting_enforce,
-				   NULL, false) != SLURM_ERROR) {
+				   NULL, false) == SLURM_SUCCESS) {
 		return user.default_acct;
 	} else {
 		return NULL;
 	}
+}
+
+static int _fill_assoc(uint32_t user_id, char *account, char *partition,
+		       slurmdb_assoc_rec_t *assoc)
+{
+	xassert(assoc);
+
+	memset(assoc, 0, sizeof(slurmdb_assoc_rec_t));
+	assoc->uid = user_id;
+	assoc->partition = partition;
+	if (account) {
+		assoc->acct = account;
+	} else {
+		assoc->acct = _get_default_account(user_id);
+	}
+
+	return assoc_mgr_fill_in_assoc(acct_db_conn, assoc, accounting_enforce,
+				       NULL, false);
 }
 
 /* Get the default QOS for an association (or NULL if not present) */
@@ -157,17 +139,7 @@ static char *_get_default_qos(uint32_t user_id, char *account, char *partition)
 	slurmdb_qos_rec_t qos;
 	uint32_t qos_id = 0;
 
-	memset(&assoc, 0, sizeof(slurmdb_assoc_rec_t));
-	assoc.uid = user_id;
-	assoc.partition = partition;
-	if (account) {
-		assoc.acct = account;
-	} else {
-		assoc.acct = _get_default_account(user_id);
-	}
-
-	if (assoc_mgr_fill_in_assoc(acct_db_conn, &assoc, accounting_enforce,
-				    NULL, false) != SLURM_ERROR)
+	if (_fill_assoc(user_id, account, partition, &assoc) == SLURM_SUCCESS)
 		qos_id = assoc.def_qos_id;
 
 	if (!qos_id)
@@ -175,31 +147,65 @@ static char *_get_default_qos(uint32_t user_id, char *account, char *partition)
 
 	memset(&qos, 0, sizeof(slurmdb_qos_rec_t));
 	qos.id = qos_id;
-	if (assoc_mgr_fill_in_qos(acct_db_conn, &qos, accounting_enforce,
-				  NULL, false) != SLURM_ERROR) {
+	if (assoc_mgr_fill_in_qos(acct_db_conn, &qos, accounting_enforce, NULL,
+				  false) == SLURM_SUCCESS) {
 		return qos.name;
 	} else {
 		return NULL;
 	}
 }
 
+static int _qos_id_to_qos_name(void *x, void *arg)
+{
+	char *qos_id = x;
+	list_t *qos_name_list = arg;
+	slurmdb_qos_rec_t qos = { 0 };
+
+	qos.id = atoi(qos_id);
+
+	if (assoc_mgr_fill_in_qos(acct_db_conn, &qos, accounting_enforce, NULL,
+				  false) != SLURM_SUCCESS) {
+		return 0;
+	}
+
+	slurm_addto_char_list(qos_name_list, qos.name);
+
+	return 0;
+}
+
+/* Get all possible QOS for an association (or NULL if not present) */
+static char *_get_assoc_qos(uint32_t user_id, char *account, char *partition)
+{
+	slurmdb_assoc_rec_t assoc;
+	list_t *qos_name_list;
+	char *qos_name_list_str;
+	list_t *qos_list = NULL;
+
+	if (_fill_assoc(user_id, account, partition, &assoc) == SLURM_SUCCESS)
+		qos_list = assoc.qos_list;
+
+	if (!qos_list)
+		return NULL;
+
+	qos_name_list = list_create(xfree_ptr);
+	list_for_each_ro(qos_list, _qos_id_to_qos_name, qos_name_list);
+
+	qos_name_list_str = slurm_char_list_to_xstr(qos_name_list);
+
+	list_destroy(qos_name_list);
+
+	return qos_name_list_str;
+}
+
 /* Get the comment for an association (or NULL if not present) */
-static char *_get_assoc_comment(uint32_t user_id, char *account)
+static char *_get_assoc_comment(uint32_t user_id, char *account,
+				char *partition)
 {
 	slurmdb_assoc_rec_t assoc;
 	char *comment = NULL;
 
-	memset(&assoc, 0, sizeof(slurmdb_assoc_rec_t));
-	assoc.uid = user_id;
-	if (account) {
-		assoc.acct = account;
-	} else {
-		assoc.acct = _get_default_account(user_id);
-	}
-
-	if (assoc_mgr_fill_in_assoc(acct_db_conn, &assoc, accounting_enforce,
-				    NULL, false) != SLURM_ERROR)
-		comment = xstrdup(assoc.comment);
+	if (_fill_assoc(user_id, account, partition, &assoc) == SLURM_SUCCESS)
+		comment = assoc.comment;
 
 	return comment;
 }
@@ -525,7 +531,14 @@ static int _get_job_req_field(const job_desc_msg_t *job_desc, const char *name)
 		lua_pushstring(L, job_desc->array_inx);
 	} else if (!xstrcmp(name, "assoc_comment")) {
 		lua_pushstring(L, _get_assoc_comment(job_desc->user_id,
-						     job_desc->account));
+						     job_desc->account,
+						     job_desc->partition));
+	} else if (!xstrcmp(name, "assoc_qos")) {
+		char *assoc_qos_str = _get_assoc_qos(job_desc->user_id,
+						     job_desc->account,
+						     job_desc->partition);
+		lua_pushstring(L, assoc_qos_str);
+		xfree(assoc_qos_str);
 	} else if (!xstrcmp(name, "batch_features")) {
 		lua_pushstring(L, job_desc->batch_features);
 	} else if (!xstrcmp(name, "begin_time")) {
@@ -616,6 +629,11 @@ static int _get_job_req_field(const job_desc_msg_t *job_desc, const char *name)
 	} else if (!xstrcmp(name, "network")) {
 		lua_pushstring(L, job_desc->network);
 	} else if (!xstrcmp(name, "nice")) {
+		/*
+		 * nice will be NO_VAL when unset or offset by NICE_OFFSET.
+		 * Decrement nice by NICE_OFFSET in job_submit.lua if the value
+		 * needs to be human readable.
+		 */
 		lua_pushnumber(L, job_desc->nice);
 	} else if (!xstrcmp(name, "ntasks_per_board")) {
 		lua_pushnumber(L, job_desc->ntasks_per_board);
@@ -667,6 +685,8 @@ static int _get_job_req_field(const job_desc_msg_t *job_desc, const char *name)
 		lua_pushstring(L, job_desc->reservation);
 	} else if (!xstrcmp(name, "script")) {
 		lua_pushstring(L, job_desc->script);
+	} else if (!xstrcmp(name, "segment_size")) {
+		lua_pushnumber(L, job_desc->segment_size);
 	} else if (!xstrcmp(name, "shared") ||
 		   !xstrcmp(name, "oversubscribe")) {
 		lua_pushnumber(L, job_desc->shared);
@@ -924,6 +944,10 @@ static int _set_job_req_field(lua_State *L)
 		if (strlen(value_str))
 			job_desc->name = xstrdup(value_str);
 	} else if (!xstrcmp(name, "nice")) {
+		/*
+		 * nice should be NO_VAL when unset or incremented by
+		 * NICE_OFFSET by the job_submit.lua script.
+		 */
 		job_desc->nice = luaL_checknumber(L, 3);
 	} else if (!xstrcmp(name, "ntasks_per_gpu")) {
 		job_desc->ntasks_per_tres = luaL_checknumber(L, 3);
@@ -983,6 +1007,8 @@ static int _set_job_req_field(lua_State *L)
 		xfree(job_desc->script);
 		if (strlen(value_str))
 			job_desc->script = xstrdup(value_str);
+	} else if (!xstrcmp(name, "segment_size")) {
+		job_desc->segment_size = luaL_checknumber(L, 3);
 	} else if (!xstrcmp(name, "selinux_context")) {
 		value_str = luaL_checkstring(L, 3);
 		xfree(job_desc->selinux_context);
@@ -1301,21 +1327,7 @@ static const struct luaL_Reg slurm_functions [] = {
 
 static void _register_local_output_functions(lua_State *L)
 {
-	char *unpack_str;
-	char tmp_string[100];
-
-#if LUA_VERSION_NUM == 501
-	unpack_str = "unpack";
-#else
-	unpack_str = "table.unpack";
-#endif
-
 	slurm_lua_table_register(L, NULL, slurm_functions);
-	snprintf(tmp_string, sizeof(tmp_string),
-		 "slurm.user_msg (string.format(%s({...})))",
-		 unpack_str);
-	luaL_loadstring(L, tmp_string);
-	lua_setfield(L, -2, "log_user");
 
 	/* Must be always done after we register the slurm_functions */
 	lua_setglobal(L, "slurm");
@@ -1352,7 +1364,7 @@ static void _loadscript_extra(lua_State *st)
  *   let alone called from multiple threads. Therefore, locking
  *   is unnecessary here.
  */
-int init(void)
+extern int init(void)
 {
 	int rc = SLURM_SUCCESS;
 
@@ -1363,10 +1375,10 @@ int init(void)
 	return slurm_lua_loadscript(&L, "job_submit/lua",
 				    lua_script_path, req_fxns,
 				    &lua_script_last_loaded,
-				    _loadscript_extra);
+				    _loadscript_extra, NULL);
 }
 
-int fini(void)
+extern void fini(void)
 {
 	if (L) {
 		debug3("%s: Unloading Lua script", __func__);
@@ -1377,8 +1389,6 @@ int fini(void)
 	xfree(lua_script_path);
 
 	slurm_lua_fini();
-
-	return SLURM_SUCCESS;
 }
 
 
@@ -1387,11 +1397,14 @@ extern int job_submit(job_desc_msg_t *job_desc, uint32_t submit_uid,
 		      char **err_msg)
 {
 	int rc;
+	char *err_str = NULL;
+
 	slurm_mutex_lock (&lua_lock);
 
 	rc = slurm_lua_loadscript(&L, "job_submit/lua",
 				  lua_script_path, req_fxns,
-				  &lua_script_last_loaded, _loadscript_extra);
+				  &lua_script_last_loaded, _loadscript_extra,
+				  NULL);
 
 	if (rc != SLURM_SUCCESS)
 		goto out;
@@ -1412,9 +1425,18 @@ extern int job_submit(job_desc_msg_t *job_desc, uint32_t submit_uid,
 	lua_pushnumber(L, submit_uid);
 	slurm_lua_stack_dump(
 		"job_submit/lua", "job_submit, before lua_pcall", L);
-	if (lua_pcall(L, 3, 1, 0) != 0) {
+	if ((rc = slurm_lua_pcall(L, 3, 1, &err_str, __func__))) {
+		if (!err_str)
+			err_str = xstrdup_printf("Lua %s failed: %s",
+						 lua_script_path,
+						 slurm_strerror(rc));
+
 		error("%s/lua: %s: %s",
-		      __func__, lua_script_path, lua_tostring(L, -1));
+		      __func__, lua_script_path, err_str);
+
+		/* Replace user_msg as err_msg with Lua error */
+		xfree(user_msg);
+		SWAP(*err_msg, err_str);
 	} else {
 		if (lua_isnumber(L, -1)) {
 			rc = lua_tonumber(L, -1);
@@ -1433,6 +1455,8 @@ extern int job_submit(job_desc_msg_t *job_desc, uint32_t submit_uid,
 	}
 
 out:	slurm_mutex_unlock (&lua_lock);
+
+	xfree(err_str);
 	return rc;
 }
 
@@ -1441,13 +1465,16 @@ extern int job_modify(job_desc_msg_t *job_desc, job_record_t *job_ptr,
 		      uint32_t submit_uid, char **err_msg)
 {
 	int rc;
+	char *err_str = NULL;
+
 	slurm_mutex_lock (&lua_lock);
 
 	rc = slurm_lua_loadscript(&L, "job_submit/lua",
 				  lua_script_path, req_fxns,
-				  &lua_script_last_loaded, _loadscript_extra);
+				  &lua_script_last_loaded, _loadscript_extra,
+				  NULL);
 
-	if (rc == SLURM_ERROR)
+	if (rc != SLURM_SUCCESS)
 		goto out;
 
 	/*
@@ -1467,9 +1494,18 @@ extern int job_modify(job_desc_msg_t *job_desc, job_record_t *job_ptr,
 	lua_pushnumber(L, submit_uid);
 	slurm_lua_stack_dump(
 		"job_submit/lua", "job_modify, before lua_pcall", L);
-	if (lua_pcall(L, 4, 1, 0) != 0) {
+	if ((rc = slurm_lua_pcall(L, 4, 1, &err_str, __func__))) {
+		if (!err_str)
+			err_str = xstrdup_printf("Lua %s failed: %s",
+						 lua_script_path,
+						 slurm_strerror(rc));
+
 		error("%s/lua: %s: %s",
-		      __func__, lua_script_path, lua_tostring(L, -1));
+		      __func__, lua_script_path, err_str);
+
+		/* Replace user_msg as err_msg with Lua error */
+		xfree(user_msg);
+		SWAP(*err_msg, err_str);
 	} else {
 		if (lua_isnumber(L, -1)) {
 			rc = lua_tonumber(L, -1);
@@ -1488,5 +1524,7 @@ extern int job_modify(job_desc_msg_t *job_desc, job_record_t *job_ptr,
 	}
 
 out:	slurm_mutex_unlock (&lua_lock);
+
+	xfree(err_str);
 	return rc;
 }

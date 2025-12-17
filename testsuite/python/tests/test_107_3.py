@@ -160,7 +160,7 @@ def setup_wckeys():
 @pytest.fixture
 def setup_partition2_down(setup_partitions):
     """Set partitions[2] down so we ensure that matching jobs will run on
-    partition[0] and mistmatching ones in partition[1]"""
+    partition[0] and mismatching ones in partition[1]"""
     atf.run_command(
         f"scontrol update partitionname={partitions[2]} state=down",
         user=atf.properties["slurm-user"],
@@ -170,7 +170,7 @@ def setup_partition2_down(setup_partitions):
 
 @pytest.fixture
 def setup_reservations_used(setup_reservations):
-    """'Run an exlusive job in reservations[1] to ensure that jobs run in
+    """'Run an exclusive job in reservations[1] to ensure that jobs run in
     reservations[0]"""
     job_id = atf.submit_job_sbatch(
         f"--exclusive --reservation={reservations[1]} --wrap 'srun sleep infinity'",
@@ -186,7 +186,7 @@ def submit_job(job_list, opt, opt_val, expected_state):
     test_opt = ""
     other_opts = ""
 
-    if opt != None:
+    if opt is not None:
         test_opt = f"--{opt}={opt_val}"
     if expected_state == "PENDING":
         other_opts = "--hold"
@@ -202,8 +202,8 @@ def submit_job(job_list, opt, opt_val, expected_state):
 
 
 def submit_het_job(job_list, opt, opt_val_1, opt_val_2, expected_state):
-    het_opts_1 = f"-n1 -c1 --mem=10"
-    het_opts_2 = f"-n1 -c1 --mem=10"
+    het_opts_1 = "-n1 -c1 --mem=10"
+    het_opts_2 = "-n1 -c1 --mem=10"
     other_opts = ""
 
     if expected_state == "PENDING":
@@ -225,9 +225,9 @@ def submit_het_job(job_list, opt, opt_val_1, opt_val_2, expected_state):
     job_list.append(job_id + 1)
 
 
-def wait_for_jobs(job_list, expected_state, timeout):
+def wait_for_jobs(job_list, expected_state):
     for job_id in job_list:
-        atf.wait_for_job_state(job_id, expected_state, fatal=True, timeout=timeout)
+        atf.wait_for_job_state(job_id, expected_state, fatal=True)
 
 
 def run_scancel(opt, opt_filter, job_list):
@@ -409,9 +409,9 @@ def test_filter(
 
     matching_jobs = []
     mismatching_jobs = []
-    matching_hetjobs = []
-    mismatching_hetjobs = []
-    het_jobs = []
+    # matching_hetjobs = []
+    # mismatching_hetjobs = []
+    # het_jobs = []
 
     logging.info(
         f"Test scancel --ctld --{scancel_opt}={scancel_val}, sbatch --{sbatch_opt}, job match:{sbatch_match_val}, job mismatch:{sbatch_mismatch_val}"
@@ -422,12 +422,12 @@ def test_filter(
     submit_job(mismatching_jobs, sbatch_opt, sbatch_mismatch_val, mismatch_job_state)
 
     # Waiting for jobs
-    wait_for_jobs(matching_jobs, match_job_state, 60)
-    wait_for_jobs(mismatching_jobs, mismatch_job_state, 60)
+    wait_for_jobs(matching_jobs, match_job_state)
+    wait_for_jobs(mismatching_jobs, mismatch_job_state)
 
     # Just to show jobs in the logs
     atf.run_command_output(
-        f"echo ''; squeue --Format=JobId,Account,Name,Nodelist,Partition,Qos,Reservation,State,UserName,WCKey"
+        "echo ''; squeue --Format=JobId,Account,Name,Nodelist,Partition,Qos,Reservation,State,UserName,WCKey"
     )
 
     # Cancel jobs with --scancel_opt=scancel:val
@@ -435,8 +435,8 @@ def test_filter(
 
     # Wait for jobs matching the signal filter to finish
     # And verify that jobs not matching the signal filter are still in their expected state
-    wait_for_jobs(matching_jobs, "CANCELLED", 10)
-    wait_for_jobs(mismatching_jobs, mismatch_job_state, 60)
+    wait_for_jobs(matching_jobs, "CANCELLED")
+    wait_for_jobs(mismatching_jobs, mismatch_job_state)
 
 
 @pytest.mark.parametrize(
@@ -454,6 +454,12 @@ def test_filter_hetjobs(
     match_job_state,
     mismatch_job_state,
 ):
+    if atf.get_version("sbin/slurmdbd") < (25, 5):
+        if fixture == "setup_wckeys":
+            pytest.xfail(
+                "Ticket 20771: Setting/clearing default wckeys at submit time was fixed in 25.05"
+            )
+
     # Custom fixture may be necessary
     if fixture is not None:
         request.getfixturevalue(fixture)
@@ -492,15 +498,15 @@ def test_filter_hetjobs(
 
     # Waiting for hetjobs
     if scancel_opt != "nodelist":
-        wait_for_jobs(matching_hetjobs, match_job_state, 60)
-        wait_for_jobs(mismatching_hetjobs, mismatch_job_state, 60)
+        wait_for_jobs(matching_hetjobs, match_job_state)
+        wait_for_jobs(mismatching_hetjobs, mismatch_job_state)
     if scancel_opt != "state":
-        wait_for_jobs([het_jobs[1]], match_job_state, 60)
-        wait_for_jobs([het_jobs[0]], mismatch_job_state, 60)
+        wait_for_jobs([het_jobs[1]], match_job_state)
+        wait_for_jobs([het_jobs[0]], mismatch_job_state)
 
     # Just to show jobs in the logs
     atf.run_command_output(
-        f"echo ''; squeue --Format=JobId,Account,Name,Nodelist,Partition,Qos,Reservation,State,UserName,WCKey"
+        "echo ''; squeue --Format=JobId,Account,Name,Nodelist,Partition,Qos,Reservation,State,UserName,WCKey"
     )
 
     # Cancel jobs with --scancel_opt=scancel:val
@@ -508,11 +514,11 @@ def test_filter_hetjobs(
 
     # Same for hetjobs
     if scancel_opt != "nodelist":
-        wait_for_jobs(matching_hetjobs, "CANCELLED", 10)
-        wait_for_jobs(mismatching_hetjobs, mismatch_job_state, 60)
+        wait_for_jobs(matching_hetjobs, "CANCELLED")
+        wait_for_jobs(mismatching_hetjobs, mismatch_job_state)
     if scancel_opt != "state":
-        wait_for_jobs([het_jobs[1]], "CANCELLED", 10)
-        wait_for_jobs([het_jobs[0]], mismatch_job_state, 60)
+        wait_for_jobs([het_jobs[1]], "CANCELLED")
+        wait_for_jobs([het_jobs[0]], mismatch_job_state)
 
 
 def test_signal_job_ids():
@@ -538,28 +544,28 @@ def test_signal_job_ids():
         test_jobs.append(atf.submit_job_sbatch(s, fatal=True))
         other_jobs.append(atf.submit_job_sbatch(s, fatal=True))
 
-    wait_for_jobs(test_jobs, "RUNNING", 35)
-    wait_for_jobs(other_jobs, "RUNNING", 35)
+    wait_for_jobs(test_jobs, "RUNNING")
+    wait_for_jobs(other_jobs, "RUNNING")
 
     run_scancel("signal", "SIGSTOP", test_jobs)
-    wait_for_jobs(test_jobs, "STOPPED", 35)
-    wait_for_jobs(other_jobs, "RUNNING", 35)
+    wait_for_jobs(test_jobs, "STOPPED")
+    wait_for_jobs(other_jobs, "RUNNING")
 
     run_scancel("signal", "SIGCONT", test_jobs)
-    wait_for_jobs(test_jobs, "RUNNING", 35)
-    wait_for_jobs(other_jobs, "RUNNING", 35)
+    wait_for_jobs(test_jobs, "RUNNING")
+    wait_for_jobs(other_jobs, "RUNNING")
 
     # SIGTERM will make the job end in FAILED, not CANCELLED
     run_scancel("signal", "SIGTERM", test_jobs)
-    wait_for_jobs(test_jobs, "FAILED", 35)
-    wait_for_jobs(other_jobs, "RUNNING", 35)
+    wait_for_jobs(test_jobs, "FAILED")
+    wait_for_jobs(other_jobs, "RUNNING")
 
     # SIGKILL will make the job end in CANCELLED
     run_scancel("signal", "SIGKILL", other_jobs)
-    wait_for_jobs(other_jobs, "CANCELLED", 35)
+    wait_for_jobs(other_jobs, "CANCELLED")
 
     # Sanity check that there are no running jobs
-    output = atf.run_command_output(f"squeue --noheader")
+    output = atf.run_command_output("squeue --noheader")
     assert len(output) == 0
 
 

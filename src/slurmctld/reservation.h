@@ -47,6 +47,8 @@
 #include "src/slurmctld/licenses.h"
 #include "src/slurmctld/slurmctld.h"
 
+extern uint32_t validate_resv_cnt;
+
 /* Create a resource reservation */
 extern int create_resv(resv_desc_msg_t *resv_desc_ptr, char **err_msg);
 
@@ -78,10 +80,9 @@ extern int send_resvs_to_accounting(int db_rc);
 
 /*
  * Set or clear NODE_STATE_MAINT for node_state as needed
- * IN reset_all - re-initialize all node information for all reservations
  * RET count of newly started reservations
  */
-extern int set_node_maint_mode(bool reset_all);
+extern int set_node_maint_mode(void);
 
 /* checks if node within node_record_table_ptr is in maint reservation */
 extern bool is_node_in_maint_reservation(int nodenum);
@@ -91,7 +92,7 @@ extern void update_assocs_in_resvs(void);
 
 /*
  * Update reserved nodes for all reservations using a specific partition if the
- * resevation has NodeList=ALL and RESERVE_FLAGS_PART_NODES.
+ * reservation has NodeList=ALL and RESERVE_FLAGS_PART_NODES.
 */
 extern void update_part_nodes_in_resv(part_record_t *part_ptr);
 
@@ -111,10 +112,13 @@ extern int load_all_resv_state(int recover);
  * Request validation of all reservation records, reset bitmaps, etc.
  * Will purge any invalid reservation.
  *
- * IN run_now - true: apply changes now if previously called
- *              false: defer changes until called with run_now=true
+ * IN run_now    - true: apply changes now if previously called
+ *                 false: defer changes until called with run_now=true
+ * IN run_locked - true: if applying changes, do it locking first
+ *                 false: assume we locked earlier, or not needed
+ *                 NOTE: Ignored if run_now==false
  */
-extern void validate_all_reservations(bool run_now);
+extern void validate_all_reservations(bool run_now, bool run_locked);
 
 /*
  * Determine if a job request can use the specified reservations
@@ -142,12 +146,12 @@ extern burst_buffer_info_msg_t *job_test_bb_resv(job_record_t *job_ptr,
  *	prevented from using due to reservations
  *
  * IN job_ptr   - job to test
- * IN lic_name  - name of license
+ * IN id        - id of license
  * IN when      - when the job is expected to start
  * IN reboot    - true if node reboot required to start job
  * RET number of licenses of this type the job is prevented from using
  */
-extern int job_test_lic_resv(job_record_t *job_ptr, char *lic_name,
+extern int job_test_lic_resv(job_record_t *job_ptr, licenses_id_t id,
 			     time_t when, bool reboot);
 
 /*
@@ -178,12 +182,12 @@ extern int job_test_resv(job_record_t *job_ptr, time_t *when,
 			 bool reboot);
 
 /*
- * Note that a job is starting execution. If that job is associated with a
- * reservation having the "Refresh" flag, then remove that job's nodes from
- * the reservation. Additional nodes will be added to the reservation from
+ * Note that a job is starting or finishing execution. If that job is associated
+ * with a reservation having the "Refresh" flag, then remove that job's nodes
+ * from the reservation. Additional nodes will be added to the reservation from
  * those currently available.
  */
-extern void job_claim_resv(job_record_t *job_ptr);
+extern void resv_replace_update(job_record_t *job_ptr);
 
 /*
  * Determine the time of the first reservation to end after some time.

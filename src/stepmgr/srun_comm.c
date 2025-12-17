@@ -54,7 +54,7 @@
  * we don't want to clog the system up with messages destined for
  * defunct srun processes
  */
-static void _srun_agent_launch(slurm_addr_t *addr, char *host,
+static void _srun_agent_launch(slurm_addr_t *addr, char *tls_cert, char *host,
 			       slurm_msg_type_t type, void *msg_args,
 			       uid_t r_uid, uint16_t protocol_version)
 {
@@ -66,8 +66,16 @@ static void _srun_agent_launch(slurm_addr_t *addr, char *host,
 	agent_args->hostlist   = hostlist_create(host);
 	agent_args->msg_type   = type;
 	agent_args->msg_args   = msg_args;
+	agent_args->tls_cert = xstrdup(tls_cert);
 	set_agent_arg_r_uid(agent_args, r_uid);
-	agent_args->protocol_version = protocol_version;
+
+	/*
+	 * A federated job could have been submitted to a higher versioned
+	 * origin cluster (job_ptr->start_protocol_ver), so we need to talk at
+	 * the highest version that that THIS cluster understands.
+	 */
+	agent_args->protocol_version = MIN(SLURM_PROTOCOL_VERSION,
+					   protocol_version);
 
 	stepmgr_ops->agent_queue_request(agent_args);
 }
@@ -86,11 +94,9 @@ extern void srun_allocate_abort(job_record_t *job_ptr)
 		slurm_set_addr(addr, job_ptr->alloc_resp_port,
 			       job_ptr->resp_host);
 		msg_arg = xmalloc(sizeof(srun_timeout_msg_t));
-		msg_arg->job_id = job_ptr->job_id;
-		msg_arg->step_id = NO_VAL;
-		msg_arg->step_het_comp = NO_VAL;
-		_srun_agent_launch(addr, job_ptr->alloc_node,
-				   SRUN_JOB_COMPLETE,
+		*msg_arg = STEP_ID_FROM_JOB_RECORD(job_ptr);
+		_srun_agent_launch(addr, job_ptr->alloc_tls_cert,
+				   job_ptr->alloc_node, SRUN_JOB_COMPLETE,
 				   msg_arg, job_ptr->user_id,
 				   job_ptr->start_protocol_ver);
 	}
@@ -137,8 +143,8 @@ static int _srun_node_fail(void *x, void *arg)
 	msg_arg = xmalloc(sizeof(*msg_arg));
 	memcpy(&msg_arg->step_id, &step_ptr->step_id, sizeof(msg_arg->step_id));
 	msg_arg->nodelist = xstrdup(args->node_name);
-	_srun_agent_launch(addr, step_ptr->host, SRUN_NODE_FAIL,
-			   msg_arg, step_ptr->job_ptr->user_id,
+	_srun_agent_launch(addr, step_ptr->alloc_tls_cert, step_ptr->host,
+			   SRUN_NODE_FAIL, msg_arg, step_ptr->job_ptr->user_id,
 			   step_ptr->start_protocol_ver);
 
 	return 0;
@@ -151,9 +157,7 @@ static int _srun_node_fail(void *x, void *arg)
  */
 extern void srun_node_fail(job_record_t *job_ptr, char *node_name)
 {
-#ifndef HAVE_FRONT_END
 	node_record_t *node_ptr;
-#endif
 	bool notify_job = true;
 	srun_node_fail_args_t args = {
 		.bit_position = -1,
@@ -165,13 +169,9 @@ extern void srun_node_fail(job_record_t *job_ptr, char *node_name)
 	if (!job_ptr || !IS_JOB_RUNNING(job_ptr))
 		return;
 
-#ifdef HAVE_FRONT_END
-	/* Purge all jobs steps in front end mode */
-#else
 	if (!node_name || (node_ptr = find_node_record(node_name)) == NULL)
 		return;
 	args.bit_position = node_ptr->index;
-#endif
 
 	list_for_each(job_ptr->step_list, _srun_node_fail, &args);
 
@@ -181,13 +181,13 @@ extern void srun_node_fail(job_record_t *job_ptr, char *node_name)
 		srun_node_fail_msg_t *msg_arg;
 
 		msg_arg = xmalloc(sizeof(*msg_arg));
-		msg_arg->step_id.job_id = job_ptr->job_id;
-		msg_arg->step_id.step_id  = NO_VAL;
-		msg_arg->step_id.step_het_comp = NO_VAL;
+		msg_arg->step_id = STEP_ID_FROM_JOB_RECORD(job_ptr);
 		msg_arg->nodelist = xstrdup(node_name);
 
-		_srun_agent_launch(NULL, job_ptr->batch_host, SRUN_NODE_FAIL,
-				   msg_arg, slurm_conf.slurmd_user_id,
+		//FIXME
+		_srun_agent_launch(NULL, NULL, job_ptr->batch_host,
+				   SRUN_NODE_FAIL, msg_arg,
+				   slurm_conf.slurmd_user_id,
 				   job_ptr->start_protocol_ver);
 
 		/* If step mgr, if enabled, will take care of notify the job. */
@@ -202,12 +202,11 @@ extern void srun_node_fail(job_record_t *job_ptr, char *node_name)
 		addr = xmalloc(sizeof(slurm_addr_t));
 		slurm_set_addr(addr, job_ptr->other_port, job_ptr->resp_host);
 		msg_arg = xmalloc(sizeof(srun_node_fail_msg_t));
-		msg_arg->step_id.job_id = job_ptr->job_id;
-		msg_arg->step_id.step_id  = NO_VAL;
-		msg_arg->step_id.step_het_comp = NO_VAL;
+		msg_arg->step_id = STEP_ID_FROM_JOB_RECORD(job_ptr);
 		msg_arg->nodelist = xstrdup(node_name);
-		_srun_agent_launch(addr, job_ptr->alloc_node, SRUN_NODE_FAIL,
-				   msg_arg, job_ptr->user_id,
+		_srun_agent_launch(addr, job_ptr->alloc_tls_cert,
+				   job_ptr->alloc_node, SRUN_NODE_FAIL, msg_arg,
+				   job_ptr->user_id,
 				   job_ptr->start_protocol_ver);
 	}
 }
@@ -233,8 +232,9 @@ static int _srun_ping(void *x, void *arg)
 	slurm_set_addr(addr, job_ptr->other_port, job_ptr->resp_host);
 	msg_arg->job_id = job_ptr->job_id;
 
-	_srun_agent_launch(addr, job_ptr->alloc_node, SRUN_PING, msg_arg,
-			   job_ptr->user_id, job_ptr->start_protocol_ver);
+	_srun_agent_launch(addr, job_ptr->alloc_tls_cert, job_ptr->alloc_node,
+			   SRUN_PING, msg_arg, job_ptr->user_id,
+			   job_ptr->start_protocol_ver);
 
 	return 0;
 }
@@ -275,8 +275,8 @@ static int _srun_step_timeout(void *x, void *arg)
 	memcpy(&msg_arg->step_id, &step_ptr->step_id, sizeof(msg_arg->step_id));
 	msg_arg->timeout = step_ptr->job_ptr->end_time;
 
-	_srun_agent_launch(addr, step_ptr->host, SRUN_TIMEOUT, msg_arg,
-			   step_ptr->job_ptr->user_id,
+	_srun_agent_launch(addr, step_ptr->alloc_tls_cert, step_ptr->host,
+			   SRUN_TIMEOUT, msg_arg, step_ptr->job_ptr->user_id,
 			   step_ptr->start_protocol_ver);
 
 	return 0;
@@ -298,41 +298,41 @@ extern void srun_timeout(job_record_t *job_ptr)
 
 	list_for_each(job_ptr->step_list, _srun_step_timeout, NULL);
 
+	if (!job_ptr->other_port || !job_ptr->alloc_node || !job_ptr->resp_host)
+		return;
+
 	if (running_in_slurmctld() &&
 	    job_ptr->batch_host &&
 	    (job_ptr->bit_flags & STEPMGR_ENABLED)) {
 		srun_timeout_msg_t *msg_arg;
 
 		msg_arg = xmalloc(sizeof(*msg_arg));
-		msg_arg->step_id.job_id = job_ptr->job_id;
-		msg_arg->step_id.step_id  = NO_VAL;
-		msg_arg->step_id.step_het_comp = NO_VAL;
+		msg_arg->step_id = STEP_ID_FROM_JOB_RECORD(job_ptr);
 		msg_arg->timeout = job_ptr->end_time;
 
-		_srun_agent_launch(NULL, job_ptr->batch_host, SRUN_TIMEOUT,
-				   msg_arg, slurm_conf.slurmd_user_id,
+		//FIXME
+		_srun_agent_launch(NULL, NULL, job_ptr->batch_host,
+				   SRUN_TIMEOUT, msg_arg,
+				   slurm_conf.slurmd_user_id,
 				   job_ptr->start_protocol_ver);
 
 		/* If step mgr, if enabled, will take care of notify the job. */
 		notify_job = false;
 	}
 
-	if (notify_job &&
-	    job_ptr->other_port && job_ptr->alloc_node && job_ptr->resp_host) {
+	if (notify_job) {
 		addr = xmalloc(sizeof(slurm_addr_t));
 		slurm_set_addr(addr, job_ptr->other_port, job_ptr->resp_host);
 		msg_arg = xmalloc(sizeof(srun_timeout_msg_t));
-		msg_arg->step_id.job_id   = job_ptr->job_id;
-		msg_arg->step_id.step_id  = NO_VAL;
-		msg_arg->step_id.step_het_comp = NO_VAL;
+		msg_arg->step_id = STEP_ID_FROM_JOB_RECORD(job_ptr);
 		msg_arg->timeout  = job_ptr->end_time;
-		_srun_agent_launch(addr, job_ptr->alloc_node, SRUN_TIMEOUT,
-				   msg_arg, job_ptr->user_id,
+		_srun_agent_launch(addr, job_ptr->alloc_tls_cert,
+				   job_ptr->alloc_node, SRUN_TIMEOUT, msg_arg,
+				   job_ptr->user_id,
 				   job_ptr->start_protocol_ver);
 	}
 }
 
-#ifndef HAVE_FRONT_END
 /*
  * _find_first_node_record - find a record for first node in the bitmap
  * IN node_bitmap
@@ -352,7 +352,6 @@ static node_record_t *_find_first_node_record(bitstr_t *node_bitmap)
 	else
 		return node_record_table_ptr[inx];
 }
-#endif
 
 /*
  * srun_user_message - Send arbitrary message to an srun job (no job steps)
@@ -371,46 +370,30 @@ extern int srun_user_message(job_record_t *job_ptr, char *msg)
 		addr = xmalloc(sizeof(slurm_addr_t));
 		slurm_set_addr(addr, job_ptr->other_port, job_ptr->resp_host);
 		msg_arg = xmalloc(sizeof(srun_user_msg_t));
-		msg_arg->job_id = job_ptr->job_id;
+		msg_arg->step_id = STEP_ID_FROM_JOB_RECORD(job_ptr);
 		msg_arg->msg    = xstrdup(msg);
-		_srun_agent_launch(addr, job_ptr->resp_host, SRUN_USER_MSG,
-				   msg_arg, job_ptr->user_id,
+		_srun_agent_launch(addr, job_ptr->alloc_tls_cert,
+				   job_ptr->resp_host, SRUN_USER_MSG, msg_arg,
+				   job_ptr->user_id,
 				   job_ptr->start_protocol_ver);
 		return SLURM_SUCCESS;
 	} else if (job_ptr->batch_flag && IS_JOB_RUNNING(job_ptr)) {
-#ifndef HAVE_FRONT_END
 		node_record_t *node_ptr;
-#endif
 		job_notify_msg_t *notify_msg_ptr;
 
-#ifdef HAVE_FRONT_END
-		if (job_ptr->batch_host == NULL)
-			return ESLURM_DISABLED;	/* no allocated nodes */
-#else
 		node_ptr = _find_first_node_record(job_ptr->node_bitmap);
 		if (node_ptr == NULL)
 			return ESLURM_DISABLED;	/* no allocated nodes */
-#endif
 
 		notify_msg_ptr = (job_notify_msg_t *)
 				 xmalloc(sizeof(job_notify_msg_t));
-		notify_msg_ptr->step_id.job_id = job_ptr->job_id;
-		notify_msg_ptr->step_id.step_id = NO_VAL;
-		notify_msg_ptr->step_id.step_het_comp = NO_VAL;
+		notify_msg_ptr->step_id = STEP_ID_FROM_JOB_RECORD(job_ptr);
 		notify_msg_ptr->message = xstrdup(msg);
 
-#ifdef HAVE_FRONT_END
-		_srun_agent_launch(NULL, job_ptr->batch_host, REQUEST_JOB_NOTIFY,
-				   notify_msg_ptr, SLURM_AUTH_UID_ANY,
-				   (job_ptr->front_end_ptr ?
-				    job_ptr->front_end_ptr->protocol_version :
-				    0));
-
-#else
-		_srun_agent_launch(NULL, node_ptr->name, REQUEST_JOB_NOTIFY,
-				   notify_msg_ptr, SLURM_AUTH_UID_ANY,
+		_srun_agent_launch(NULL, NULL, node_ptr->name,
+				   REQUEST_JOB_NOTIFY, notify_msg_ptr,
+				   SLURM_AUTH_UID_ANY,
 				   node_ptr->protocol_version);
-#endif
 		return SLURM_SUCCESS;
 	}
 	return ESLURM_DISABLED;
@@ -444,12 +427,11 @@ extern void srun_job_complete(job_record_t *job_ptr)
 		srun_job_complete_msg_t *msg_arg;
 
 		msg_arg = xmalloc(sizeof(*msg_arg));
-		msg_arg->job_id = job_ptr->job_id;
-		msg_arg->step_id = NO_VAL;
-		msg_arg->step_het_comp = NO_VAL;
+		*msg_arg = STEP_ID_FROM_JOB_RECORD(job_ptr);
 
-		_srun_agent_launch(NULL, job_ptr->batch_host, SRUN_JOB_COMPLETE,
-				   msg_arg, slurm_conf.slurmd_user_id,
+		_srun_agent_launch(NULL, NULL, job_ptr->batch_host,
+				   SRUN_JOB_COMPLETE, msg_arg,
+				   slurm_conf.slurmd_user_id,
 				   job_ptr->start_protocol_ver);
 
 		notify_job = false;
@@ -464,12 +446,10 @@ extern void srun_job_complete(job_record_t *job_ptr)
 		addr = xmalloc(sizeof(slurm_addr_t));
 		slurm_set_addr(addr, job_ptr->other_port, job_ptr->resp_host);
 		msg_arg = xmalloc(sizeof(srun_job_complete_msg_t));
-		msg_arg->job_id = job_ptr->job_id;
-		msg_arg->step_id = NO_VAL;
-		msg_arg->step_het_comp = NO_VAL;
-		_srun_agent_launch(addr, job_ptr->alloc_node,
-				   SRUN_JOB_COMPLETE, msg_arg,
-				   job_ptr->user_id,
+		*msg_arg = STEP_ID_FROM_JOB_RECORD(job_ptr);
+		_srun_agent_launch(addr, job_ptr->alloc_tls_cert,
+				   job_ptr->alloc_node, SRUN_JOB_COMPLETE,
+				   msg_arg, job_ptr->user_id,
 				   job_ptr->start_protocol_ver);
 	}
 }
@@ -492,11 +472,11 @@ extern bool srun_job_suspend(job_record_t *job_ptr, uint16_t op)
 		addr = xmalloc(sizeof(slurm_addr_t));
 		slurm_set_addr(addr, job_ptr->other_port, job_ptr->resp_host);
 		msg_arg = xmalloc(sizeof(suspend_msg_t));
-		msg_arg->job_id  = job_ptr->job_id;
+		msg_arg->step_id = STEP_ID_FROM_JOB_RECORD(job_ptr);
 		msg_arg->op     = op;
-		_srun_agent_launch(addr, job_ptr->alloc_node,
-				   SRUN_REQUEST_SUSPEND, msg_arg,
-				   job_ptr->user_id,
+		_srun_agent_launch(addr, job_ptr->alloc_tls_cert,
+				   job_ptr->alloc_node, SRUN_REQUEST_SUSPEND,
+				   msg_arg, job_ptr->user_id,
 				   job_ptr->start_protocol_ver);
 		msg_sent = true;
 	}
@@ -518,8 +498,9 @@ extern void srun_step_complete(step_record_t *step_ptr)
 
 		msg_arg = xmalloc(sizeof(srun_job_complete_msg_t));
 		memcpy(msg_arg, &step_ptr->step_id, sizeof(*msg_arg));
-		_srun_agent_launch(addr, step_ptr->host, SRUN_JOB_COMPLETE,
-				   msg_arg, step_ptr->job_ptr->user_id,
+		_srun_agent_launch(addr, step_ptr->alloc_tls_cert,
+				   step_ptr->host, SRUN_JOB_COMPLETE, msg_arg,
+				   step_ptr->job_ptr->user_id,
 				   step_ptr->start_protocol_ver);
 	}
 }
@@ -543,8 +524,9 @@ extern void srun_step_missing(step_record_t *step_ptr, char *node_list)
 		memcpy(&msg_arg->step_id, &step_ptr->step_id,
 		       sizeof(msg_arg->step_id));
 		msg_arg->nodelist = xstrdup(node_list);
-		_srun_agent_launch(addr, step_ptr->host, SRUN_STEP_MISSING,
-				   msg_arg, step_ptr->job_ptr->user_id,
+		_srun_agent_launch(addr, step_ptr->alloc_tls_cert,
+				   step_ptr->host, SRUN_STEP_MISSING, msg_arg,
+				   step_ptr->job_ptr->user_id,
 				   step_ptr->start_protocol_ver);
 	}
 }
@@ -568,8 +550,9 @@ extern void srun_step_signal(step_record_t *step_ptr, uint16_t signal)
 		memcpy(&msg_arg->step_id, &step_ptr->step_id,
 		       sizeof(msg_arg->step_id));
 		msg_arg->signal      = signal;
-		_srun_agent_launch(addr, step_ptr->host, SRUN_STEP_SIGNAL,
-				   msg_arg, step_ptr->job_ptr->user_id,
+		_srun_agent_launch(addr, step_ptr->alloc_tls_cert,
+				   step_ptr->host, SRUN_STEP_SIGNAL, msg_arg,
+				   step_ptr->job_ptr->user_id,
 				   step_ptr->start_protocol_ver);
 	}
 }
@@ -580,7 +563,7 @@ extern void srun_step_signal(step_record_t *step_ptr, uint16_t signal)
  */
 extern void srun_response(slurm_step_id_t *step_id)
 {
-	job_record_t *job_ptr = stepmgr_ops->find_job_record(step_id->job_id);
+	job_record_t *job_ptr = stepmgr_ops->find_job(step_id);
 	step_record_t *step_ptr;
 	time_t now = time(NULL);
 

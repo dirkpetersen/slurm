@@ -51,35 +51,9 @@
 #include "pmixp_info.h"
 #include "pmixp_client.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *      <application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "switch" for Slurm switch) and <method> is a description
- * of how this plugin satisfies that application.  Slurm will only load
- * a switch plugin if the plugin_type string has a prefix of "switch/".
- *
- * plugin_version - an unsigned 32-bit integer giving the version number
- * of the plugin.  If major and minor revisions are desired, the major
- * version number may be multiplied by a suitable magnitude constant such
- * as 100 or 1000.  Various Slurm versions will likely require a certain
- * minimum version for their plugins as this API matures.
- */
+/* Required Slurm and mpi plugin symbols: */
 const char plugin_name[] = "PMIx plugin";
-
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 #if (HAVE_PMIX_VER == 2)
 const char plugin_type[] = "mpi/pmix_v2";
 const uint32_t plugin_id = MPI_PLUGIN_PMIX2;
@@ -92,9 +66,14 @@ const uint32_t plugin_id = MPI_PLUGIN_PMIX4;
 #elif (HAVE_PMIX_VER == 5)
 const char plugin_type[] = "mpi/pmix_v5";
 const uint32_t plugin_id = MPI_PLUGIN_PMIX5;
+#elif (HAVE_PMIX_VER == 6)
+const char plugin_type[] = "mpi/pmix_v6";
+const uint32_t plugin_id = MPI_PLUGIN_PMIX6;
 #endif
 
-const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+static pthread_mutex_t setup_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t setup_cond  = PTHREAD_COND_INITIALIZER;
+static bool setup_done = false;
 
 void *libpmix_plug = NULL;
 
@@ -111,6 +90,7 @@ s_p_options_t pmix_options[] = {
 	{"PMIxEnv", S_P_STRING},
 	{"PMIxFenceBarrier", S_P_BOOLEAN},
 	{"PMIxNetDevicesUCX", S_P_STRING},
+	{"PMIxShareServerTopology", S_P_BOOLEAN},
 	{"PMIxTimeout", S_P_UINT32},
 	{"PMIxTlsUCX", S_P_STRING},
 	{NULL}
@@ -161,6 +141,7 @@ static void _init_pmix_conf(void)
 	slurm_pmix_conf.direct_samearch = false;
 	slurm_pmix_conf.env = NULL;
 	slurm_pmix_conf.fence_barrier = false;
+	slurm_pmix_conf.share_topology = false;
 	slurm_pmix_conf.timeout = PMIXP_TIMEOUT_DEFAULT;
 	slurm_pmix_conf.ucx_netdevices = NULL;
 	slurm_pmix_conf.ucx_tls = NULL;
@@ -177,15 +158,12 @@ static void _reset_pmix_conf(void)
 	slurm_pmix_conf.direct_samearch = false;
 	xfree(slurm_pmix_conf.env);
 	slurm_pmix_conf.fence_barrier = false;
+	slurm_pmix_conf.share_topology = false;
 	slurm_pmix_conf.timeout = PMIXP_TIMEOUT_DEFAULT;
 	xfree(slurm_pmix_conf.ucx_netdevices);
 	xfree(slurm_pmix_conf.ucx_tls);
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	libpmix_plug = _libpmix_open();
@@ -198,15 +176,13 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	PMIXP_DEBUG("%s: call fini()", pmixp_info_hostname());
 	pmixp_agent_stop();
 	pmixp_stepd_finalize();
 	_libpmix_close(libpmix_plug);
 	_reset_pmix_conf();
-
-	return SLURM_SUCCESS;
 }
 
 extern int mpi_p_slurmstepd_prefork(const stepd_step_rec_t *step, char ***env)
@@ -230,8 +206,7 @@ extern int mpi_p_slurmstepd_prefork(const stepd_step_rec_t *step, char ***env)
 
 err_ext:
 	/* Abort the whole job if error! */
-	slurm_kill_job_step(step->step_id.job_id,
-			    step->step_id.step_id, SIGKILL, 0);
+	slurm_kill_job_step((slurm_step_id_t *) &step->step_id, SIGKILL, 0);
 	return ret;
 }
 
@@ -266,9 +241,6 @@ extern int mpi_p_slurmstepd_task(const mpi_task_info_t *mpi_task, char ***env)
 extern mpi_plugin_client_state_t *
 mpi_p_client_prelaunch(const mpi_step_info_t *mpi_step, char ***env)
 {
-	static pthread_mutex_t setup_mutex = PTHREAD_MUTEX_INITIALIZER;
-	static pthread_cond_t setup_cond  = PTHREAD_COND_INITIALIZER;
-	static bool setup_done = false;
 	uint32_t nnodes, ntasks, **tids;
 	uint16_t *task_cnt;
 	int ret;
@@ -310,7 +282,10 @@ mpi_p_client_prelaunch(const mpi_step_info_t *mpi_step, char ***env)
 
 extern int mpi_p_client_fini(void)
 {
-	xfree(process_mapping);
+	slurm_mutex_lock(&setup_mutex);
+	if (setup_done)
+		xfree(process_mapping);
+	slurm_mutex_unlock(&setup_mutex);
 	return pmixp_abort_agent_stop();
 }
 
@@ -342,6 +317,8 @@ extern void mpi_p_conf_set(s_p_hashtbl_t *tbl)
 				"PMIxFenceBarrier", tbl);
 		s_p_get_string(&slurm_pmix_conf.ucx_netdevices,
 			       "PMIxNetDevicesUCX", tbl);
+		s_p_get_boolean(&slurm_pmix_conf.share_topology,
+				"PMIxShareServerTopology", tbl);
 		s_p_get_uint32(&slurm_pmix_conf.timeout, "PMIxTimeout", tbl);
 		s_p_get_string(&slurm_pmix_conf.ucx_tls, "PMIxTlsUCX", tbl);
 	}
@@ -386,6 +363,9 @@ extern s_p_hashtbl_t *mpi_p_conf_get(void)
 		s_p_parse_pair(tbl, "PMIxNetDevicesUCX",
 			       slurm_pmix_conf.ucx_netdevices);
 
+	s_p_parse_pair(tbl, "PMIxShareServerTopology",
+		       (slurm_pmix_conf.share_topology ? "yes" : "no"));
+
 	value = xstrdup_printf("%u", slurm_pmix_conf.timeout);
 	s_p_parse_pair(tbl, "PMIxTimeout", value);
 	xfree(value);
@@ -396,73 +376,42 @@ extern s_p_hashtbl_t *mpi_p_conf_get(void)
 	return tbl;
 }
 
-extern List mpi_p_conf_get_printable(void)
+extern list_t *mpi_p_conf_get_printable(void)
 {
-	config_key_pair_t *key_pair;
-	List data = list_create(destroy_config_key_pair);
+	list_t *data = list_create(destroy_config_key_pair);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxCliTmpDirBase");
-	key_pair->value = xstrdup(slurm_pmix_conf.cli_tmpdir_base);
-	list_append(data, key_pair);
+	add_key_pair(data, "PMIxCliTmpDirBase", "%s",
+		     slurm_pmix_conf.cli_tmpdir_base);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxCollFence");
-	key_pair->value = xstrdup(slurm_pmix_conf.coll_fence);
-	list_append(data, key_pair);
+	add_key_pair(data, "PMIxCollFence", "%s", slurm_pmix_conf.coll_fence);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxDebug");
-	key_pair->value = xstrdup_printf("%u", slurm_pmix_conf.debug);
-	list_append(data, key_pair);
+	add_key_pair(data, "PMIxDebug", "%u", slurm_pmix_conf.debug);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxDirectConn");
-	key_pair->value = xstrdup(slurm_pmix_conf.direct_conn ? "yes" : "no");
-	list_append(data, key_pair);
+	add_key_pair_bool(data, "PMIxDirectConn", slurm_pmix_conf.direct_conn);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxDirectConnEarly");
-	key_pair->value = xstrdup(slurm_pmix_conf.direct_conn_early ?
-				  "yes" : "no");
-	list_append(data, key_pair);
+	add_key_pair_bool(data, "PMIxDirectConnEarly",
+			  slurm_pmix_conf.direct_conn_early);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxDirectConnUCX");
-	key_pair->value = xstrdup(slurm_pmix_conf.direct_conn_ucx ?
-				  "yes" : "no");
-	list_append(data, key_pair);
+	add_key_pair_bool(data, "PMIxDirectConnUCX",
+			  slurm_pmix_conf.direct_conn_ucx);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxDirectSameArch");
-	key_pair->value = xstrdup(slurm_pmix_conf.direct_samearch ?
-				  "yes" : "no");
-	list_append(data, key_pair);
+	add_key_pair_bool(data, "PMIxDirectSameArch",
+			  slurm_pmix_conf.direct_samearch);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxEnv");
-	key_pair->value = xstrdup(slurm_pmix_conf.env);
-	list_append(data, key_pair);
+	add_key_pair(data, "PMIxEnv", "%s", slurm_pmix_conf.env);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxFenceBarrier");
-	key_pair->value = xstrdup(slurm_pmix_conf.fence_barrier ? "yes" : "no");
-	list_append(data, key_pair);
+	add_key_pair_bool(data, "PMIxFenceBarrier",
+			  slurm_pmix_conf.fence_barrier);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxNetDevicesUCX");
-	key_pair->value = xstrdup(slurm_pmix_conf.ucx_netdevices);
-	list_append(data, key_pair);
+	add_key_pair(data, "PMIxNetDevicesUCX", "%s",
+		     slurm_pmix_conf.ucx_netdevices);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxTimeout");
-	key_pair->value = xstrdup_printf("%u", slurm_pmix_conf.timeout);
-	list_append(data, key_pair);
+	add_key_pair_bool(data, "PMIxShareServerTopology",
+			  slurm_pmix_conf.share_topology);
 
-	key_pair = xmalloc(sizeof(*key_pair));
-	key_pair->name = xstrdup("PMIxTlsUCX");
-	key_pair->value = xstrdup(slurm_pmix_conf.ucx_tls);
-	list_append(data, key_pair);
+	add_key_pair(data, "PMIxTimeout", "%u", slurm_pmix_conf.timeout);
+
+	add_key_pair(data, "PMIxTlsUCX", "%s", slurm_pmix_conf.ucx_tls);
 
 	return data;
 }

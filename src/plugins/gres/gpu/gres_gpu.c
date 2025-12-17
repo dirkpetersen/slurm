@@ -40,7 +40,6 @@
 
 #include <ctype.h>
 #include <inttypes.h>
-#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,35 +62,12 @@
 
 #include "../common/gres_common.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - A string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - A string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Gres GPU plugin";
-const char	plugin_type[]		= "gres/gpu";
-const uint32_t	plugin_version		= SLURM_VERSION_NUMBER;
-static List	gres_devices		= NULL;
+const char plugin_type[] = "gres/gpu";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
+static list_t *gres_devices = NULL;
 static uint32_t	node_flags		= 0;
 
 extern void gres_p_step_hardware_init(bitstr_t *usable_gpus, char *tres_freq)
@@ -203,8 +179,8 @@ static int _find_nonnull_type_in_gres_list(void *x, void *key)
  * NOTE: Both lists will be sorted in descending order by type_name
  * length. gres_list_conf_single is assumed to only have records of count == 1.
  */
-static void _normalize_sys_gres_types(List gres_list_system,
-				      List gres_list_conf_single)
+static void _normalize_sys_gres_types(list_t *gres_list_system,
+				      list_t *gres_list_conf_single)
 {
 	gres_slurmd_conf_t *sys_gres, *conf_gres;
 	list_itr_t *itr;
@@ -397,11 +373,12 @@ static int _sort_gpu_by_links_order(void *x, void *y)
  * 	*type
  * 	*file
  */
-static void _merge_system_gres_conf(List gres_list_conf, List gres_list_system)
+static void _merge_system_gres_conf(list_t *gres_list_conf,
+				    list_t *gres_list_system)
 {
 	list_itr_t *itr, *itr2;
 	gres_slurmd_conf_t *gres_slurmd_conf, *gres_slurmd_conf_sys;
-	List gres_list_conf_single, gres_list_gpu = NULL, gres_list_non_gpu;
+	list_t *gres_list_conf_single, *gres_list_gpu = NULL, *gres_list_non_gpu;
 
 	if (gres_list_conf == NULL) {
 		error("gres_list_conf is NULL. This shouldn't happen");
@@ -562,6 +539,10 @@ static void _merge_system_gres_conf(List gres_list_conf, List gres_list_system)
 					GRES_CONF_ENV_SET;
 			}
 
+			gres_slurmd_conf_sys->config_flags |=
+				gres_slurmd_conf->config_flags &
+				GRES_CONF_EXPLICIT;
+
 			list_remove(itr2);
 			list_append(gres_list_gpu, gres_slurmd_conf_sys);
 			continue;
@@ -638,7 +619,7 @@ static void _merge_system_gres_conf(List gres_list_conf, List gres_list_system)
  * This is to test converting the cpu mask from NVML to Slurm.
  * Only 0xF and 0x0 are supported.
  */
-static void _add_fake_gpus_from_file(List gres_list_system,
+static void _add_fake_gpus_from_file(list_t *gres_list_system,
 				     char *fake_gpus_file)
 {
 	char buffer[256];
@@ -748,9 +729,9 @@ static void _add_fake_gpus_from_file(List gres_list_system,
  * If fake_gpus.conf does not exist, or an error occurs, returns NULL
  * Caller is responsible for freeing the list if not NULL.
  */
-static List _get_system_gpu_list_fake(void)
+static list_t *_get_system_gpu_list_fake(void)
 {
-	List gres_list_system = NULL;
+	list_t *gres_list_system = NULL;
 	struct stat config_stat;
 	char *fake_gpus_file = NULL;
 
@@ -774,13 +755,12 @@ extern int init(void)
 
 	return SLURM_SUCCESS;
 }
-extern int fini(void)
+
+extern void fini(void)
 {
 	debug("unloading");
 	gpu_plugin_fini();
 	FREE_NULL_LIST(gres_devices);
-
-	return SLURM_SUCCESS;
 }
 
 /*
@@ -789,11 +769,11 @@ extern int fini(void)
  * slurm.conf.
  * In the general case, no code would need to be changed.
  */
-extern int gres_p_node_config_load(List gres_conf_list,
+extern int gres_p_node_config_load(list_t *gres_conf_list,
 				   node_config_load_t *node_config)
 {
 	int rc = SLURM_SUCCESS;
-	List gres_list_system = NULL;
+	list_t *gres_list_system = NULL;
 	log_level_t log_lvl;
 
 	/* Assume this state is caused by an scontrol reconfigure */
@@ -941,45 +921,10 @@ unpack_error:
 }
 
 /*
- * get data from a job's GRES data structure
- * IN job_gres_data  - job's GRES data structure
- * IN node_inx - zero-origin index of the node within the job's allocation
- *	for which data is desired
- * IN data_type - type of data to get from the job's data
- * OUT data - pointer to the data from job's GRES data structure
- *            DO NOT FREE: This is a pointer into the job's data structure
- * RET - SLURM_SUCCESS or error code
- */
-extern int gres_p_get_job_info(gres_job_state_t *gres_js,
-			       uint32_t node_inx,
-			       enum gres_job_data_type data_type, void *data)
-{
-	return EINVAL;
-}
-
-/*
- * get data from a step's GRES data structure
- * IN gres_ss  - step's GRES data structure
- * IN node_inx - zero-origin index of the node within the job's allocation
- *	for which data is desired. Note this can differ from the step's
- *	node allocation index.
- * IN data_type - type of data to get from the step's data
- * OUT data - pointer to the data from step's GRES data structure
- *            DO NOT FREE: This is a pointer into the step's data structure
- * RET - SLURM_SUCCESS or error code
- */
-extern int gres_p_get_step_info(gres_step_state_t *gres_ss,
-				uint32_t node_inx,
-				enum gres_step_data_type data_type, void *data)
-{
-	return EINVAL;
-}
-
-/*
  * Return a list of devices of this type. The list elements are of type
  * "gres_device_t" and the list should be freed using FREE_NULL_LIST().
  */
-extern List gres_p_get_devices(void)
+extern list_t *gres_p_get_devices(void)
 {
 	return gres_devices;
 }

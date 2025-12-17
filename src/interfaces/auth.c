@@ -40,6 +40,9 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+
+#include "slurm/slurm.h"
 
 #include "src/common/macros.h"
 #include "src/common/plugin.h"
@@ -52,6 +55,7 @@
 #include "src/common/xstring.h"
 
 #include "src/interfaces/auth.h"
+#include "src/interfaces/conn.h"
 
 typedef struct {
 	int index;
@@ -77,6 +81,9 @@ typedef struct {
 	int		(*thread_config) (const char *token, const char *username);
 	void		(*thread_clear) (void);
 	char *		(*token_generate) (const char *username, int lifespan);
+	int		(*get_reconfig_fd)(void);
+	void *(*cred_generate)(const char *token, const char *username,
+			       uid_t uid, gid_t gid);
 } auth_ops_t;
 /*
  * These strings must be kept in the same order as the fields
@@ -98,10 +105,12 @@ static const char *syms[] = {
 	"auth_p_thread_config",
 	"auth_p_thread_clear",
 	"auth_p_token_generate",
+	"auth_p_get_reconfig_fd",
+	"auth_p_cred_generate",
 };
 
 typedef struct {
-	int plugin_id;
+	auth_plugin_type_t plugin_id;
 	char *type;
 } auth_plugin_types_t;
 
@@ -148,7 +157,7 @@ static void _atfork_child()
 		slurm_rwlock_wrlock(&context_lock);
 }
 
-extern const char *auth_get_plugin_name(int plugin_id)
+extern const char *auth_get_plugin_name(auth_plugin_type_t plugin_id)
 {
 	for (int i = 0; i < ARRAY_SIZE(auth_plugin_types); i++)
 		if (plugin_id == auth_plugin_types[i].plugin_id)
@@ -166,7 +175,7 @@ extern bool slurm_get_plugin_hash_enable(int index)
 	return *(ops[index].hash_enable);
 }
 
-extern bool auth_is_plugin_type_inited(int plugin_id)
+extern bool auth_is_plugin_type_inited(auth_plugin_type_t plugin_id)
 {
 	for (int i = 0; i < g_context_num; i++)
 		if (plugin_id == *(ops[i].plugin_id))
@@ -180,7 +189,6 @@ extern int auth_g_init(void)
 	char *auth_alt_types = NULL, *list = NULL;
 	char *type, *last = NULL;
 	char *plugin_type = "auth";
-	static bool daemon_run = false, daemon_set = false;
 
 	slurm_rwlock_wrlock(&context_lock);
 
@@ -203,7 +211,7 @@ extern int auth_g_init(void)
 	if (!type || type[0] == '\0')
 		goto done;
 
-	if (run_in_daemon(&daemon_run, &daemon_set, "slurmctld,slurmdbd"))
+	if (run_in_daemon(IS_SLURMCTLD | IS_SLURMDBD))
 		list = auth_alt_types = xstrdup(slurm_conf.authalttypes);
 	g_context_num = 0;
 
@@ -413,8 +421,8 @@ extern uid_t auth_g_get_uid(void *cred)
 
 extern char *auth_g_get_host(void *slurm_msg)
 {
-	slurm_addr_t addr;
 	slurm_msg_t *msg = slurm_msg;
+	slurm_addr_t *addr = &msg->address;
 	cred_wrapper_t *wrap = NULL;
 	char *host = NULL;
 
@@ -432,25 +440,33 @@ extern char *auth_g_get_host(void *slurm_msg)
 		return host;
 	}
 
-	if (msg->conn && msg->conn->rem_host) {
+	if (msg->pcon && msg->pcon->rem_host) {
 		/* use remote host name if persistent connection */
-		host = xstrdup(msg->conn->rem_host);
+		host = xstrdup(msg->pcon->rem_host);
 		debug3("%s: using remote hostname: %s", __func__, host);
 		return host;
 	}
 
-	if (slurm_get_peer_addr(msg->conn_fd, &addr)) {
-		error("%s: unable to determine host", __func__);
-		return NULL;
+	if (addr->ss_family == AF_UNSPEC) {
+		int rc;
+		int fd = conn_g_get_fd(msg->conn);
+
+		if ((rc = slurm_get_peer_addr(fd, addr))) {
+			error("%s: [fd:%d] unable to determine socket remote host: %s",
+			      __func__, fd, slurm_strerror(rc));
+			return NULL;
+		}
+
+		xassert(addr->ss_family != AF_UNSPEC);
 	}
 
 	/* use remote host IP, then look it up */
-	if ((host = xgetnameinfo((struct sockaddr *) &addr, sizeof(addr)))) {
+	if ((host = xgetnameinfo(addr))) {
 		debug3("%s: looked up from connection's IP address: %s",
 		       __func__, host);
 	} else {
 		host = xmalloc(INET6_ADDRSTRLEN);
-		slurm_get_ip_str(&addr, host, INET6_ADDRSTRLEN);
+		slurm_get_ip_str(addr, host, INET6_ADDRSTRLEN);
 		debug3("%s: using connection's IP address: %s", __func__, host);
 	}
 
@@ -565,8 +581,8 @@ extern void auth_g_thread_clear(void)
 	slurm_rwlock_unlock(&context_lock);
 }
 
-extern char *auth_g_token_generate(int plugin_id, const char *username,
-				   int lifespan)
+extern char *auth_g_token_generate(auth_plugin_type_t plugin_id,
+				   const char *username, int lifespan)
 {
 	char *token = NULL;
 	xassert(g_context_num > 0);
@@ -581,4 +597,68 @@ extern char *auth_g_token_generate(int plugin_id, const char *username,
 	slurm_rwlock_unlock(&context_lock);
 
 	return token;
+}
+
+extern void *auth_g_cred_generate(auth_plugin_type_t plugin_id,
+				  const char *token, const char *username)
+{
+	int rc = EINVAL;
+	cred_wrapper_t *cred = NULL;
+	uid_t uid = SLURM_AUTH_NOBODY;
+	gid_t gid = SLURM_AUTH_NOBODY;
+
+	xassert(g_context_num > 0);
+
+	if (username) {
+		if ((rc = uid_from_string(username, &uid))) {
+			error("%s: resolving username=%s failed:%s",
+			      __func__, username, slurm_strerror(rc));
+			errno = ESLURM_AUTH_CRED_INVALID;
+			return NULL;
+		}
+
+		gid = gid_from_uid(uid);
+
+		if ((uid == SLURM_AUTH_NOBODY) || (gid == SLURM_AUTH_NOBODY)) {
+			error("%s: rejecting resolved username=%s to nobody",
+			      __func__, username);
+			errno = ESLURM_AUTH_NOBODY;
+			return NULL;
+		}
+	}
+
+	for (int i = 0; i < g_context_num; i++) {
+		if ((plugin_id == AUTH_PLUGIN_DEFAULT) ||
+		    (plugin_id == *(ops[i].plugin_id))) {
+			cred = (*(ops[i].cred_generate))(token, username, uid,
+							 gid);
+
+			if (cred)
+				cred->index = i;
+
+			return cred;
+		}
+	}
+
+	error("%s: authentication plugin %s(%u) not found",
+	      __func__, auth_get_plugin_name(plugin_id), plugin_id);
+	return NULL;
+}
+
+extern int auth_g_get_reconfig_fd(auth_plugin_type_t plugin_id)
+{
+	int fd = -1;
+
+	xassert(g_context_num > 0);
+
+	slurm_rwlock_rdlock(&context_lock);
+	for (int i = 0; i < g_context_num; i++) {
+		if (plugin_id == *(ops[i].plugin_id)) {
+			fd = (*(ops[i].get_reconfig_fd))();
+			break;
+		}
+	}
+	slurm_rwlock_unlock(&context_lock);
+
+	return fd;
 }

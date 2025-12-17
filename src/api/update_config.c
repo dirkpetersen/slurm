@@ -50,18 +50,6 @@
 static int _slurm_update (void * data, slurm_msg_type_t msg_type);
 
 /*
- * slurm_update_front_end - issue RPC to a front_end node's configuration per
- *	request, only usable by user root
- * IN front_end_msg - description of front_end node updates
- * RET SLURM_SUCCESS on success, otherwise return SLURM_ERROR with errno set
- */
-int
-slurm_update_front_end (update_front_end_msg_t * front_end_msg)
-{
-	return _slurm_update ((void *) front_end_msg, REQUEST_UPDATE_FRONT_END);
-}
-
-/*
  * slurm_update_job - issue RPC to a job's configuration per request,
  *	only usable by user root or (for some parameters) the job's owner
  * IN job_msg - description of job updates
@@ -107,7 +95,7 @@ tryagain:
 	{
 		reroute_msg_t *rr_msg = (reroute_msg_t *)resp_msg.data;
 
-		/* Don't expect mutliple hops but in the case it does
+		/* Don't expect multiple hops but in the case it does
 		 * happen, free the previous rr cluster_rec. */
 		if (working_cluster_rec &&
 		    working_cluster_rec != save_working_cluster_rec)
@@ -127,12 +115,12 @@ tryagain:
 	case RESPONSE_SLURM_RC:
 		rc = ((return_code_msg_t *) resp_msg.data)->return_code;
 		if (rc)
-			slurm_seterrno(rc);
+			errno = rc;
 		slurm_free_msg_data(resp_msg.msg_type, resp_msg.data);
 		resp_msg.data = NULL;
 		break;
 	default:
-		slurm_seterrno(SLURM_UNEXPECTED_MSG_ERROR);
+		errno = SLURM_UNEXPECTED_MSG_ERROR;
 	}
 
 	if (working_cluster_rec != save_working_cluster_rec) {
@@ -208,7 +196,7 @@ slurm_delete_partition ( delete_part_msg_t * part_msg )
 /*
  * slurm_create_reservation - create a new reservation, only usable by user root
  * IN resv_msg - description of reservation
- * RET name of reservation on success (caller must free the memory),
+ * RET name of reservation on success (caller must xfree),
  *	otherwise return NULL and set errno to indicate the error
  */
 char *
@@ -229,20 +217,20 @@ slurm_create_reservation (resv_desc_msg_t * resv_msg)
 	rc = slurm_send_recv_controller_msg(&req_msg, &resp_msg,
 					    working_cluster_rec);
 	if (rc)
-		slurm_seterrno(rc);
+		errno = rc;
 	switch (resp_msg.msg_type) {
 	case RESPONSE_CREATE_RESERVATION:
 		resp = (reservation_name_msg_t *) resp_msg.data;
 		if (resp->name)
-			resv_name = strdup(resp->name);
+			resv_name = xstrdup(resp->name);
 		break;
 	case RESPONSE_SLURM_RC:
 		rc = ((return_code_msg_t *) resp_msg.data)->return_code;
 		if (rc)
-			slurm_seterrno(rc);
+			errno = rc;
 		break;
 	default:
-		slurm_seterrno(SLURM_UNEXPECTED_MSG_ERROR);
+		errno = SLURM_UNEXPECTED_MSG_ERROR;
 	}
 	slurm_free_msg_data(resp_msg.msg_type, resp_msg.data);
 	return resv_name;
@@ -356,7 +344,7 @@ slurm_top_job(char *job_id_str)
 					      working_cluster_rec) < 0)
 		return SLURM_ERROR;
 
-	slurm_seterrno(rc);
+	errno = rc;
 	return rc;
 }
 

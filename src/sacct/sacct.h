@@ -61,8 +61,6 @@
 #include "src/interfaces/jobcomp.h"
 #include "src/common/print_fields.h"
 
-#define ERROR 2
-
 #define BRIEF_FIELDS "jobid,state,exitcode"
 #define BRIEF_COMP_FIELDS "jobid,uid,state"
 #define DEFAULT_FIELDS "jobid,jobname,partition,account,alloccpus,state,exitcode"
@@ -157,6 +155,7 @@ typedef enum {
 		PRINT_PRIO,
 		PRINT_QOS,
 		PRINT_QOSRAW,
+		PRINT_QOSREQ,
 		PRINT_REASON,
 		PRINT_REQ_CPUFREQ_MIN,
 		PRINT_REQ_CPUFREQ_MAX,
@@ -166,6 +165,10 @@ typedef enum {
 		PRINT_REQ_NODES,
 		PRINT_RESERVATION,
 		PRINT_RESERVATION_ID,
+		PRINT_RESERVATION_REQ,
+		PRINT_RESTART_CNT,
+		PRINT_SEGMENT_SIZE,
+		PRINT_SLUID,
 		PRINT_START,
 		PRINT_STATE,
 		PRINT_STDERR,
@@ -213,7 +216,6 @@ typedef struct {
 	bool opt_federation;	/* --federation */
 	char *opt_field_list;	/* --fields= */
 	gid_t opt_gid;		/* running persons gid */
-	int opt_help;		/* --help */
 	bool opt_local;		/* --local */
 	int opt_noheader;	/* can only be cleared */
 	uid_t opt_uid;		/* running persons uid */
@@ -226,12 +228,12 @@ typedef struct {
 extern print_field_t fields[];
 extern sacct_parameters_t params;
 
-extern List jobs;
-extern List print_fields_list;
+extern list_t *jobs;
+extern list_t *print_fields_list;
 extern list_itr_t *print_fields_itr;
 extern int field_count;
-extern List g_qos_list;
-extern List g_tres_list;
+extern list_t *g_qos_list;
+extern list_t *g_tres_list;
 
 /* process.c */
 void aggregate_stats(slurmdb_stats_t *dest, slurmdb_stats_t *from);
@@ -242,7 +244,6 @@ void print_fields(type_t type, void *object);
 /* options.c */
 int  get_data(void);
 void parse_command_line(int argc, char **argv);
-void do_help(void);
 void do_list(int argc, char **argv);
 void do_list_completion(void);
 void sacct_init(void);

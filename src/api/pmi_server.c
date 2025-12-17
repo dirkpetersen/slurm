@@ -30,15 +30,17 @@
 
 #include "slurm/slurm_errno.h"
 
-#include "src/api/slurm_pmi.h"
 #include "src/common/macros.h"
 #include "src/common/read_config.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
+#include "src/common/threadpool.h"
 #include "src/common/timers.h"
+#include "src/common/xmalloc.h"
 #include "src/common/xsignal.h"
 #include "src/common/xstring.h"
-#include "src/common/xmalloc.h"
+
+#include "src/api/slurm_pmi.h"
 
 #define _DEBUG           0	/* non-zero for extra KVS logging */
 #define _DEBUG_TIMING    0	/* non-zero for KVS timing details */
@@ -62,6 +64,7 @@ static int pmi_kvs_no_dup_keys = 1;
 struct barrier_resp {
 	uint16_t port;
 	char *hostname;
+	char *tls_cert;
 };				/* details for barrier task communications */
 struct barrier_resp *barrier_ptr = NULL;
 uint32_t barrier_resp_cnt = 0;	/* tasks having reached barrier */
@@ -149,6 +152,7 @@ static void *_msg_thread(void *x)
 		msg_arg_ptr->bar_ptr->port);
 	msg_send.msg_type = PMI_KVS_GET_RESP;
 	msg_send.data = (void *) msg_arg_ptr->kvs_ptr;
+	msg_send.tls_cert = msg_arg_ptr->bar_ptr->tls_cert;
 	slurm_set_addr(&msg_send.address,
 		msg_arg_ptr->bar_ptr->port,
 		msg_arg_ptr->bar_ptr->hostname);
@@ -223,6 +227,8 @@ static void *_agent(void *x)
 					args->barrier_xmit_ptr[j].port;
 			kvs_host_list[host_cnt].hostname =
 					args->barrier_xmit_ptr[j].hostname;
+			kvs_host_list[host_cnt].tls_cert =
+					args->barrier_xmit_ptr[j].tls_cert;
 			args->barrier_xmit_ptr[j].port = 0;/* don't reissue */
 			host_cnt++;
 			if (host_cnt >= pmi_fanout)
@@ -271,8 +277,10 @@ static void *_agent(void *x)
 	for (i=0; i<kvs_set_cnt; i++)
 		xfree(kvs_set[i].kvs_host_ptr);
 	xfree(kvs_set);
-	for (i=0; i<args->barrier_xmit_cnt; i++)
+	for (i=0; i<args->barrier_xmit_cnt; i++) {
 		xfree(args->barrier_xmit_ptr[i].hostname);
+		xfree(args->barrier_xmit_ptr[i].tls_cert);
+	}
 	xfree(args->barrier_xmit_ptr);
 	for (i=0; i<args->kvs_xmit_cnt; i++) {
 		for (j=0; j<args->kvs_xmit_ptr[i]->kvs_cnt; j++) {
@@ -288,7 +296,7 @@ static void *_agent(void *x)
 	xfree(args);
 
 	END_TIMER;
-	debug("kvs_xmit time %ld usec", DELTA_TIMER);
+	debug("kvs_xmit time %s", TIMER_STR());
 	return NULL;
 }
 
@@ -444,7 +452,7 @@ extern int pmi_kvs_put(kvs_comm_set_t *kvs_set_ptr)
 	kvs_updated = 1;
 	slurm_mutex_unlock(&kvs_mutex);
 	END_TIMER;
-	usec_timer = DELTA_TIMER;
+	usec_timer = TIMER_DURATION_USEC();
 	min_time_kvs_put = MIN(min_time_kvs_put, usec_timer);
 	max_time_kvs_put = MAX(max_time_kvs_put, usec_timer);
 	tot_time_kvs_put += usec_timer;
@@ -500,6 +508,8 @@ extern int pmi_kvs_get(kvs_get_msg_t *kvs_get_ptr)
 	barrier_ptr[kvs_get_ptr->task_id].port = kvs_get_ptr->port;
 	barrier_ptr[kvs_get_ptr->task_id].hostname = kvs_get_ptr->hostname;
 	kvs_get_ptr->hostname = NULL; /* just moved the pointer */
+	barrier_ptr[kvs_get_ptr->task_id].tls_cert = kvs_get_ptr->tls_cert;
+	kvs_get_ptr->tls_cert = NULL;
 	if (barrier_resp_cnt == barrier_cnt) {
 #if _DEBUG_TIMING
 		info("task[%d] at %u", 0, tm[0]);

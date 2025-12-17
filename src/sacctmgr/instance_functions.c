@@ -43,22 +43,17 @@
 
 static int _set_cond(int *start, int argc, char **argv,
 		     slurmdb_instance_cond_t *instance_cond,
-		     List format_list)
+		     list_t *format_list)
 {
 	int i, end = 0;
 	int set = 0;
 	int command_len = 0;
 
 	for (i = (*start); i < argc; i++) {
-		end = parse_option_end(argv[i]);
-		if (!end)
-			command_len = strlen(argv[i]);
-		else {
-			command_len = end - 1;
-			if (argv[i][end] == '=') {
-				end++;
-			}
-		}
+		int op_type;
+		end = parse_option_end(argv[i], &op_type, &command_len);
+		if (!common_verify_option_syntax(argv[i], op_type, false))
+			continue;
 
 		if (!end &&
 		    !xstrncasecmp(argv[i], "where", MAX(command_len, 5))) {
@@ -130,9 +125,9 @@ extern int sacctmgr_list_instance(int argc, char **argv)
 	slurmdb_instance_cond_t *instance_cond = xmalloc(
 		sizeof(slurmdb_instance_cond_t));
 	slurmdb_instance_rec_t *instance = NULL;
-	List format_list; /* list of char * */
-	List instance_list = NULL; /* list of slurmdb_instance_rec_t */
-	List print_fields_list; /* list of print_field_t */
+	list_t *format_list; /* list of char * */
+	list_t *instance_list = NULL; /* list of slurmdb_instance_rec_t */
+	list_t *print_fields_list; /* list of print_field_t */
 	list_itr_t *itr = NULL;
 	list_itr_t *itr2 = NULL;
 	print_field_t *field = NULL;

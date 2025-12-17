@@ -1,4 +1,4 @@
-.TH "cgroup.conf" "5" "Slurm Configuration File" "July 2024" "Slurm Configuration File"
+.TH "cgroup.conf" "5" "Slurm Configuration File" "Slurm 26.05" "Slurm Configuration File"
 
 .SH "NAME"
 cgroup.conf \- Slurm configuration file for the cgroup support
@@ -38,14 +38,27 @@ the cgroups, "cgroup/v1" which supports the legacy interface of cgroup v1,
 "cgroup/v2" for the unified cgroup2 architecture, and "autodetect" which tries
 to determine which cgroup version does your system provide. "autodetect" is
 useful to have a single configuration in clusters where nodes can have different
-cgroup versions. The default value is "autodetect".
+cgroup versions. The default value is "autodetect" on linux, otherwise the
+default is "disabled".
+
+NOTE: cgroup/v1 plugin is deprecated and no new features will be added to it.
+It is recommended that you switch to cgroup/v2 at your earliest convenience.
+.IP
+
+.TP
+\fBCgroupSlice\fR=\fISLICE_NAME\fR
+Start slurmd and the slurmstepd scope in the specified slice. If starting
+slurmd with systemd, you should also add the Slice= property under the [Service]
+section of slurmd.service file. Changing this parameter requires to stop all
+the slurmstepd scopes in the node and restart slurmd. Applies only to cgroup v2.
+The default is system.slice.
 .IP
 
 .TP
 \fBSystemdTimeout\fR=\fI<number>\fR
 On slow systems like virtual machines or when systemd is busy, it can take
 a lot of time to initialize and prepare the scope for slurmd during startup.
-Slurm will wait a maximum of this amount of time (in miliseconds) for the
+Slurm will wait a maximum of this amount of time (in milliseconds) for the
 scope to be ready before failing. Only applies to cgroup/v2.
 The default is 1000 ms.
 .IP
@@ -73,6 +86,15 @@ the available controllers from root's cgroup.controllers file
 (\fBCgroupMountPoint\fR, by default /sys/fs/cgroup/cgroup.controllers) and makes
 them available in all levels of the cgroup tree until it reaches Slurm's cgroup
 leaf.
+.IP
+
+.TP
+\fBEnableExtraControllers\fR=\fI<all|controller1[,controller2,...]>\fR
+This will enable extra controllers not natively used by Slurm in the job cgroup
+subtree. If combined with EnableControllers it will enable them in all the
+levels of the cgroup tree from the OS root cgroup. The controllers that can be
+enabled are io, pids, rdma, hugetlb and misc or all. If they do not exist in the
+system an error is logged. Only for cgroup/v2.
 .IP
 
 .SH "TASK/CGROUP PLUGIN"
@@ -203,7 +225,9 @@ must be set to \fByes\fR in order for this parameter to be applied.
 Set a lower bound (in MB) on the memory limits defined by
 \fBAllowedRAMSpace\fR and \fBAllowedSwapSpace\fR. This prevents
 accidentally creating a memory cgroup with such a low limit that slurmstepd
-is immediately killed due to lack of RAM. The default limit is 30M.
+is immediately killed due to lack of RAM. If this happens, cleanup will not be
+performed and temporary files, sockets and directories can remain in the node.
+The default limit is 30M.
 .IP
 
 .SH "PROCTRACK/CGROUP PLUGIN"

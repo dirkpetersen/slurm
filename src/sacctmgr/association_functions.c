@@ -43,51 +43,43 @@
 
 static int _set_cond(int *start, int argc, char **argv,
 		     slurmdb_assoc_cond_t *assoc_cond,
-		     List format_list)
+		     list_t *format_list)
 {
 	int i, end = 0;
 	int set = 0;
 	int command_len = 0;
-	int option = 0;
 	for (i=(*start); i<argc; i++) {
-		end = parse_option_end(argv[i]);
-		if (!end)
-			command_len=strlen(argv[i]);
-		else {
-			command_len=end-1;
-			if (argv[i][end] == '=') {
-				option = (int)argv[i][end-1];
-				end++;
-			}
-		}
+		int op_type;
+		end = parse_option_end(argv[i], &op_type, &command_len);
+		if (!common_verify_option_syntax(argv[i], op_type, false))
+			continue;
 
 		if (!end && !xstrncasecmp(argv[i], "OnlyDefaults",
 					  MAX(command_len, 2))) {
-			assoc_cond->only_defs = 1;
+			assoc_cond->flags |= ASSOC_COND_FLAG_ONLY_DEFS;
 			set = 1;
 		} else if (!end && !xstrncasecmp(argv[i], "Tree",
 					  MAX(command_len, 4))) {
 			tree_display = 1;
 		} else if (!end && !xstrncasecmp(argv[i], "WithDeleted",
 						 MAX(command_len, 5))) {
-			assoc_cond->with_deleted = 1;
+			assoc_cond->flags |= ASSOC_COND_FLAG_WITH_DELETED;
 		} else if (!end &&
 			   !xstrncasecmp(argv[i], "WithRawQOSLevel",
 					 MAX(command_len, 5))) {
-			assoc_cond->with_raw_qos = 1;
+			assoc_cond->flags |= ASSOC_COND_FLAG_RAW_QOS;
 		} else if (!end &&
 			   !xstrncasecmp(argv[i], "WithSubAccounts",
 					 MAX(command_len, 5))) {
-			assoc_cond->with_sub_accts = 1;
+			assoc_cond->flags |= ASSOC_COND_FLAG_SUB_ACCTS;
 		} else if (!end && !xstrncasecmp(argv[i], "WOPInfo",
 						 MAX(command_len, 4))) {
-			assoc_cond->without_parent_info = 1;
-		} else if (!end && !xstrncasecmp(argv[i], "WOPLimits",
-						 MAX(command_len, 4))) {
-			assoc_cond->without_parent_limits = 1;
-		} else if (!end && !xstrncasecmp(argv[i], "WOLimits",
-						 MAX(command_len, 3))) {
-			assoc_cond->without_parent_limits = 1;
+			assoc_cond->flags |= ASSOC_COND_FLAG_WOPI;
+		} else if (!end && (!xstrncasecmp(argv[i], "WOPLimits",
+						  MAX(command_len, 4)) ||
+				    !xstrncasecmp(argv[i], "WOLimits",
+						  MAX(command_len, 3)))) {
+			assoc_cond->flags |= ASSOC_COND_FLAG_WOPL;
 		} else if (!end && !xstrncasecmp(argv[i], "where",
 						 MAX(command_len, 5))) {
 			continue;
@@ -120,8 +112,8 @@ static int _set_cond(int *start, int argc, char **argv,
 				slurm_addto_char_list(format_list,
 						      argv[i]+end);
 		} else if (!(set = sacctmgr_set_assoc_cond(
-				    assoc_cond, argv[i], argv[i]+end,
-				    command_len, option)) || exit_code) {
+				     assoc_cond, argv[i], argv[i]+end,
+				     command_len)) || exit_code) {
 			exit_code = 1;
 			fprintf(stderr, " Unknown condition: %s\n", argv[i]);
 		}
@@ -133,8 +125,8 @@ static int _set_cond(int *start, int argc, char **argv,
 }
 
 extern int sacctmgr_set_assoc_cond(slurmdb_assoc_cond_t *assoc_cond,
-					 char *type, char *value,
-					 int command_len, int option)
+				   char *type, char *value,
+				   int command_len)
 {
 	int set =0;
 
@@ -205,7 +197,7 @@ extern int sacctmgr_set_assoc_cond(slurmdb_assoc_cond_t *assoc_cond,
 				db_conn, NULL);
 
 		if (slurmdb_addto_qos_char_list(assoc_cond->qos_list,
-						g_qos_list, value, option) > 0)
+						g_qos_list, value, 0) > 0)
 			set = 1;
 	} else if (!xstrncasecmp(type, "Users", MAX(command_len, 1))) {
 		if (!assoc_cond->user_list)
@@ -220,13 +212,15 @@ extern int sacctmgr_set_assoc_cond(slurmdb_assoc_cond_t *assoc_cond,
 
 extern int sacctmgr_set_assoc_rec(slurmdb_assoc_rec_t *assoc,
 				  char *type, char *value,
-				  int command_len, int option)
+				  int command_len, int option,
+				  bool *allow_option)
 {
 	int set = 0;
 	uint32_t mins = NO_VAL;
 	uint64_t tmp64;
 	char *tmp_char = NULL;
-	uint32_t tres_flags = TRES_STR_FLAG_SORT_ID | TRES_STR_FLAG_REPLACE;
+	uint32_t tres_flags = TRES_STR_FLAG_SORT_ID | TRES_STR_FLAG_REPLACE |
+		TRES_STR_FLAG_ALLOW_AMEND;
 
 	if (!assoc)
 		return set;
@@ -519,6 +513,7 @@ extern int sacctmgr_set_assoc_rec(slurmdb_assoc_rec_t *assoc,
 		    SLURM_SUCCESS)
 			set = 1;
 	} else if (!xstrncasecmp(type, "QosLevel", MAX(command_len, 1))) {
+		*allow_option = true;
 		if (!assoc->qos_list)
 			assoc->qos_list = list_create(xfree_ptr);
 
@@ -535,8 +530,28 @@ extern int sacctmgr_set_assoc_rec(slurmdb_assoc_rec_t *assoc,
 	return set;
 }
 
+extern void sacctmgr_print_default_qos(uint32_t def_qos_id,
+				       print_field_t *field, bool last)
+{
+	char *tmp_char = NULL, *print_acct = NULL;
+
+	if (!g_qos_list)
+		g_qos_list = slurmdb_qos_get(db_conn, NULL);
+
+	if (def_qos_id != NO_VAL) {
+		tmp_char = slurmdb_qos_str(g_qos_list, def_qos_id);
+		if (!tmp_char)
+			tmp_char = print_acct =
+				xstrdup_printf("UNKN-%u", def_qos_id);
+	} else
+		tmp_char = print_acct = xstrdup("");
+
+	field->print_routine(field, tmp_char, last);
+	xfree(print_acct);
+}
+
 extern void sacctmgr_print_assoc_rec(slurmdb_assoc_rec_t *assoc,
-				     print_field_t *field, List tree_list,
+				     print_field_t *field, list_t *tree_list,
 				     bool last)
 {
 	char *print_acct = NULL;
@@ -579,20 +594,7 @@ extern void sacctmgr_print_assoc_rec(slurmdb_assoc_rec_t *assoc,
 		field->print_routine(field, assoc->comment, last);
 		break;
 	case PRINT_DQOS:
-		if (!g_qos_list)
-			g_qos_list = slurmdb_qos_get(
-				db_conn, NULL);
-		if (assoc->def_qos_id != NO_VAL) {
-			tmp_char = slurmdb_qos_str(g_qos_list,
-						   assoc->def_qos_id);
-			if (!tmp_char)
-				tmp_char = print_acct =
-					xstrdup_printf("UNKN-%u",
-						       assoc->def_qos_id);
-		} else
-			tmp_char = print_acct = xstrdup("");
-		field->print_routine(field, tmp_char, last);
-		xfree(print_acct);
+		sacctmgr_print_default_qos(assoc->def_qos_id, field, last);
 		break;
 	case PRINT_FAIRSHARE:
 		if (assoc->shares_raw == SLURMDB_FS_USE_PARENT)
@@ -744,9 +746,6 @@ extern void sacctmgr_print_assoc_rec(slurmdb_assoc_rec_t *assoc,
 	case PRINT_QOS_RAW:
 		field->print_routine(field, &assoc->qos_list, last);
 		break;
-	case PRINT_RGT:
-		field->print_routine(field, &assoc->rgt, last);
-		break;
 	case PRINT_USER:
 		field->print_routine(field, assoc->user, last);
 		break;
@@ -761,20 +760,20 @@ extern int sacctmgr_list_assoc(int argc, char **argv)
 	int rc = SLURM_SUCCESS;
 	slurmdb_assoc_cond_t *assoc_cond =
 		xmalloc(sizeof(slurmdb_assoc_cond_t));
-	List assoc_list = NULL;
+	list_t *assoc_list = NULL;
 	slurmdb_assoc_rec_t *assoc = NULL;
 	int i=0;
 	list_itr_t *itr = NULL;
 	list_itr_t *itr2 = NULL;
 	char *last_cluster = NULL;
-	List tree_list = NULL;
+	list_t *tree_list = NULL;
 
 	int field_count = 0;
 
 	print_field_t *field = NULL;
 
-	List format_list = list_create(xfree_ptr);
-	List print_fields_list; /* types are of print_field_t */
+	list_t *format_list = list_create(xfree_ptr);
+	list_t *print_fields_list; /* types are of print_field_t */
 
 	for (i=0; i<argc; i++) {
 		int command_len = strlen(argv[i]);
@@ -790,7 +789,7 @@ extern int sacctmgr_list_assoc(int argc, char **argv)
 		return SLURM_ERROR;
 	} else if (!list_count(format_list)) {
 		slurm_addto_char_list(format_list, "Cluster,Account,User,Part");
-		if (!assoc_cond->without_parent_limits)
+		if (!(assoc_cond->flags & ASSOC_COND_FLAG_WOPL))
 			slurm_addto_char_list(format_list,
 					      "Share,Priority,GrpJ,GrpTRES,"
 					      "GrpS,GrpWall,GrpTRESMins,MaxJ,"

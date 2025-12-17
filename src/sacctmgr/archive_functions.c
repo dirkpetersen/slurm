@@ -63,15 +63,10 @@ static int _set_cond(int *start, int argc, char **argv,
 	job_cond = arch_cond->job_cond;
 
 	for (i=(*start); i<argc; i++) {
-		end = parse_option_end(argv[i]);
-		if (!end)
-			command_len=strlen(argv[i]);
-		else {
-			command_len=end-1;
-			if (argv[i][end] == '=') {
-				end++;
-			}
-		}
+		int op_type;
+		end = parse_option_end(argv[i], &op_type, &command_len);
+		if (!common_verify_option_syntax(argv[i], op_type, false))
+			continue;
 
 		if (!end && !xstrncasecmp(argv[i], "where",
 					MAX(command_len, 5))) {
@@ -473,15 +468,10 @@ extern int sacctmgr_archive_load(int argc, char **argv)
 	int i, command_len = 0;
 
 	for (i = 0; i < argc; i++) {
-		int end = parse_option_end(argv[i]);
-		if (!end)
-			command_len=strlen(argv[i]);
-		else {
-			command_len=end-1;
-			if (argv[i][end] == '=') {
-				end++;
-			}
-		}
+		int op_type;
+		int end = parse_option_end(argv[i], &op_type, &command_len);
+		if (!common_verify_option_syntax(argv[i], op_type, false))
+			continue;
 
 		if (!end
 		   || !xstrncasecmp(argv[i], "File", MAX(command_len, 1))) {
@@ -510,10 +500,18 @@ extern int sacctmgr_archive_load(int argc, char **argv)
 	rc = slurmdb_archive_load(db_conn, arch_rec);
 	if (rc == SLURM_SUCCESS) {
 		if (commit_check("Would you like to commit changes?")) {
-			slurmdb_connection_commit(db_conn, 1);
+			rc = slurmdb_connection_commit(db_conn, 1);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr,
+					"Error committing changes: %s\n",
+					slurm_strerror(rc));
 		} else {
 			printf(" Changes Discarded\n");
-			slurmdb_connection_commit(db_conn, 0);
+			rc = slurmdb_connection_commit(db_conn, 0);
+			if (rc != SLURM_SUCCESS)
+				fprintf(stderr,
+					"Error rolling back changes: %s\n",
+					slurm_strerror(rc));
 		}
 	} else {
 		exit_code = 1;

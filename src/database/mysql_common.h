@@ -65,7 +65,7 @@ typedef struct {
 	uint32_t flags;
 	pthread_mutex_t lock;
 	char *pre_commit_query;
-	List update_list;
+	list_t *update_list;
 	int conn;
 	uint64_t wsrep_trx_fragment_size_orig;
 	char *wsrep_trx_fragment_unit_orig;
@@ -78,6 +78,10 @@ typedef struct {
 	char *user;
 	char *params;
 	char *pass;
+	char *pass_script;
+	time_t token_expires;
+	uint32_t token_duration;
+	pthread_mutex_t token_lock;
 } mysql_db_info_t;
 
 typedef struct {

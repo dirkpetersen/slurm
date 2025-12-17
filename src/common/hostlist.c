@@ -55,6 +55,7 @@
 #include "src/common/hostlist.h"
 #include "src/common/log.h"
 #include "src/common/macros.h"
+#include "src/common/read_config.h"
 #include "src/common/strnatcmp.h"
 #include "src/common/timers.h"
 #include "src/common/working_cluster.h"
@@ -68,6 +69,7 @@
  */
 strong_alias(hostlist_create_dims,	slurm_hostlist_create_dims);
 strong_alias(hostlist_create,		slurm_hostlist_create);
+strong_alias(hostlist_create_client,	slurm_hostlist_create_client);
 strong_alias(hostlist_copy,		slurm_hostlist_copy);
 strong_alias(hostlist_count,		slurm_hostlist_count);
 strong_alias(hostlist_delete,		slurm_hostlist_delete);
@@ -87,6 +89,7 @@ strong_alias(hostlist_iterator_destroy,	slurm_hostlist_iterator_destroy);
 strong_alias(hostlist_iterator_reset,	slurm_hostlist_iterator_reset);
 strong_alias(hostlist_next,		slurm_hostlist_next);
 strong_alias(hostlist_nth,		slurm_hostlist_nth);
+strong_alias(hostlist_drop, slurm_hostlist_drop);
 strong_alias(hostlist_pop,		slurm_hostlist_pop);
 strong_alias(hostlist_push,		slurm_hostlist_push);
 strong_alias(hostlist_push_host_dims,	slurm_hostlist_push_host_dims);
@@ -103,6 +106,7 @@ strong_alias(hostlist_remove,		slurm_hostlist_remove);
 strong_alias(hostlist_shift,		slurm_hostlist_shift);
 strong_alias(hostlist_shift_dims,	slurm_hostlist_shift_dims);
 strong_alias(hostlist_sort,		slurm_hostlist_sort);
+strong_alias(hostlist_split_treewidth, slurm_hostlist_split_treewidth);
 strong_alias(hostlist_cmp_first,	slurm_hostlist_cmp_first);
 strong_alias(hostlist_uniq,		slurm_hostlist_uniq);
 strong_alias(hostset_count,		slurm_hostset_count);
@@ -127,9 +131,6 @@ do {						\
 
 /* number of elements to allocate when extending the hostlist array */
 #define HOSTLIST_CHUNK    16
-
-/* max host range: anything larger will be assumed to be an error */
-#define MAX_RANGE    (64*1024)    /* 64K Hosts */
 
 /* max number of ranges that will be processed between brackets */
 #define MAX_RANGES   (256*1024)    /* 256K ranks */
@@ -1354,7 +1355,7 @@ hostlist_t *_hostlist_create(const char *hostlist, char *sep, char *r_op,
 		high = low = 0;
 
 		/* find end of alpha part
-		 *   do this by finding last occurence of range_op in str */
+		 *   do this by finding last occurrence of range_op in str */
 		pos = strlen(tok) - 1;
 		if (strstr(tok, r_op) != '\0') {
 			while (pos >= 0 && (char) tok[pos] != range_op)
@@ -1818,6 +1819,23 @@ hostlist_t *hostlist_create(const char *str)
 	return hostlist_create_dims(str, dims);
 }
 
+extern hostlist_t *hostlist_create_client(const char *str)
+{
+	if (xstrchr(str, '{')) {
+		char *hostlist = NULL;
+		hostlist_t *hl = NULL;
+		if (!slurm_controller_hostlist_expansion(str, &hostlist)) {
+			hl = _hostlist_create(hostlist, "\t, \n", "-", 1);
+			xfree(hostlist);
+			return hl;
+		} else {
+			error("%s: controller failed to expand hostlist function",
+			      __func__);
+		}
+	}
+	return _hostlist_create(str, "\t, \n", "-", 1);
+}
+
 hostlist_t *hostlist_copy(hostlist_t *hl)
 {
 	int i;
@@ -1863,7 +1881,8 @@ int hostlist_push(hostlist_t *hl, const char *hosts)
 	int retval;
 	if (!hosts || !hl)
 		return 0;
-	new = hostlist_create(hosts);
+	if (!(new = hostlist_create(hosts)))
+		return 0;
 	LOCK_HOSTLIST(new);
 	retval = new->nhosts;
 	UNLOCK_HOSTLIST(new);
@@ -1922,6 +1941,30 @@ int hostlist_push_list(hostlist_t *h1, hostlist_t *h2)
 	return n;
 }
 
+extern void hostlist_drop(hostlist_t *hl)
+{
+	if (!hl) {
+		error("%s: no hostlist given", __func__);
+		return;
+	}
+
+	LOCK_HOSTLIST(hl);
+	if (hl->nhosts > 0) {
+		hostrange_t *hr = hl->hr[hl->nranges - 1];
+
+		if (hostrange_count(hr) > 0)
+			hr->hi--;
+
+		hl->nhosts--;
+
+		if (hr->singlehost || hostrange_empty(hr)) {
+			hostrange_destroy(hl->hr[--hl->nranges]);
+			hl->hr[hl->nranges] = NULL;
+		}
+	}
+	UNLOCK_HOSTLIST(hl);
+}
+
 char *hostlist_pop(hostlist_t *hl)
 {
 	char *host = NULL;
@@ -1958,11 +2001,27 @@ static void hostlist_shift_iterators(hostlist_t *hl, int idx, int depth, int n)
 			if (i->idx == idx && i->depth >= depth)
 				i->depth = i->depth > -1 ? i->depth - 1 : -1;
 		} else {
+			/* Modify iter if rm indexes have already been seen */
 			if (i->idx >= idx) {
-				if ((i->idx -= n) >= 0)
-					i->hr = i->hl->hr[i->idx];
-				else
-					hostlist_iterator_reset(i);
+				/* Current referenced host range was deleted */
+				if (i->idx < (idx + n)) {
+					/*
+					 * idx is now the index of the first
+					 * host range after the deleted ones
+					 */
+					i->idx = idx;
+					i->depth = -1; /* reset depth */
+				} else {
+					/*
+					 * Current host range not deleted,
+					 * update i->idx to the current host
+					 * range's new index but keep depth the
+					 * same.
+					 */
+					i->idx -= n;
+				}
+
+				i->hr = i->hl->hr[i->idx];
 			}
 		}
 	}
@@ -2399,6 +2458,143 @@ void hostlist_parse_int_to_array(int in, int *out, int dims, int base)
 
 	for ( ; --dims >= 0; in /= hostlist_base)
 		out[dims] = in % hostlist_base;
+}
+
+/* this is used to set how many nodes are going to be on each branch
+ * of the tree.
+ * IN total       - total number of nodes to send to
+ * IN tree_width  - how wide the tree should be on each hop
+ * OUT span       - pointer to int array tree_width in length each space
+ *		    containing the number of nodes to send to each hop
+ *		    on the span.
+ * RET int	  - the number of levels opened in the tree, or SLURM_ERROR
+ */
+static int _set_span(int total, uint16_t tree_width, int **span)
+{
+	int depth = 0;
+
+	/* This should not happen. This is an error. */
+	if (!span || total < 1)
+		return SLURM_ERROR;
+
+	/* If default span */
+	if (!tree_width)
+		tree_width = slurm_conf.tree_width;
+
+	/* Safeguard from leaks */
+	if (*span)
+		xfree(*span);
+
+	/*
+	 * Memory optimization:
+	 * Don't allocate if we are in the last step to the leaves, as this is
+	 * considered direct communication and we don't really need it.
+	 */
+	if (total <= tree_width)
+		return 1;
+
+	/* Each cell will contain the #nodes below this specific branch */
+	*span = xcalloc(tree_width, sizeof(int));
+
+	/*
+	 * Try to fill levels until no more nodes are available.
+	 *
+	 * Each time a new level is created, it is exponentially bigger than the
+	 * previous one
+	 */
+	for (uint32_t branch_capacity = 1, level_capacity = tree_width; total;
+	     branch_capacity *= tree_width, level_capacity *= tree_width) {
+		/* Remaining nodes can fill a whole new level up, or not */
+		if (level_capacity <= total) {
+			for (int i = 0; i < tree_width; i++)
+				(*span)[i] += branch_capacity;
+			total -= level_capacity;
+		} else {
+			/* Evenly distribute remaining nodes */
+			branch_capacity = total / tree_width;
+			/* But left the division remainder ones */
+			level_capacity = branch_capacity * tree_width;
+			/* Fill current level up, as much as possible */
+			for (int i = 0; i < tree_width; i++)
+				(*span)[i] += branch_capacity;
+			total -= level_capacity;
+
+			/* Evenly distribute the remainder nodes */
+			for (int i = 0; total; i++, total--)
+				(*span)[i]++;
+
+			/* total == 0 always at this point */
+		}
+
+		/* One level more has been added */
+		depth++;
+
+		/* The level needed all the nodes, no more levels are added */
+		if (!total)
+			break;
+	}
+
+	/* Inform the caller about the number of levels below itself */
+	return depth;
+}
+
+/* Split a hostlist into a fanout tree */
+extern int hostlist_split_treewidth(hostlist_t *hl, hostlist_t ***sp_hl,
+				    int *count, uint16_t tree_width)
+{
+	int host_count = hostlist_count(hl), depth, *span = NULL;
+	char *name;
+
+	/* If default span */
+	if (!tree_width)
+		tree_width = slurm_conf.tree_width;
+
+	/* This should not happen. This is an error. */
+	if ((depth = _set_span(host_count, tree_width, &span)) < 0)
+		return SLURM_ERROR;
+
+	/*
+	 * Memory optimization:
+	 * _set_span doesn't return array for direct communication
+	 * (if depth == 1 then span == NULL), so we just fill the hostlist array
+	 * directly.
+	 */
+	if (depth == 1)
+		tree_width = host_count;
+
+	/* Each cell will contain the hostlist below this specific branch */
+	*sp_hl = xcalloc(tree_width, sizeof(hostlist_t *));
+
+	/*
+	 * Fill the hostlists for each branch according to the distribution in
+	 * set_span.
+	 *
+	 * Additionally, try to preserve network locality (based on distance)
+	 * for subtrees, by assuming consecutive nodes are placed one next to
+	 * each other
+	 */
+	for (*count = 0; (*count < tree_width) && (name = hostlist_shift(hl));
+	     (*count)++) {
+		/* Open the new branch, and add the 1st one */
+		(*sp_hl)[*count] = hostlist_create(name);
+		free(name);
+
+		/* Consecutively add the rest of nodes for this branch */
+		for (int i = 1; span && (i < span[*count]); i++) {
+			name = hostlist_shift(hl);
+			hostlist_push_host((*sp_hl)[*count], name);
+			free(name);
+		}
+		if (slurm_conf.debug_flags & DEBUG_FLAG_ROUTE) {
+			char *buf =
+			hostlist_ranged_string_xmalloc((*sp_hl)[*count]);
+			debug("ROUTE: ... sublist[%d] %s", *count, buf);
+			xfree(buf);
+		}
+	}
+
+	xfree(span);
+	return depth;
 }
 
 /* return true if a bracket is needed for the range at i in hostlist hl */
@@ -2902,7 +3098,7 @@ ssize_t hostlist_ranged_string_dims(hostlist_t *hl, size_t n, char *buf,
 				offset[i] = offset[i+1] * hostlist_base;
 		}
 
-		/* Set this bitmap up once and clear it when everytime
+		/* Set this bitmap up once and clear it when every time
 		   instead of reallocing.  Turns out to be about 5
 		   times faster doing it this way.  It does leak the
 		   last alloc, but that shouldn't be a big deal.

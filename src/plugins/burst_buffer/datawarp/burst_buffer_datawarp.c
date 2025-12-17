@@ -61,10 +61,13 @@
 #include "src/common/run_command.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
+#include "src/common/state_save.h"
+#include "src/common/threadpool.h"
 #include "src/common/timers.h"
 #include "src/common/uid.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
+
 #include "src/slurmctld/agent.h"
 #include "src/slurmctld/job_scheduler.h"
 #include "src/slurmctld/locks.h"
@@ -72,6 +75,7 @@
 #include "src/slurmctld/slurmctld.h"
 #include "src/slurmctld/state_save.h"
 #include "src/slurmctld/trigger_mgr.h"
+
 #include "src/plugins/burst_buffer/common/burst_buffer_common.h"
 
 #define _DEBUG 0	/* Detailed debugging information */
@@ -85,34 +89,10 @@
 #define LINE_BB    1
 #define LINE_DW    2
 
-/*
- * These variables are required by the burst buffer plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *      <application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "burst_buffer" for Slurm burst_buffer) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will only
- * load a burst_buffer plugin if the plugin_type string has a prefix of
- * "burst_buffer/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-const char plugin_name[]        = "burst_buffer datawarp plugin";
-const char plugin_type[]        = "burst_buffer/datawarp";
-const uint32_t plugin_version   = SLURM_VERSION_NUMBER;
+/* Required Slurm plugin symbols: */
+const char plugin_name[] = "burst_buffer datawarp plugin";
+const char plugin_type[] = "burst_buffer/datawarp";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
 /* Most state information is in a common structure so that we can more
  * easily use common functions from multiple burst buffer plugins */
@@ -744,12 +724,11 @@ static void _apply_limits(void)
 static void _save_bb_state(void)
 {
 	static time_t last_save_time = 0;
-	static int high_buffer_size = 16 * 1024;
+	static uint32_t high_buffer_size = 16 * 1024;
 	time_t save_time = time(NULL);
 	bb_alloc_t *bb_alloc;
 	uint32_t rec_count = 0;
 	buf_t *buffer;
-	char *old_file = NULL, *new_file = NULL, *reg_file = NULL;
 	int i, count_offset, offset;
 	uint16_t protocol_version = SLURM_PROTOCOL_VERSION;
 
@@ -793,20 +772,9 @@ static void _save_bb_state(void)
 		set_buf_offset(buffer, offset);
 	}
 
-	xstrfmtcat(old_file, "%s/%s", slurm_conf.state_save_location,
-	           "burst_buffer_cray_state.old");
-	xstrfmtcat(reg_file, "%s/%s", slurm_conf.state_save_location,
-	           "burst_buffer_cray_state");
-	xstrfmtcat(new_file, "%s/%s", slurm_conf.state_save_location,
-	           "burst_buffer_cray_state.new");
+	if (!save_buf_to_state("burst_buffer_cray_state", buffer, NULL))
+		last_save_time = save_time;
 
-	bb_write_state_file(old_file, reg_file, new_file, "burst_buffer_cray",
-			    buffer, high_buffer_size, save_time,
-			    &last_save_time);
-
-	xfree(old_file);
-	xfree(reg_file);
-	xfree(new_file);
 	FREE_NULL_BUFFER(buffer);
 }
 
@@ -814,13 +782,12 @@ static void _save_bb_state(void)
  * and QOS information for persistent burst buffers. */
 static void _recover_bb_state(void)
 {
-	char *state_file = NULL, *data = NULL;
-	int data_allocated, data_read = 0;
+	char *state_file = NULL;
 	uint16_t protocol_version = NO_VAL16;
-	uint32_t data_size = 0, rec_count = 0, name_len = 0;
+	uint32_t rec_count = 0;
 	uint32_t id = 0, user_id = 0;
 	uint64_t size = 0;
-	int i, state_fd;
+	int i;
 	char *account = NULL, *name = NULL;
 	char *partition = NULL, *pool = NULL, *qos = NULL;
 	char *end_ptr = NULL;
@@ -828,34 +795,16 @@ static void _recover_bb_state(void)
 	bb_alloc_t *bb_alloc;
 	buf_t *buffer;
 
-	state_fd = bb_open_state_file("burst_buffer_cray_state", &state_file);
-	if (state_fd < 0) {
+	errno = 0;
+	buffer = state_save_open("burst_buffer_cray_state", &state_file);
+	if (!buffer && (errno == ENOENT)) {
 		info("No burst buffer state file (%s) to recover",
 		     state_file);
 		xfree(state_file);
 		return;
 	}
-	data_allocated = BUF_SIZE;
-	data = xmalloc(data_allocated);
-	while (1) {
-		data_read = read(state_fd, &data[data_size], BUF_SIZE);
-		if (data_read < 0) {
-			if  (errno == EINTR)
-				continue;
-			else {
-				error("Read error on %s: %m", state_file);
-				break;
-			}
-		} else if (data_read == 0)     /* eof */
-			break;
-		data_size      += data_read;
-		data_allocated += data_read;
-		xrealloc(data, data_allocated);
-	}
-	close(state_fd);
 	xfree(state_file);
 
-	buffer = create_buf(data, data_size);
 	safe_unpack16(&protocol_version, buffer);
 	if (protocol_version == NO_VAL16) {
 		if (!ignore_state_errors)
@@ -869,13 +818,13 @@ static void _recover_bb_state(void)
 	safe_unpack32(&rec_count, buffer);
 	for (i = 0; i < rec_count; i++) {
 		if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-			safe_unpackstr_xmalloc(&account,   &name_len, buffer);
+			safe_unpackstr(&account, buffer);
 			safe_unpack_time(&create_time, buffer);
 			safe_unpack32(&id, buffer);
-			safe_unpackstr_xmalloc(&name,      &name_len, buffer);
-			safe_unpackstr_xmalloc(&partition, &name_len, buffer);
-			safe_unpackstr_xmalloc(&pool,      &name_len, buffer);
-			safe_unpackstr_xmalloc(&qos,       &name_len, buffer);
+			safe_unpackstr(&name, buffer);
+			safe_unpackstr(&partition, buffer);
+			safe_unpackstr(&pool, buffer);
+			safe_unpackstr(&qos, buffer);
 			safe_unpack32(&user_id, buffer);
 			if (bb_state.bb_config.flags & BB_FLAG_EMULATE_CRAY)
 				safe_unpack64(&size, buffer);
@@ -1354,7 +1303,7 @@ static void *_start_stage_in(void *x)
 	resp_msg = run_command(&run_command_args);
 	END_TIMER;
 	info("setup for job JobId=%u ran for %s",
-	     stage_args->job_id, TIME_STR);
+	     stage_args->job_id, TIMER_STR());
 
 	if (track_script_killed(pthread_self(), status, true)) {
 		/* I was killed by slurmtrack, bail out right now */
@@ -1423,7 +1372,7 @@ static void *_start_stage_in(void *x)
 		resp_msg = run_command(&run_command_args);
 		END_TIMER;
 		info("dws_data_in for JobId=%u ran for %s",
-		     stage_args->job_id, TIME_STR);
+		     stage_args->job_id, TIMER_STR());
 		if (track_script_killed(pthread_self(), status, true)) {
 			/* I was killed by slurmtrack, bail out right now */
 			info("dws_data_in for JobId=%u terminated by slurmctld",
@@ -1479,10 +1428,10 @@ static void *_start_stage_in(void *x)
 		run_command_args.script_type = "real_size";
 		resp_msg2 = run_command(&run_command_args);
 		END_TIMER;
-		if ((DELTA_TIMER > 200000) ||	/* 0.2 secs */
+		if ((TIMER_DURATION_USEC() > 200000) || /* 0.2 secs */
 		    (slurm_conf.debug_flags & DEBUG_FLAG_BURST_BUF))
 			info("real_size ran for %s",
-			     TIME_STR);
+			     TIMER_STR());
 
 		if (track_script_killed(pthread_self(), status, true)) {
 			/* I was killed by slurmtrack, bail out right now */
@@ -1672,10 +1621,10 @@ static void *_start_stage_out(void *x)
 	run_command_args.script_type = "dws_post_run";
 	resp_msg = run_command(&run_command_args);
 	END_TIMER;
-	if ((DELTA_TIMER > 500000) ||	/* 0.5 secs */
+	if ((TIMER_DURATION_USEC() > 500000) || /* 0.5 secs */
 	    (slurm_conf.debug_flags & DEBUG_FLAG_BURST_BUF)) {
 		info("dws_post_run for JobId=%u ran for %s",
-		     stage_args->job_id, TIME_STR);
+		     stage_args->job_id, TIMER_STR());
 	}
 
 	if (track_script_killed(pthread_self(), status, true)) {
@@ -1733,11 +1682,11 @@ static void *_start_stage_out(void *x)
 		run_command_args.script_type = "dws_data_out";
 		resp_msg = run_command(&run_command_args);
 		END_TIMER;
-		if ((DELTA_TIMER > 1000000) ||	/* 10 secs */
+		if ((TIMER_DURATION_USEC() > 1000000) || /* 10 secs */
 		    (slurm_conf.debug_flags & DEBUG_FLAG_BURST_BUF)) {
 			info("dws_data_out for JobId=%u ran for %s",
 			     stage_args->job_id,
-			     TIME_STR);
+			     TIMER_STR());
 		}
 
 		if (track_script_killed(pthread_self(), status, true)) {
@@ -1928,7 +1877,7 @@ static void *_start_teardown(void *x)
 	resp_msg = run_command(&run_command_args);
 	END_TIMER;
 	info("teardown for JobId=%u ran for %s",
-	     teardown_args->job_id, TIME_STR);
+	     teardown_args->job_id, TIMER_STR());
 
 	if (track_script_killed(pthread_self(), status, true)) {
 		/* I was killed by slurmtrack, bail out right now */
@@ -2523,13 +2472,13 @@ fini:	xfree(access);
 }
 
 /*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Read and validate configuration file here. Spawn thread to
- * periodically read Datawarp state.
+ * Read and validate configuration file.
+ * Spawn thread to periodically read Datawarp state.
  */
 extern int init(void)
 {
 	slurm_mutex_init(&bb_state.bb_mutex);
+	slurm_mutex_init(&bb_state.term_mutex);
 	slurm_mutex_lock(&bb_state.bb_mutex);
 	bb_load_config(&bb_state, (char *)plugin_type); /* Removes "const" */
 	_test_config();
@@ -2541,11 +2490,7 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-/*
- * fini() is called when the plugin is unloaded. Free all memory and shutdown
- * threads.
- */
-extern int fini(void)
+extern void fini(void)
 {
 	int pc, last_pc = 0;
 
@@ -2574,8 +2519,6 @@ extern int fini(void)
 	bb_clear_config(&bb_state.bb_config, true);
 	bb_clear_cache(&bb_state);
 	slurm_mutex_unlock(&bb_state.bb_mutex);
-
-	return SLURM_SUCCESS;
 }
 
 static void _pre_queue_stage_out(job_record_t *job_ptr, bb_job_t *bb_job)
@@ -3171,10 +3114,10 @@ extern int bb_p_job_validate2(job_record_t *job_ptr, char **err_msg)
 	run_command_args.script_argv = script_argv;
 	resp_msg = run_command(&run_command_args);
 	END_TIMER;
-	if ((DELTA_TIMER > 200000) ||	/* 0.2 secs */
+	if ((TIMER_DURATION_USEC() > 200000) || /* 0.2 secs */
 	    (slurm_conf.debug_flags & DEBUG_FLAG_BURST_BUF))
 		info("job_process ran for %s",
-		     TIME_STR);
+		     TIMER_STR());
 	_log_script_argv(script_argv, resp_msg);
 	if (!WIFEXITED(status) || (WEXITSTATUS(status) != 0)) {
 		error("job_process for %pJ status:%u response:%s",
@@ -3345,10 +3288,10 @@ extern time_t bb_p_job_get_est_start(job_record_t *job_ptr)
 /*
  * Attempt to allocate resources and begin file staging for pending jobs.
  */
-extern int bb_p_job_try_stage_in(List job_queue)
+extern int bb_p_job_try_stage_in(list_t *job_queue)
 {
 	bb_job_queue_rec_t *job_rec;
-	List job_candidates;
+	list_t *job_candidates;
 	list_itr_t *job_iter;
 	job_record_t *job_ptr;
 	bb_job_t *bb_job;
@@ -3577,10 +3520,10 @@ extern int bb_p_job_begin(job_record_t *job_ptr)
 		run_command_args.script_argv = script_argv;
 		resp_msg = run_command(&run_command_args);
 		END_TIMER;
-		if ((DELTA_TIMER > 200000) ||	/* 0.2 secs */
+		if ((TIMER_DURATION_USEC() > 200000) || /* 0.2 secs */
 		    (slurm_conf.debug_flags & DEBUG_FLAG_BURST_BUF))
 			info("paths ran for %s",
-			     TIME_STR);
+			     TIMER_STR());
 		_log_script_argv(script_argv, resp_msg);
 #if 1
 		//FIXME: Cray API returning "job_file_valid True" but exit 1 in some cases
@@ -3723,10 +3666,10 @@ static void *_start_pre_run(void *x)
 	lock_slurmctld(job_write_lock);
 	slurm_mutex_lock(&bb_state.bb_mutex);
 	job_ptr = find_job_record(pre_run_args->job_id);
-	if ((DELTA_TIMER > 500000) ||	/* 0.5 secs */
+	if ((TIMER_DURATION_USEC() > 500000) || /* 0.5 secs */
 	    (slurm_conf.debug_flags & DEBUG_FLAG_BURST_BUF)) {
 		info("dws_pre_run for %pJ ran for %s",
-		     job_ptr, TIME_STR);
+		     job_ptr, TIMER_STR());
 	}
 	if (job_ptr)
 		bb_job = _get_bb_job(job_ptr);
@@ -4311,7 +4254,7 @@ static void *_create_persistent(void *x)
 	xfree_array(script_argv);
 	END_TIMER;
 	info("create_persistent of %s ran for %s",
-	     create_args->name, TIME_STR);
+	     create_args->name, TIMER_STR());
 
 	if (track_script_killed(pthread_self(), status, true)) {
 		/* I was killed by slurmtrack, bail out right now */
@@ -4473,7 +4416,7 @@ static void *_destroy_persistent(void *x)
 	xfree_array(script_argv);
 	END_TIMER;
 	info("destroy_persistent of %s ran for %s",
-	     destroy_args->name, TIME_STR);
+	     destroy_args->name, TIMER_STR());
 
 	if (track_script_killed(pthread_self(), status, true)) {
 		/* I was killed by slurmtrack, bail out right now */
@@ -4584,7 +4527,7 @@ _bb_get_configs(int *num_ent, bb_state_t *state_ptr, uint32_t timeout)
 	resp_msg = run_command(&run_command_args);
 	END_TIMER;
 	log_flag(BURST_BUF, "show_configurations ran for %s",
-		 TIME_STR);
+		 TIMER_STR());
 	_log_script_argv(script_argv, resp_msg);
 	xfree_array(script_argv);
 #if 0
@@ -4658,7 +4601,7 @@ _bb_get_instances(int *num_ent, bb_state_t *state_ptr, uint32_t timeout)
 	resp_msg = run_command(&run_command_args);
 	END_TIMER;
 	log_flag(BURST_BUF, "show_instances ran for %s",
-		 TIME_STR);
+		 TIMER_STR());
 	_log_script_argv(script_argv, resp_msg);
 	xfree_array(script_argv);
 #if 0
@@ -4735,7 +4678,7 @@ _bb_get_pools(int *num_ent, bb_state_t *state_ptr, uint32_t timeout)
 		static uint32_t last_csum = 0;
 		uint32_t i, resp_csum = 0;
 		debug("pools ran for %s",
-		      TIME_STR);
+		      TIMER_STR());
 		for (i = 0; resp_msg[i]; i++)
 			resp_csum += ((i * resp_msg[i]) % 1000000);
 		if (last_csum != resp_csum)
@@ -4803,7 +4746,7 @@ _bb_get_sessions(int *num_ent, bb_state_t *state_ptr, uint32_t timeout)
 	resp_msg = run_command(&run_command_args);
 	END_TIMER;
 	log_flag(BURST_BUF, "show_sessions ran for %s",
-		 TIME_STR);
+		 TIMER_STR());
 	_log_script_argv(script_argv, resp_msg);
 	xfree_array(script_argv);
 #if 0

@@ -42,38 +42,17 @@
 
 #include "api.h"
 #include "events.h"
+#include "openapi.h"
 #include "parsers.h"
 #include "parsing.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "select" for Slurm node selection) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load select plugins if the plugin_type string has a
- * prefix of "select/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Slurm Data Parser " XSTRINGIFY(DATA_VERSION);
 const char plugin_type[] = "data_parser/" XSTRINGIFY(DATA_VERSION);
-const uint32_t plugin_id = PLUGIN_ID;
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
+/* Required for data_parser plugins: */
+const uint32_t plugin_id = PLUGIN_ID;
 
 extern int data_parser_p_dump(args_t *args, data_parser_type_t type, void *src,
 			      ssize_t src_bytes, data_t *dst)
@@ -95,7 +74,7 @@ extern int data_parser_p_dump(args_t *args, data_parser_type_t type, void *src,
 		return ESLURM_NOT_SUPPORTED;
 	}
 
-	return dump(src, src_bytes, parser, dst, args);
+	return dump(src, src_bytes, NULL, parser, dst, args);
 }
 
 extern int data_parser_p_parse(args_t *args, data_parser_type_t type, void *dst,
@@ -139,15 +118,19 @@ static void _parse_param(const char *param, args_t *args)
 		if (xstrcasecmp(bit->name, param))
 			continue;
 
-		log_flag(DATA, "parser(0x%"PRIxPTR") activated flag=%s",
-			 (uintptr_t) args, bit->flag_name);
+		if (bit->value == FLAG_PREFER_REFS) {
+			info("%s ignoring default flag %s",
+			     plugin_type, bit->flag_name);
+			return;
+		}
+
+		debug("%s activated flag %s", plugin_type, bit->flag_name);
 
 		args->flags |= bit->value;
 		return;
 	}
 
-	log_flag(DATA, "parser(0x%"PRIxPTR") ignoring param=%s",
-		 (uintptr_t) args, param);
+	warning("%s ignoring unknown flag %s", plugin_type, param);
 }
 
 extern args_t *data_parser_p_new(data_parser_on_error_t on_parse_error,
@@ -269,16 +252,17 @@ extern openapi_type_t data_parser_p_resolve_openapi_type(
 	if (!parser)
 		return OPENAPI_TYPE_INVALID;
 
+	if (parser->model == PARSER_MODEL_ALIAS)
+		return openapi_type_format_to_type(unalias_parser(
+			find_parser_by_type(parser->type))->obj_openapi);
+
 	if (!field)
 		return openapi_type_format_to_type(parser->obj_openapi);
 
 	for (int i = 0; i < parser->field_count; i++) {
 		if (!xstrcasecmp(parser->fields[i].field_name, field)) {
-			const parser_t *p =
-				find_parser_by_type(parser->fields[i].type);
-
-			while (p->pointer_type)
-				p = find_parser_by_type(p->pointer_type);
+			const parser_t *p = unalias_parser(
+				find_parser_by_type(parser->fields[i].type));
 
 			return openapi_type_format_to_type(p->obj_openapi);
 		}
@@ -297,8 +281,27 @@ extern const char *data_parser_p_resolve_type_string(args_t *args,
 	if (!parser)
 		return NULL;
 
-	while (parser->pointer_type)
-		parser = find_parser_by_type(parser->pointer_type);
+	parser = unalias_parser(parser);
 
 	return parser->type_string;
+}
+
+extern bool data_parser_p_is_complex(args_t *args)
+{
+	xassert(args->magic == MAGIC_ARGS);
+	return is_complex_mode(args);
+}
+
+extern bool data_parser_p_is_deprecated(args_t *args)
+{
+	xassert(args->magic == MAGIC_ARGS);
+	return IS_PLUGIN_DEPRECATED;
+}
+
+extern int data_parser_p_dump_flags(args_t *args, data_t *dst)
+{
+	xassert(args->magic == MAGIC_ARGS);
+
+	return data_parser_p_dump(args, DATA_PARSER_FLAGS, &args->flags,
+				  sizeof(args->flags), dst);
 }

@@ -46,6 +46,8 @@
 #include "src/common/list.h"
 #include "src/interfaces/accounting_storage.h"
 
+#define RC_AS_CLUSTER_ID SLURM_BIT(31)
+
 /* Slurm DBD message types */
 /* ANY TIME YOU ADD TO THIS LIST UPDATE THE CONVERSION FUNCTIONS! */
 typedef enum {
@@ -162,6 +164,10 @@ typedef enum {
 				 * add_assoc_cond */
 	DBD_GET_INSTANCES,	/* Get instance information */
 	DBD_GOT_INSTANCES,	/* Response to DBD_GET_INSTANCES */
+	DBD_GET_QOS_USAGE,  	/* Get qos usage information */
+	DBD_GOT_QOS_USAGE,  	/* Response to DBD_GET_QOS_USAGE */
+	DBD_GET_ASSOC_NG_USAGE, /* Get non-grouped assoc usage
+				 * (this is used for sreport user topuser) */
 	SLURM_DBD_MESSAGES_END = 2000, /* So that we don't overlap with any
 					* slurm_msg_type_t numbers. */
 	SLURM_PERSIST_INIT = 6500, /* So we don't use the
@@ -175,7 +181,7 @@ typedef enum {
 \*****************************************************************************/
 
 typedef struct {
-	List acct_list; /* list of account names (char *'s) */
+	list_t *acct_list; /* list of account names (char *'s) */
 	slurmdb_user_cond_t *cond;
 } dbd_acct_coord_msg_t;
 
@@ -215,8 +221,8 @@ typedef struct dbd_get_jobs_msg {
 				 * of accounting record */
 	uint32_t gid;		/* group id */
 	time_t last_update;	/* time of latest info */
-	List selected_steps;	/* List of slurm_selected_step_t *'s */
-	List selected_parts;	/* List of char *'s */
+	list_t *selected_steps;	/* list_t *of slurm_selected_step_t *'s */
+	list_t *selected_parts;	/* list_t *of char *'s */
 	char *user;		/* user name */
 } dbd_get_jobs_msg_t;
 
@@ -288,10 +294,14 @@ typedef struct dbd_job_start_msg {
 	char *   partition;	/* partition job is running on */
 	uint32_t priority;	/* job priority */
 	uint32_t qos_id;        /* qos job is running with */
+	char *qos_req;          /* qos(s) requested for the job */
 	uint32_t req_cpus;	/* count of req processors */
 	uint64_t req_mem;       /* requested minimum memory */
+	uint16_t restart_cnt;   /* How many times the job has been restarted */
 	uint32_t resv_id;	/* reservation id */
+	char *resv_req;		/* original requested reservations */
 	char *script_hash;      /* hash value of script */
+	uint16_t segment_size;	/* requested segment size */
 	time_t   start_time;	/* job start time */
 	uint32_t state_reason_prev; /* Last reason of blocking before job
 				     * started */
@@ -340,7 +350,7 @@ typedef struct dbd_job_suspend_msg {
 } dbd_job_suspend_msg_t;
 
 typedef struct {
-	List my_list;		/* this list could be of any type as long as it
+	list_t *my_list;	/* this list could be of any type as long as it
 				 * is handled correctly on both ends */
 	uint32_t return_code;   /* If there was an error and a list of
 				 * them this is the type of error it
@@ -358,7 +368,7 @@ typedef struct {
 
 typedef struct dbd_node_state_msg {
 	time_t event_time;	/* time of transition */
-	char *extra;		/* arbitrary sting */
+	char *extra;		/* arbitrary string */
 	char *hostlist;		/* name of hosts */
 	char *instance_id;	/* cloud instance id */
 	char *instance_type;	/* cloud instance type */
@@ -375,6 +385,7 @@ typedef struct dbd_register_ctld_msg {
 	uint16_t dimensions;    /* dimensions of system */
 	uint32_t flags;         /* flags for cluster */
 	uint16_t port;		/* slurmctld's comm port */
+	uint32_t cluster_id; /* cluster id of cluster making request */
 } dbd_register_ctld_msg_t;
 
 typedef struct dbd_step_comp_msg {
@@ -413,9 +424,14 @@ typedef struct dbd_step_start_msg {
 	uint32_t req_cpufreq_max; /* requested maximum CPU frequency  */
 	uint32_t req_cpufreq_gov; /* requested CPU frequency governor */
 	slurm_step_id_t step_id;
+	char *cwd;              /* Current work dir of the step */
+	char *std_err;          /* The stderr file path of the step */
+	char *std_in;           /* The stdin file path of the step */
+	char *std_out;          /* The stdout file path of the step */
 	char *submit_line;      /* The command issued with all it's options in a
 				 * string */
 	uint32_t task_dist;     /* layout method of step */
+	uint32_t time_limit; /* time limit of step */
 	uint32_t total_tasks;	/* count of tasks for step */
 	char *tres_alloc_str;   /* Simple comma separated list of TRES */
 } dbd_step_start_msg_t;

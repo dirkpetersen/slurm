@@ -1,7 +1,6 @@
 # Makefile for conmgr library
 
 AUTOMAKE_OPTIONS = foreign
-CLEANFILES = core.*
 
 AM_CPPFLAGS = -I$(top_srcdir)
 
@@ -13,14 +12,26 @@ libconmgr_la_SOURCES = \
 	conmgr.c \
 	conmgr.h \
 	delayed.c \
+	delayed.h \
 	io.c \
 	mgr.h \
+	poll.c \
+	polling.c \
+	polling.h \
 	rpc.c \
 	signals.c \
+	signals.h \
+	tls.c \
+	tls.h \
+	tls_fingerprint.c \
+	tls_fingerprint.h \
 	watch.c \
 	work.c \
-	workq.c \
-	workq.h
+	workers.c
+
+if HAVE_EPOLL
+libconmgr_la_SOURCES += epoll.c
+endif
 
 libconmgr_la_LDFLAGS = $(LIB_LDFLAGS) -module --export-dynamic
 

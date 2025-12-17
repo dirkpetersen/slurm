@@ -1,24 +1,28 @@
-.TH "job_container.conf" "5" "Slurm Configuration File" "November 2022" "Slurm Configuration File"
+.TH "job_container.conf" "5" "Slurm Configuration File" "Slurm 26.05" "Slurm Configuration File"
 
 .SH "NAME"
-job_container.conf \- Slurm configuration file for job_container/tmpfs plugin
+job_container.conf \- Slurm configuration file for namespace plugins
 
 .SH "DESCRIPTION"
 
 \fBjob_container.conf\fP is an ASCII file which defines parameters used by
-Slurm's job_container/tmpfs plugin. The plugin reads the
-job_container.conf file to find out the configuration settings. Based on them it
-constructs a private (or optionally shared) filesystem namespace for the job and
-mounts a list of directories (defaults to /tmp and /dev/shm) inside it. This
-gives the job a private view of these directories. These paths are mounted
-inside the location specified by 'BasePath' in the \fBjob_container.conf\fR
-file. When the job completes, the private namespace is unmounted and all
-files therein are automatically removed.
+Slurm's namespace/tmpfs plugin. Based on these parameters, the plugin will
+create the appropriate job-specifc namespace(s).
+
+The namespace/tmpfs plugin creates a filesystem namespace and will construct a
+private (or optionally shared) filesystem namespace and mount a list of
+directories (defaults to /tmp and /dev/shm) inside it, giving the job a private
+view of these directories. These paths are mounted inside the location specified
+by 'BasePath' in the \fBjob_container.conf\fR file.
+
+When the job completes, the namespace is unmounted and all files therein are
+automatically removed.
+
 To make use of this plugin, 'PrologFlags=Contain' must also be present in
 your \fBslurm.conf\fR file, as shown:
 
 .nf
-JobContainerType=job_container/tmpfs
+NamespaceType=namespace/tmpfs
 PrologFlags=Contain
 .fi
 
@@ -38,7 +42,7 @@ Changes to the configuration file take effect upon restart of Slurm daemons.
 
 .LP
 The following job_container.conf parameters are defined to control the behavior
-of the job_container/tmpfs plugin.
+of the namespace/tmpfs plugin.
 
 .TP
 \fBAutoBasePath\fR
@@ -63,7 +67,7 @@ running. Set \fIPATH\fR to 'none' to disable the tmpfs plugin on node subsets
 when there is a global setting.
 
 \fBNOTE\fR: The \fBBasePath\fR must be unique to each node. If BasePath is on a
-shared filesystem, you can use "%h" or "%n" to create node-uinque directories.
+shared filesystem, you can use "%h" or "%n" to create node-unique directories.
 
 \fBNOTE\fR: The \fBBasePath\fR parameter cannot be set to any of
 the paths specified by \fBDirs\fR. Using these directories will cause conflicts
@@ -71,12 +75,42 @@ when trying to mount and unmount the private directories for the job.
 .IP
 
 .TP
-\fBDirs\fR
-A list of mount points separated with commas to create private mounts for.
-This parameter is optional and if not specified it defaults to "/tmp,/dev/shm".
+\fBCloneNSScript\fR
+Specify fully qualified pathname of an optional initialization script. This
+script is run after the namespace construction of a job. This script will be
+provided the SLURM_NS environment variable containing the path to the namespace
+that can be used by the nsenter command. This variable will allow the script to
+join the newly created namespace and do further setup work. This parameter is
+optional.
+.IP
 
-\fBNOTE\fR: /dev/shm has special handling, and instead of a bind mount is always
-a fresh tmpfs filesystem.
+.TP
+\fBCloneNSScript_Wait\fR
+The number of seconds to wait for the CloneNSScript to complete before
+considering the script failed. The default value is 10 seconds.
+.IP
+
+.TP
+\fBCloneNSEpilog\fR
+Specify fully qualified pathname of an optional epilog script. This script runs
+just before the namespace is torn down. This script will be provided the
+SLURM_NS environment variable containing the path to the namespace that can
+be used by the nsenter command. This variable will allow the script to join the
+soon to be removed namespace and do any cleanup work. This parameter is optional.
+.IP
+
+.TP
+\fBCloneNSEpilog_Wait\fR
+The number of seconds to wait for the CloneNSEpilog to complete before
+considering the script failed. The default value is 10 seconds.
+.IP
+
+.TP
+\fBEntireStepInNS\fR
+Specifying EntireStepInNS=true will pivot all slurmstepd processes (excluding
+the external step, which is tasked with creating the namespace) into the
+constructed namespace. This will cause issues if certain paths such as
+SlurmdSpoolDir are inaccessible. This parameter is optional.
 .IP
 
 .TP
@@ -121,10 +155,10 @@ applies.
 .TP
 \fB/etc/slurm/slurm.conf\fR:
 These are the entries required in \fBslurm.conf\fR to activate the
-job_container/tmpfs plugin.
+namespace/tmpfs plugin.
 .IP
 .nf
-JobContainerType=job_container/tmpfs
+NamespaceType=namespace/tmpfs
 PrologFlags=Contain
 .fi
 

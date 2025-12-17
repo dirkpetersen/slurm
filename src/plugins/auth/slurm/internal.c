@@ -179,8 +179,7 @@ static void _read_keys_file(char *key_file)
 	buf_t *jwks = NULL;
 	data_t *keys = NULL;
 
-	if (serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))
-		fatal("%s: serializer_g_init() failed", __func__);
+	serializer_required(MIME_TYPE_JSON);
 
 	debug("loading keys file `%s`", key_file);
 
@@ -241,6 +240,9 @@ extern void init_internal(void)
 
 	if (!(lifespan = slurm_get_auth_ttl()))
 		lifespan = DEFAULT_TTL;
+
+	xfree(key_file);
+	xfree(jwks_file);
 }
 
 extern void fini_internal(void)

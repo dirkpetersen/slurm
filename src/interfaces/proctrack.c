@@ -50,20 +50,22 @@
 #endif
 
 /* This is suppose to be defined in linux/sched.h but we have found it
- * is a very rare occation this is the case, so we define it here.
+ * is a very rare occasion this is the case, so we define it here.
  */
 #ifndef PF_DUMPCORE
 #define PF_DUMPCORE     0x00000200      /* dumped core */
 #endif
 
-
 #include "src/common/log.h"
 #include "src/common/plugrack.h"
 #include "src/common/read_config.h"
 #include "src/common/slurm_protocol_api.h"
+#include "src/common/threadpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
+
 #include "src/interfaces/proctrack.h"
+
 #include "src/slurmd/slurmstepd/slurmstepd_job.h"
 
 bool proctrack_forked = false;
@@ -76,6 +78,8 @@ typedef struct slurm_proctrack_ops {
 	uint64_t         (*find_cont) (pid_t pid);
 	bool             (*has_pid)   (uint64_t id, pid_t pid);
 	int              (*wait)      (uint64_t id);
+	int (*wait_for_any_task)(stepd_step_rec_t *step,
+				 stepd_step_task_info_t **task, bool block);
 	int              (*get_pids)  (uint64_t id, pid_t ** pids, int *npids);
 } slurm_proctrack_ops_t;
 
@@ -90,6 +94,7 @@ static const char *syms[] = {
 	"proctrack_p_find",
 	"proctrack_p_has_pid",
 	"proctrack_p_wait",
+	"proctrack_p_wait_for_any_task",
 	"proctrack_p_get_pids"
 };
 
@@ -285,6 +290,7 @@ static void *_sig_agent(void *args)
 {
 	bool hung_pids = false;
 	sig_agent_arg_t *agent_arg_ptr = args;
+	pid_t stepd_pid = getpid();
 
 	while (1) {
 		pid_t *pids = NULL;
@@ -298,6 +304,12 @@ static void *_sig_agent(void *args)
 
 		if (proctrack_g_get_pids(agent_arg_ptr->cont_id, &pids,
 					     &npids) == SLURM_SUCCESS) {
+			if (!npids ||
+			    ((npids == 1) && (pids[0] == stepd_pid))) {
+				xfree(pids);
+				break;
+			}
+
 			/*
 			 * Check if any processes are core dumping.
 			 * If so, do not signal any of them, instead
@@ -311,6 +323,8 @@ static void *_sig_agent(void *args)
 			 * of them will terminate the application.
 			 */
 			for (i = 0; i < npids; i++) {
+				if (pids[i] == stepd_pid)
+					continue;
 				xstrfmtcat(stat_fname, "/proc/%d/stat",
 					   (int) pids[i]);
 				if (_test_core_dumping(stat_fname)) {
@@ -329,6 +343,9 @@ static void *_sig_agent(void *args)
 			}
 
 			for (i = 0; i < npids; i++) {
+				/* Avoid killing our own (stepd) process. */
+				if (pids[i] == stepd_pid)
+					continue;
 				/* Kill processes */
 				kill(pids[i], agent_arg_ptr->signal);
 			}
@@ -367,7 +384,7 @@ extern int proctrack_g_signal(uint64_t cont_id, int signal)
 	xassert(g_context);
 
 	if (signal == SIGKILL) {
-		pid_t *pids = NULL;
+		pid_t *pids = NULL, stepd_pid = getpid();
 		int i, j, npids = 0, hung_pids = 0;
 		char *stat_fname = NULL;
 		if (proctrack_g_get_pids(cont_id, &pids, &npids) ==
@@ -377,7 +394,7 @@ extern int proctrack_g_signal(uint64_t cont_id, int signal)
 					sleep(2);
 				hung_pids = 0;
 				for (i = 0; i < npids; i++) {
-					if (!pids[i])
+					if (!pids[i] || (pids[i] == stepd_pid))
 						continue;
 					xstrfmtcat(stat_fname, "/proc/%d/stat",
 						   (int) pids[i]);
@@ -397,7 +414,7 @@ extern int proctrack_g_signal(uint64_t cont_id, int signal)
 			}
 			xfree(pids);
 			if (hung_pids) {
-				info("Defering sending signal, processes in "
+				info("Deferring sending signal, processes in "
 				     "job are currently core dumping");
 				_spawn_signal_thread(cont_id, signal);
 				return SLURM_SUCCESS;
@@ -454,6 +471,42 @@ extern int proctrack_g_wait(uint64_t cont_id)
 	xassert(g_context);
 
 	return (*(ops.wait)) (cont_id);
+}
+
+/*
+ * Wait for any task to end
+ *
+ * IN step - wait for any task in this step
+ * OUT ended_task - pointer to task that ended. NULL if no tasks ended
+ * IN block - If true, wait until any task ends, or return immediately if all
+ *   tasks have already ended. If false, check for any ended tasks and then
+ *   immediately return.
+ *
+ * RET - SLURM_SUCCESS or SLURM_ERROR. SLURM_ERROR and errno set to ECHILD
+ *   means all tasks have already ended.
+ */
+extern int proctrack_g_wait_for_any_task(stepd_step_rec_t *step,
+					 stepd_step_task_info_t **ended_task,
+					 bool block)
+{
+	int status;
+	struct rusage rusage;
+	int pid;
+
+	xassert(g_context);
+	xassert(ended_task);
+
+	if (step->flags & LAUNCH_WAIT_FOR_CHILDREN)
+		return (*(ops.wait_for_any_task))(step, ended_task, block);
+
+	pid = wait3(&status, block ? 0 : WNOHANG, &rusage);
+
+	if ((pid > 0) && (*ended_task = job_task_info_by_pid(step, pid))) {
+		(*ended_task)->estatus = status;
+		(*ended_task)->rusage = rusage;
+	}
+
+	return pid;
 }
 
 /*

@@ -45,13 +45,14 @@
 #include "src/common/macros.h"
 #include "src/interfaces/prep.h"
 #include "src/common/run_command.h"
+#include "src/common/sluid.h"
 #include "src/common/spank.h"
 #include "src/common/track_script.h"
 #include "src/common/uid.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 
-#include "src/interfaces/job_container.h"
+#include "src/interfaces/namespace.h"
 #include "src/slurmd/slurmd/req.h"
 
 #include "prep_script.h"
@@ -64,17 +65,18 @@ slurmd_conf_t *conf = NULL;
 
 static char **_build_env(job_env_t *job_env, slurm_cred_t *cred,
 			 bool is_epilog);
-static int _run_spank_job_script(const char *mode, char **env, uint32_t job_id);
+static int _run_spank_job_script(const char *mode, char **env, uint32_t job_id,
+				 bool is_epilog);
 
 static int _ef(const char *p, int errnum)
 {
 	return error("prep_script_slurmd: glob: %s: %s", p, strerror(errno));
 }
 
-static List _script_list_create(const char *pattern)
+static list_t *_script_list_create(const char *pattern)
 {
 	glob_t gl;
-	List l = NULL;
+	list_t *l = NULL;
 	int rc;
 
 	if (!pattern)
@@ -166,16 +168,18 @@ extern int slurmd_script(job_env_t *job_env, slurm_cred_t *cred,
 	    (!is_epilog && spank_has_prolog())) {
 		if (!env)
 			env = _build_env(job_env, cred, is_epilog);
-		rc = _run_spank_job_script(name, env, job_env->jobid);
+		rc = _run_spank_job_script(name, env, job_env->step_id.job_id,
+					   is_epilog);
 	}
 
 	if (script_cnt) {
 		int status = 0;
-		int timeout = slurm_conf.prolog_epilog_timeout;
+		int timeout = is_epilog ?
+			slurm_conf.epilog_timeout : slurm_conf.prolog_timeout;
 		char *cmd_argv[2] = {0};
 		list_t *path_list = NULL;
 		run_command_args_t run_command_args = {
-			.job_id = job_env->jobid,
+			.job_id = job_env->step_id.job_id,
 			.script_argv = cmd_argv,
 			.script_type = name,
 			.status = &status,
@@ -184,10 +188,7 @@ extern int slurmd_script(job_env_t *job_env, slurm_cred_t *cred,
 		if (!env)
 			env = _build_env(job_env, cred, is_epilog);
 
-		if (timeout == NO_VAL16)
-			timeout = -1;
-		else
-			timeout *= 1000;
+		timeout = (timeout != NO_VAL16) ? (timeout * 1000) : -1;
 
 		run_command_args.env = env;
 		run_command_args.max_wait = timeout;
@@ -248,11 +249,17 @@ static char **_build_env(job_env_t *job_env, slurm_cred_t *cred,
 	setenvf(&env, "SLURMD_NODENAME", "%s", conf->node_name);
 	setenvf(&env, "SLURM_CONF", "%s", conf->conffile);
 	setenvf(&env, "SLURM_CLUSTER_NAME", "%s", slurm_conf.cluster_name);
-	setenvf(&env, "SLURM_JOB_ID", "%u", job_env->jobid);
+	setenvf(&env, "SLURM_JOB_ID", "%u", job_env->step_id.job_id);
 	setenvf(&env, "SLURM_JOB_UID", "%u", job_env->uid);
 	setenvf(&env, "SLURM_JOB_GID", "%u", job_env->gid);
 	setenvf(&env, "SLURM_JOB_WORK_DIR", "%s", job_env->work_dir);
-	setenvf(&env, "SLURM_JOBID", "%u", job_env->jobid);
+	setenvf(&env, "SLURM_JOBID", "%u", job_env->step_id.job_id);
+
+	if (job_env->step_id.sluid) {
+		char sluid[15] = "";
+		print_sluid(job_env->step_id.sluid, sluid, sizeof(sluid));
+		setenvf(&env, "SLURM_JOB_SLUID", "%s", sluid);
+	}
 
 	if (job_env->het_job_id && (job_env->het_job_id != NO_VAL)) {
 		/* Continue support for old hetjob terminology. */
@@ -335,12 +342,17 @@ static char **_build_env(job_env_t *job_env, slurm_cred_t *cred,
 		if (cred_arg->job_partition)
 			setenvf(&env, "SLURM_JOB_PARTITION", "%s",
 				cred_arg->job_partition);
+		if (cred_arg->job_qos)
+			setenvf(&env, "SLURM_JOB_QOS", "%s", cred_arg->job_qos);
 		if (cred_arg->job_reservation)
 			setenvf(&env, "SLURM_JOB_RESERVATION", "%s",
 				cred_arg->job_reservation);
 		if (cred_arg->job_restart_cnt != INFINITE16)
 			setenvf(&env, "SLURM_JOB_RESTART_COUNT", "%u",
 				cred_arg->job_restart_cnt);
+		if (cred_arg->job_selinux_context)
+			setenvf(&env, "SLURM_JOB_SELINUX_CONTEXT", "%s",
+				cred_arg->job_selinux_context);
 		if (cred_arg->job_start_time)
 			setenvf(&env, "SLURM_JOB_START_TIME", "%lu",
 				cred_arg->job_start_time);
@@ -379,11 +391,14 @@ static void _send_conf_cb(int write_fd, void *arg)
 		       __func__, spank_mode);
 }
 
-static int _run_spank_job_script(const char *mode, char **env, uint32_t job_id)
+static int _run_spank_job_script(const char *mode, char **env, uint32_t job_id,
+				 bool is_epilog)
 {
 	int status;
 	char *argv[4];
 	char *resp = NULL;
+	int timeout = is_epilog ?
+		slurm_conf.epilog_timeout : slurm_conf.prolog_timeout;
 	run_command_args_t run_command_args = {
 		.env = env,
 		.job_id = job_id,
@@ -393,11 +408,8 @@ static int _run_spank_job_script(const char *mode, char **env, uint32_t job_id)
 		.write_to_child = true,
 	};
 
-	if (slurm_conf.prolog_epilog_timeout == NO_VAL16)
-		run_command_args.max_wait = -1;
-	else
-		run_command_args.max_wait =
-			slurm_conf.prolog_epilog_timeout * 1000;
+	run_command_args.max_wait =
+		(timeout != NO_VAL16) ? (timeout * 1000) : -1;
 
 	argv[0] = (char *) conf->stepd_loc;
 	argv[1] = "spank";

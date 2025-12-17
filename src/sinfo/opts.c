@@ -69,9 +69,9 @@
 #define OPT_LONG_HELPSTATE 0x111
 
 /* FUNCTIONS */
-static List  _build_state_list( char* str );
-static List  _build_all_states_list( void );
-static List  _build_part_list( char *parts );
+static list_t *_build_state_list(char *str);
+static list_t *_build_all_states_list(void);
+static list_t *_build_part_list(char *parts);
 static char *_get_prefix(char *token);
 static void  _help( void );
 static void _help_format(void);
@@ -312,15 +312,13 @@ extern void parse_command_line(int argc, char **argv)
 			params.mimetype = MIME_TYPE_JSON;
 			params.data_parser = optarg;
 			params.match_flags |= MATCH_FLAG_GRES_USED;
-			if (serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))
-				fatal("JSON plugin load failure");
+			serializer_required(MIME_TYPE_JSON);
 			break;
 		case OPT_LONG_YAML:
 			params.mimetype = MIME_TYPE_YAML;
 			params.data_parser = optarg;
 			params.match_flags |= MATCH_FLAG_GRES_USED;
-			if (serializer_g_init(MIME_TYPE_YAML_PLUGIN, NULL))
-				fatal("YAML plugin load failure");
+			serializer_required(MIME_TYPE_YAML);
 			break;
 		case OPT_LONG_AUTOCOMP:
 			suggest_completion(long_options, optarg);
@@ -362,8 +360,6 @@ extern void parse_command_line(int argc, char **argv)
 		working_cluster_rec = list_peek(params.clusters);
 		params.local = true;
 	}
-
-	params.cluster_flags = slurmdb_setup_cluster_flags();
 
 	if (params.federation_flag && !params.clusters && !params.local) {
 		void *ptr = NULL;
@@ -465,11 +461,11 @@ _next_tok (char *sep, char **str)
  * IN str - comma separated list of job states
  * RET List of enum job_states values
  */
-static List
-_build_state_list (char *state_str)
+static list_t *_build_state_list(char *state_str)
 {
-	List state_ids;
+	list_t *state_ids;
 	char *orig, *str, *state;
+	int node_state_id;
 
 	if (state_str == NULL)
 		return NULL;
@@ -477,20 +473,30 @@ _build_state_list (char *state_str)
 		return _build_all_states_list ();
 
 	orig = str = xstrdup (state_str);
-	state_ids = list_create (NULL);
+	state_ids = list_create(xfree_ptr);
 
-	if (xstrstr(state_str, "&"))
-	    params.state_list_and = true;
+	if ((xstrstr(state_str, "+") || xstrstr(state_str, "&")))
+		params.state_list_and = true;
 
-	state = strtok_r(state_str, ",&", &str);
+	state = strtok_r(state_str, ",&+", &str);
 	while (state) {
-		int *id = xmalloc (sizeof (*id));
-		if ((*id = _node_state_id (state)) < 0) {
+		sinfo_state_t *id = xmalloc(sizeof(*id));
+		if ((state[0] == '~') || (state[0] == '!')) {
+			id->op = SINFO_STATE_OP_NOT;
+			/* Remove one character before parsing */
+			state = state + 1;
+		}
+
+		if ((node_state_id = _node_state_id(state)) < 0) {
 			error ("Bad state string: \"%s\"", state);
+			xfree(orig);
+			xfree(id);
+			FREE_NULL_LIST(state_ids);
 			return (NULL);
 		}
+		id->state = node_state_id;
 		list_append (state_ids, id);
-		state = strtok_r(NULL, ",&", &str);
+		state = strtok_r(NULL, ",&+", &str);
 	}
 
 	xfree (orig);
@@ -501,10 +507,9 @@ _build_state_list (char *state_str)
  * _build_all_states_list - build a list containing all possible node states
  * RET List of enum job_states values
  */
-static List
-_build_all_states_list( void )
+static list_t *_build_all_states_list(void)
 {
-	List my_list;
+	list_t *my_list;
 	int i;
 	uint16_t *state_id;
 
@@ -531,10 +536,9 @@ _build_all_states_list( void )
  * IN parts - comma separated list of partitions
  * RET List of partition names
  */
-static List
-_build_part_list(char *parts)
+static list_t *_build_part_list(char *parts)
 {
-	List part_list;
+	list_t *part_list;
 	char *orig, *str, *part;
 
 	orig = str = xstrdup(parts);
@@ -560,8 +564,11 @@ _node_state_list (void)
 
 	all_states = xstrdup (node_state_string(0));
 	for (i = 1; i < NODE_STATE_END; i++) {
-		xstrcat (all_states, ",");
-		xstrcat (all_states, node_state_string(i));
+		/* Skip NODE_STATE_ERROR */
+		if (i != NODE_STATE_ERROR) {
+			xstrcat(all_states, ",");
+			xstrcat(all_states, node_state_string(i));
+		}
 	}
 
 	xstrcat(all_states,
@@ -579,6 +586,10 @@ _node_state_list (void)
 	xstrcat(all_states, ",");
 	xstrcat(all_states, node_state_string(NODE_STATE_POWERING_UP));
 	xstrcat(all_states, ",");
+	xstrcat(all_states, node_state_string(NODE_STATE_POWER_UP));
+	xstrcat(all_states, ",");
+	xstrcat(all_states, node_state_string(NODE_STATE_INVALID_REG));
+	xstrcat(all_states, ",");
 	xstrcat(all_states, node_state_string(NODE_STATE_FAIL));
 	xstrcat(all_states, ",");
 	xstrcat(all_states, node_state_string(NODE_STATE_MAINT));
@@ -586,6 +597,12 @@ _node_state_list (void)
 	xstrcat(all_states, node_state_string(NODE_STATE_REBOOT_REQUESTED));
 	xstrcat(all_states, ",");
 	xstrcat(all_states, node_state_string(NODE_STATE_REBOOT_ISSUED));
+	xstrcat(all_states, ",");
+	xstrcat(all_states, node_state_string(NODE_STATE_EXTERNAL));
+	xstrcat(all_states, ",");
+	xstrcat(all_states, node_state_string(NODE_STATE_DYNAMIC_FUTURE));
+	xstrcat(all_states, ",");
+	xstrcat(all_states, node_state_string(NODE_STATE_DYNAMIC_NORM));
 
 	for (i = 0; i < strlen (all_states); i++)
 		all_states[i] = tolower (all_states[i]);
@@ -639,6 +656,9 @@ _node_state_id (char *str)
 	if ((xstrncasecmp("BLOCKED", str, len) == 0) ||
 	    (xstrncasecmp("BLOCK", str, len) == 0))
 		return NODE_STATE_BLOCKED;
+	if ((xstrncasecmp("INVALID_REG", str, len) == 0) ||
+	    (xstrncasecmp("INVAL", str, len) == 0))
+		return NODE_STATE_INVALID_REG;
 	if ((xstrncasecmp("PLANNED", str, len) == 0) ||
 	    (xstrncasecmp("PLND", str, len) == 0))
 		return NODE_STATE_PLANNED;
@@ -652,10 +672,16 @@ _node_state_id (char *str)
 	if ((xstrncasecmp("DRAINING", str, len) == 0) ||
 	    (xstrncasecmp("DRNG", str, len) == 0))
 		return NODE_STATE_DRAIN | NODE_STATE_ALLOCATED;
+	if (_node_state_equal(NODE_STATE_DYNAMIC_FUTURE, str))
+		return NODE_STATE_DYNAMIC_FUTURE;
+	if (_node_state_equal(NODE_STATE_DYNAMIC_NORM, str))
+		return NODE_STATE_DYNAMIC_NORM;
 	if (_node_state_equal (NODE_STATE_COMPLETING, str))
 		return NODE_STATE_COMPLETING;
 	if (xstrncasecmp("NO_RESPOND", str, len) == 0)
 		return NODE_STATE_NO_RESPOND;
+	if (_node_state_equal(NODE_STATE_POWER_UP, str))
+		return NODE_STATE_POWER_UP;
 	if (_node_state_equal (NODE_STATE_POWERING_DOWN, str))
 		return NODE_STATE_POWERING_DOWN;
 	if (_node_state_equal (NODE_STATE_POWERED_DOWN, str))
@@ -674,6 +700,8 @@ _node_state_id (char *str)
 		return NODE_STATE_REBOOT_ISSUED;
 	if (_node_state_equal(NODE_STATE_CLOUD, str))
 		return NODE_STATE_CLOUD;
+	if (_node_state_equal(NODE_STATE_EXTERNAL, str))
+		return NODE_STATE_EXTERNAL;
 
 	return (-1);
 }
@@ -894,7 +922,7 @@ _get_prefix( char *token )
  * OUT field - the letter code for the data type
  * OUT field_size - byte count
  * OUT right_justify - true of field to be right justified
- * OUT suffix - string containing everthing after the field specification
+ * OUT suffix - string containing everything after the field specification
  */
 static void
 _parse_token( char *token, char *field, int *field_size, bool *right_justify,

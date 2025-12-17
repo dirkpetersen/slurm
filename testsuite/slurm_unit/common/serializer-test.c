@@ -55,6 +55,7 @@
 #include "src/common/macros.h"
 #include "src/common/read_config.h"
 #include "src/common/slurm_protocol_defs.h"
+#include "src/common/slurm_time.h"
 #include "src/common/timers.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
@@ -550,59 +551,77 @@ typedef struct {int a; int b;} mem_track_t;
 static void _test_bandwidth_str(const char *tag, const char *source,
 				const int run_count)
 {
-	DEF_TIMERS;
 	int rc;
 	data_t *data = NULL;
 	const int test_json_len = strlen(source);
 	char *output = NULL;
 	size_t output_len = 0;
-	uint64_t read_times = 0, write_times = 0;
+	timespec_t read_times = { 0, 0 }, write_times = { 0, 0 };
 	uint64_t total_written = 0, total_read = 0;
-	uint64_t fastest_write = INFINITE64, fastest_read = INFINITE64;
+	timespec_t fastest_write = { UINT_MAX, 0 };
+	timespec_t fastest_read = { UINT_MAX, 0 };
+	const timespec_t interval = { UINT_MAX, 0 };
 	double read_avg, write_avg;
 	double read_diff, write_diff, read_rate, write_rate;
 	double read_rate_bytes, write_rate_bytes;
 	double fastest_read_rate_bytes, fastest_write_rate_bytes;
 	double fastest_read_rate, fastest_write_rate;
 	mem_track_t read_mem = {0}, write_mem = {0};
+	latency_metric_t read_latency_metric = LATENCY_METRIC_INITIALIZER;
+	timespec_t read_latency_metric_start = { 0, 0 };
+	latency_metric_t write_latency_metric = LATENCY_METRIC_INITIALIZER;
+	timespec_t write_latency_metric_start = { 0, 0 };
+	char labels_histogram[LATENCY_METRIC_HISTOGRAM_STR_LEN] = { 0 };
+	char read_histogram[LATENCY_METRIC_HISTOGRAM_STR_LEN] = { 0 };
+	char write_histogram[LATENCY_METRIC_HISTOGRAM_STR_LEN] = { 0 };
 
 	for (int i = 0; i < run_count; i++) {
+		latency_metric_rc_t timer_rc;
+
 		FREE_NULL_DATA(data);
 
 		_track_mem(&read_mem);
 
-		START_TIMER;
+		latency_metric_begin(&read_latency_metric,
+				     &read_latency_metric_start);
 		rc = serialize_g_string_to_data(&data, source,
 						test_json_len, MIME_TYPE_JSON);
-		END_TIMER3(__func__, INFINITE);
+		timer_rc = latency_metric_end(&read_latency_metric,
+					      &read_latency_metric_start,
+					      timespec_now(), interval);
 
 		_track_mem(&read_mem);
 
 		total_read += test_json_len;
-		read_times += DELTA_TIMER;
+		read_times = timespec_add(read_times, timer_rc.delay);
 
-		if (DELTA_TIMER < fastest_read)
-			fastest_read = DELTA_TIMER;
+		if (timespec_is_after(fastest_read, timer_rc.delay))
+			fastest_read = timer_rc.delay;
 
 		assert_int_eq(rc, 0);
 	}
 
 	for (int i = 0; i < run_count; i++) {
+		latency_metric_rc_t timer_rc;
+
 		_track_mem(&write_mem);
 
-		START_TIMER;
+		latency_metric_begin(&write_latency_metric,
+				     &write_latency_metric_start);
 		rc = serialize_g_data_to_string(&output, &output_len, data,
 						MIME_TYPE_JSON,
 						SER_FLAGS_PRETTY);
-		END_TIMER3(__func__, INFINITE);
+		timer_rc = latency_metric_end(&write_latency_metric,
+					      &write_latency_metric_start,
+					      timespec_now(), interval);
 
 		_track_mem(&write_mem);
 
 		total_written += output_len;
-		write_times += DELTA_TIMER;
+		write_times = timespec_add(write_times, timer_rc.delay);
 
-		if (DELTA_TIMER < fastest_write)
-			fastest_write = DELTA_TIMER;
+		if (timespec_is_after(fastest_write, timer_rc.delay))
+			fastest_write = timer_rc.delay;
 
 		xfree(output);
 		output_len = 0;
@@ -612,36 +631,48 @@ static void _test_bandwidth_str(const char *tag, const char *source,
 
 	FREE_NULL_DATA(data);
 
-	read_diff = read_times / run_count;
-	write_diff = write_times / run_count;
+	read_diff = timespec_to_secs(read_times) / run_count;
+	write_diff = timespec_to_secs(write_times) / run_count;
 
 	read_avg = total_read / run_count;
 	write_avg = total_written / run_count;
 
-	/* (bytes / usec) * (1000000 usec / 1 sec) * (1 MiB / 1024*1024 bytes) */
-	read_rate_bytes = (read_avg / read_diff) * NSEC_IN_MSEC;
-	write_rate_bytes = (write_avg / write_diff) * NSEC_IN_MSEC;
-	fastest_read_rate_bytes = (read_avg / fastest_read) * NSEC_IN_MSEC;
-	fastest_write_rate_bytes = (write_avg / fastest_write) * NSEC_IN_MSEC;
+	/* (bytes / sec) * (1 MiB / 1024*1024 bytes) */
+	read_rate_bytes = (read_avg / read_diff);
+	write_rate_bytes = (write_avg / write_diff);
+	fastest_read_rate_bytes = read_avg / timespec_to_secs(fastest_read);
+	fastest_write_rate_bytes = write_avg / timespec_to_secs(fastest_write);
 
 	read_rate = read_rate_bytes / BYTES_IN_MiB;
 	write_rate = write_rate_bytes / BYTES_IN_MiB;
 	fastest_read_rate = fastest_read_rate_bytes / BYTES_IN_MiB;
 	fastest_write_rate = fastest_write_rate_bytes / BYTES_IN_MiB;
 
+	(void) latency_histogram_print(&read_latency_metric.histogram,
+				       read_histogram, sizeof(read_histogram));
+	(void) latency_histogram_print(&write_latency_metric.histogram,
+				       write_histogram,
+				       sizeof(write_histogram));
+	(void) latency_histogram_print_labels(labels_histogram,
+					      sizeof(labels_histogram));
+
 	printf("%s: %u runs:\n", tag, run_count);
 
-	printf("\tfastest read=%"PRIu64" usec\n\tfastest write=%"PRIu64" usec\n\n",
-	       fastest_read, fastest_write);
+	printf("\tfastest read=%lf sec\n\tfastest write=%lf sec\n\n",
+	       timespec_to_secs(fastest_read), timespec_to_secs(fastest_write));
 
 	printf("\tfastest read=%f MiB/sec \n\tfastest write=%f MiB/sec\n\n",
 	       fastest_read_rate, fastest_write_rate);
 
-	printf("\tavg read=%f usec\n\tavg write=%f usec\n\n",
+	printf("\tavg read=%lf sec\n\tavg write=%lf sec\n\n",
 	       read_diff, write_diff);
 
 	printf("\tavg read=%f MiB/sec \n\tavg write=%f MiB/sec\n\n",
 	       read_rate, write_rate);
+
+	printf("\thistogram:\n\t%s\n\n", labels_histogram);
+	printf("\tread histogram:\n\t%s\n\n", read_histogram);
+	printf("\twrite histogram:\n\t%s\n\n", write_histogram);
 
 	_print_tracked_mem(&read_mem, "read");
 	_print_tracked_mem(&write_mem, "write");
@@ -722,7 +753,8 @@ extern int main(void)
 	const char *debug_flags_env = getenv("SLURM_DEBUG_FLAGS");
 	const char slurm_unit_conf_content[] =
 		"ClusterName=slurm_unit\n"
-		"PluginDir=" SLURM_PREFIX "/lib/slurm/\n"
+		"PluginDir=../../../src/plugins/serializer/json/.libs:"
+		"../../../src/plugins/serializer/yaml/.libs/\n"
 		"SlurmctldHost=slurm_unit\n";
 	const size_t csize = sizeof(slurm_unit_conf_content);
 
@@ -768,12 +800,9 @@ extern int main(void)
 	xfree(slurm_unit_conf_filename);
 	close(fd);
 
-	/* force load of JSON and all others if present */
-	if (serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL) ||
-	    serializer_g_init(NULL, NULL)) {
-		error("serializer_g_init() failed");
-		return EXIT_FAILURE;
-	}
+	/* force load of JSON and YAML and all others if present */
+	serializer_required(MIME_TYPE_JSON);
+	serializer_required(MIME_TYPE_YAML);
 
 	if (log_opts.stderr_level >= LOG_LEVEL_DEBUG) {
 		/* automatically be gdb friendly when debug logging */

@@ -50,6 +50,7 @@
 #include "src/common/list.h"
 #include "src/common/macros.h"
 #include "src/common/slurm_protocol_defs.h"
+#include "src/common/threadpool.h"
 #include "src/common/xstring.h"
 
 #include "src/interfaces/preempt.h"
@@ -210,17 +211,17 @@ static void _print_jobs(struct gs_part *p_ptr)
 
 static uint16_t _get_gr_type(void)
 {
-	if (slurm_conf.select_type_param & CR_CORE)
+	if (slurm_conf.select_type_param & SELECT_CORE)
 		return GS_CORE;
-	if (slurm_conf.select_type_param & CR_CPU) {
+	if (slurm_conf.select_type_param & SELECT_CPU) {
 		if (!xstrcmp(slurm_conf.task_plugin, "task/none"))
 			return GS_CPU;
 		return GS_CPU2;
 	}
-	if (slurm_conf.select_type_param & CR_SOCKET)
+	if (slurm_conf.select_type_param & SELECT_SOCKET)
 		return GS_SOCKET;
 
-	/* note that CR_MEMORY is node-level scheduling with
+	/* note that SELECT_MEMORY is node-level scheduling with
 	 * memory management */
 	return GS_NODE;
 }
@@ -228,14 +229,14 @@ static uint16_t _get_gr_type(void)
 static uint16_t _get_part_gr_type(part_record_t *part_ptr)
 {
 	if (part_ptr) {
-		if (part_ptr->cr_type & CR_CORE)
+		if (part_ptr->cr_type & SELECT_CORE)
 			return GS_CORE;
-		if (part_ptr->cr_type & CR_CPU) {
+		if (part_ptr->cr_type & SELECT_CPU) {
 			if (!xstrcmp(slurm_conf.task_plugin, "task/none"))
 				return GS_CPU;
 			return GS_CPU2;
 		}
-		if (part_ptr->cr_type & CR_SOCKET)
+		if (part_ptr->cr_type & SELECT_SOCKET)
 			return GS_SOCKET;
 	}
 
@@ -284,6 +285,7 @@ static void _build_parts(void)
 	int num_parts;
 
 	FREE_NULL_LIST(gs_part_list);
+	gs_part_list = list_create(_destroy_parts); /* always allocate */
 
 	/* reset the sorted list, since it's currently
 	 * pointing to partitions we just destroyed */
@@ -293,7 +295,6 @@ static void _build_parts(void)
 	if (num_parts == 0)
 		return;
 
-	gs_part_list = list_create(_destroy_parts);
 	part_iterator = list_iterator_create(part_list);
 	while ((p_ptr = list_next(part_iterator))) {
 		gs_part_ptr = xmalloc(sizeof(struct gs_part));
@@ -503,10 +504,10 @@ static int _suspend_job(job_record_t *job_ptr)
 	suspend_msg_t msg;
 
 	memset(&msg, 0, sizeof(msg));
-	msg.job_id = job_ptr->job_id;
+	msg.step_id = STEP_ID_FROM_JOB_RECORD(job_ptr);
 	msg.job_id_str = NULL;
 	msg.op = SUSPEND_JOB;
-	rc = job_suspend(&msg, 0, -1, false, NO_VAL16);
+	rc = job_suspend(NULL, &msg, 0, false, NO_VAL16);
 	/* job_suspend() returns ESLURM_DISABLED if job is already suspended */
 	if (rc == SLURM_SUCCESS) {
 		if (slurm_conf.debug_flags & DEBUG_FLAG_GANG)
@@ -525,10 +526,10 @@ static void _resume_job(job_record_t *job_ptr)
 	suspend_msg_t msg;
 
 	memset(&msg, 0, sizeof(msg));
-	msg.job_id = job_ptr->job_id;
+	msg.step_id = STEP_ID_FROM_JOB_RECORD(job_ptr);
 	msg.job_id_str = NULL;
 	msg.op = RESUME_JOB;
-	rc = job_suspend(&msg, 0, -1, false, NO_VAL16);
+	rc = job_suspend(NULL, &msg, 0, false, NO_VAL16);
 	if (rc == SLURM_SUCCESS) {
 		if (slurm_conf.debug_flags & DEBUG_FLAG_GANG)
 			info("gang: resuming %pJ", job_ptr);
@@ -576,7 +577,7 @@ static void _preempt_job_dequeue(void)
 		} else if ((preempt_mode == PREEMPT_MODE_REQUEUE) &&
 			   job_ptr->batch_flag && job_ptr->details &&
 			   (job_ptr->details->requeue > 0)) {
-			rc = job_requeue(0, job_ptr->job_id, NULL, true, 0);
+			rc = job_requeue_internal(0, job_ptr, true, 0);
 			if (rc == SLURM_SUCCESS) {
 				info("preempted %pJ has been requeued",
 				     job_ptr);
@@ -612,7 +613,7 @@ static int _sort_partitions(void *part1, void *part2)
 	g1 = *(struct gs_part **)part1;
 	g2 = *(struct gs_part **)part2;
 
-	return slurm_sort_uint_list_desc(&g1->priority, &g2->priority);
+	return slurm_sort_uint16_list_desc(&g1->priority, &g2->priority);
 }
 
 /* Scan the partition list. Add the given job as a "shadow" to every

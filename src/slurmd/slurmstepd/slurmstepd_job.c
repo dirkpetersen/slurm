@@ -61,36 +61,23 @@
 #include "src/interfaces/acct_gather_profile.h"
 #include "src/interfaces/gres.h"
 #include "src/interfaces/jobacct_gather.h"
+#include "src/interfaces/switch.h"
 
 #include "src/slurmd/common/fname.h"
 #include "src/slurmd/slurmd/slurmd.h"
 #include "src/slurmd/slurmstepd/io.h"
 #include "src/slurmd/slurmstepd/multi_prog.h"
+#include "src/slurmd/slurmstepd/slurmstepd.h"
 #include "src/slurmd/slurmstepd/slurmstepd_job.h"
 
-static void _job_init_task_info(stepd_step_rec_t *step, uint32_t **gtid,
-				char *ifname, char *ofname, char *efname);
+static void _job_init_task_info(uint32_t **gtid, char *ifname, char *ofname,
+				char *efname);
 static void _srun_info_destructor(void *arg);
 static stepd_step_task_info_t *_task_info_create(int taskid, int gtaskid,
 						 char *ifname, char *ofname,
 						 char *efname);
 static void _task_info_destroy(stepd_step_task_info_t *t, uint16_t multi_prog);
-static void _task_info_array_destroy(stepd_step_rec_t *step);
-
-/*
- * return the default output filename for a batch job
- */
-static char *
-_batchfilename(stepd_step_rec_t *step, const char *name)
-{
-	if (name == NULL) {
-		if (step->array_task_id == NO_VAL)
-			return fname_create(step, "slurm-%J.out", 0);
-		else
-			return fname_create(step, "slurm-%A_%a.out", 0);
-	} else
-		return fname_create(step, name, 0);
-}
+static void _task_info_array_destroy(void);
 
 /*
  * Expand a stdio file name.
@@ -103,8 +90,7 @@ _batchfilename(stepd_step_rec_t *step, const char *name)
  * object will be used.  If is a valid number, but it does not match
  * "taskid", then the file descriptor will be connected to /dev/null.
  */
-static char *
-_expand_stdio_filename(char *filename, int gtaskid, stepd_step_rec_t *step)
+static char *_expand_stdio_filename(char *filename, int gtaskid)
 {
 	int id;
 
@@ -126,9 +112,8 @@ _expand_stdio_filename(char *filename, int gtaskid, stepd_step_rec_t *step)
 		return xstrdup("/dev/null");
 }
 
-static void
-_job_init_task_info(stepd_step_rec_t *step, uint32_t **gtid,
-		    char *ifname, char *ofname, char *efname)
+static void _job_init_task_info(uint32_t **gtid, char *ifname, char *ofname,
+				char *efname)
 {
 	int          i, node_id = step->nodeid;
 	char        *in, *out, *err;
@@ -147,15 +132,12 @@ _job_init_task_info(stepd_step_rec_t *step, uint32_t **gtid,
 		xmalloc(step->node_tasks * sizeof(stepd_step_task_info_t *));
 
 	for (i = 0; i < step->node_tasks; i++) {
-		in  = _expand_stdio_filename(ifname,
-					     gtid[node_id][i] + het_job_offset,
-					     step);
+		in = _expand_stdio_filename(ifname,
+					    gtid[node_id][i] + het_job_offset);
 		out = _expand_stdio_filename(ofname,
-					     gtid[node_id][i] + het_job_offset,
-					     step);
+					     gtid[node_id][i] + het_job_offset);
 		err = _expand_stdio_filename(efname,
-					     gtid[node_id][i] + het_job_offset,
-					     step);
+					     gtid[node_id][i] + het_job_offset);
 		step->task[i] = _task_info_create(i, gtid[node_id][i], in, out,
 						 err);
 		if ((step->flags & LAUNCH_MULTI_PROG) == 0) {
@@ -198,7 +180,7 @@ _task_info_destroy(stepd_step_task_info_t *t, uint16_t multi_prog)
 	xfree(t);
 }
 
-static void _task_info_array_destroy(stepd_step_rec_t *step)
+static void _task_info_array_destroy(void)
 {
 	uint16_t multi_prog = 0;
 
@@ -214,7 +196,7 @@ static void _task_info_array_destroy(stepd_step_rec_t *step)
 	xfree(step->task);
 }
 
-static void _slurm_cred_to_step_rec(slurm_cred_t *cred, stepd_step_rec_t *step)
+static void _slurm_cred_to_step_rec(slurm_cred_t *cred)
 {
 	slurm_cred_arg_t *cred_arg = slurm_cred_get_args(cred);
 
@@ -236,6 +218,7 @@ static void _slurm_cred_to_step_rec(slurm_cred_t *cred, stepd_step_rec_t *step)
 
 	step->job_end_time = cred_arg->job_end_time;
 	step->job_licenses = xstrdup(cred_arg->job_licenses);
+	step->job_restart_cnt = cred_arg->job_restart_cnt;
 	step->job_start_time = cred_arg->job_start_time;
 	step->selinux_context = xstrdup(cred_arg->job_selinux_context);
 
@@ -248,14 +231,17 @@ static void _slurm_cred_to_step_rec(slurm_cred_t *cred, stepd_step_rec_t *step)
 	step->alias_list = xstrdup(cred_arg->job_alias_list);
 	step->node_list = xstrdup(cred_arg->job_hostlist);
 
+	if (cred_arg->switch_step)
+		switch_g_stepinfo_duplicate(cred_arg->switch_step,
+					    &step->switch_step);
+
 	slurm_cred_unlock_args(cred);
 }
 
 /* create a slurmd step structure from a launch tasks message */
-extern stepd_step_rec_t *stepd_step_rec_create(launch_tasks_request_msg_t *msg,
-					       uint16_t protocol_version)
+extern int stepd_step_rec_create(launch_tasks_request_msg_t *msg,
+				 uint16_t protocol_version)
 {
-	stepd_step_rec_t *step = NULL;
 	srun_info_t   *srun = NULL;
 	slurm_addr_t     resp_addr;
 	slurm_addr_t     io_addr;
@@ -266,22 +252,18 @@ extern stepd_step_rec_t *stepd_step_rec_create(launch_tasks_request_msg_t *msg,
 	debug3("entering stepd_step_rec_create");
 
 	if (acct_gather_check_acct_freq_task(msg->job_mem_lim, msg->acctg_freq))
-		return NULL;
+		return SLURM_ERROR;
 
 	step = xmalloc(sizeof(stepd_step_rec_t));
 	step->msg = msg;
-#ifndef HAVE_FRONT_END
 	nodeid = nodelist_find(msg->complete_nodelist, conf->node_name);
 	step->node_name = xstrdup(conf->node_name);
-#else
-	nodeid = 0;
-	step->node_name = xstrdup(msg->complete_nodelist);
-#endif
+
 	if (nodeid < 0) {
 		error("couldn't find node %s in %s",
 		      step->node_name, msg->complete_nodelist);
-		stepd_step_rec_destroy(step);
-		return NULL;
+		stepd_step_rec_destroy();
+		return SLURM_ERROR;
 	}
 
 	step->state = SLURMSTEPD_STEP_STARTING;
@@ -294,12 +276,12 @@ extern stepd_step_rec_t *stepd_step_rec_create(launch_tasks_request_msg_t *msg,
 	step->ntasks	= msg->ntasks;
 	memcpy(&step->step_id, &msg->step_id, sizeof(step->step_id));
 
-	_slurm_cred_to_step_rec(msg->cred, step);
+	_slurm_cred_to_step_rec(msg->cred);
 	if (!step->user_name) {
 		error("Failed to look up username for uid=%u, cannot continue with launch",
 		      step->uid);
-		stepd_step_rec_destroy(step);
-		return NULL;
+		stepd_step_rec_destroy();
+		return SLURM_ERROR;
 	}
 	/*
 	 * Favor the group info in the launch cred if available - fall back
@@ -337,6 +319,13 @@ extern stepd_step_rec_t *stepd_step_rec_create(launch_tasks_request_msg_t *msg,
 	/* Used for env vars */
 	step->het_job_node_offset = msg->het_job_node_offset;
 	step->het_job_step_cnt = msg->het_job_step_cnt;
+	if (msg->het_job_step_task_cnts) {
+		step->het_job_step_task_cnts =
+			xcalloc(sizeof(uint32_t), msg->het_job_step_cnt);
+		memcpy(step->het_job_step_task_cnts,
+		       msg->het_job_step_task_cnts,
+		       (msg->het_job_step_cnt * sizeof(uint32_t)));
+	}
 	step->het_job_id  = msg->het_job_id;	/* Used for env vars */
 	step->het_job_nnodes = msg->het_job_nnodes;	/* Used for env vars */
 	if (msg->het_job_nnodes && msg->het_job_ntasks &&
@@ -428,8 +417,8 @@ extern stepd_step_rec_t *stepd_step_rec_create(launch_tasks_request_msg_t *msg,
 		memset(&io_addr, 0, sizeof(slurm_addr_t));
 	}
 
-	srun = srun_info_create(msg->cred, &resp_addr, &io_addr, step->uid,
-				protocol_version);
+	srun = srun_info_create(msg->cred, msg->alloc_tls_cert, &resp_addr,
+				&io_addr, step->uid, protocol_version);
 
 	step->profile     = msg->profile;
 	step->task_prolog = xstrdup(msg->task_prolog);
@@ -454,7 +443,6 @@ extern stepd_step_rec_t *stepd_step_rec_create(launch_tasks_request_msg_t *msg,
 
 	step->timelimit   = (time_t) -1;
 	step->flags       = msg->flags;
-	step->switch_step = msg->switch_step;
 	step->open_mode   = msg->open_mode;
 	step->options     = msg->options;
 
@@ -478,21 +466,24 @@ extern stepd_step_rec_t *stepd_step_rec_create(launch_tasks_request_msg_t *msg,
 		step->x11_target_port = msg->x11_target_port;
 	}
 
+	if (msg->step_id.step_id == SLURM_EXTERN_CONT)
+		step->oom_kill_step = false;
+	else
+		step->oom_kill_step = msg->oom_kill_step;
+
 	get_cred_gres(msg->cred, conf->node_name,
 		      &step->job_gres_list, &step->step_gres_list);
 
 	list_append(step->sruns, (void *) srun);
 
-	_job_init_task_info(step, msg->global_task_ids,
-			    msg->ifname, msg->ofname, msg->efname);
+	_job_init_task_info(msg->global_task_ids, msg->ifname, msg->ofname,
+			    msg->efname);
 
-	return step;
+	return SLURM_SUCCESS;
 }
 
-extern stepd_step_rec_t *
-batch_stepd_step_rec_create(batch_job_launch_msg_t *msg)
+extern int batch_stepd_step_rec_create(batch_job_launch_msg_t *msg)
 {
-	stepd_step_rec_t *step;
 	srun_info_t  *srun = NULL;
 	char *in_name;
 
@@ -501,7 +492,7 @@ batch_stepd_step_rec_create(batch_job_launch_msg_t *msg)
 	debug3("entering batch_stepd_step_rec_create");
 
 	if (acct_gather_check_acct_freq_task(msg->job_mem, msg->acctg_freq))
-		return NULL;
+		return SLURM_ERROR;
 
 	step = xmalloc(sizeof(stepd_step_rec_t));
 
@@ -512,9 +503,7 @@ batch_stepd_step_rec_create(batch_job_launch_msg_t *msg)
 		step->cpus    = msg->cpus_per_node[0];
 	step->node_tasks  = 1;
 	step->ntasks  = msg->ntasks;
-	step->step_id.job_id   = msg->job_id;
-	step->step_id.step_id  = SLURM_BATCH_SCRIPT;
-	step->step_id.step_het_comp  = NO_VAL;
+	step->step_id = msg->step_id;
 	step->array_job_id  = msg->array_job_id;
 	step->array_task_id = msg->array_task_id;
 	step->het_job_step_cnt = NO_VAL;
@@ -523,15 +512,18 @@ batch_stepd_step_rec_create(batch_job_launch_msg_t *msg)
 	step->het_job_ntasks = NO_VAL;	/* Used to set env vars */
 	step->het_job_offset = NO_VAL;	/* Used to set labels and env vars */
 	step->job_core_spec = msg->job_core_spec;
+	step->cpu_freq_min = msg->cpu_freq_min;
+	step->cpu_freq_max = msg->cpu_freq_max;
+	step->cpu_freq_gov = msg->cpu_freq_gov;
 
 	step->batch   = true;
 	step->node_name  = xstrdup(conf->node_name);
 
-	_slurm_cred_to_step_rec(msg->cred, step);
+	_slurm_cred_to_step_rec(msg->cred);
 	if (!step->user_name) {
 		error("Failed to look up username for uid=%u, cannot continue with launch",
 		      step->uid);
-		return NULL;
+		return SLURM_ERROR;
 	}
 	/*
 	 * Favor the group info in the launch cred if available - fall back
@@ -598,7 +590,7 @@ batch_stepd_step_rec_create(batch_job_launch_msg_t *msg)
 	get_cred_gres(msg->cred, conf->node_name,
 		      &step->job_gres_list, &step->step_gres_list);
 
-	srun = srun_info_create(NULL, NULL, NULL, step->uid, NO_VAL16);
+	srun = srun_info_create(NULL, NULL, NULL, NULL, step->uid, NO_VAL16);
 
 	list_append(step->sruns, (void *) srun);
 
@@ -623,16 +615,16 @@ batch_stepd_step_rec_create(batch_job_launch_msg_t *msg)
 		in_name = fname_create(step, msg->std_in, 0);
 
 	step->task[0] = _task_info_create(0, 0, in_name,
-					 _batchfilename(step, msg->std_out),
-					 _batchfilename(step, msg->std_err));
+					  fname_create(step, msg->std_out, 0),
+					  fname_create(step, msg->std_err, 0));
 	step->task[0]->argc = step->argc;
 	step->task[0]->argv = step->argv;
+	step->oom_kill_step = msg->oom_kill_step;
 
-	return step;
+	return SLURM_SUCCESS;
 }
 
-extern void
-stepd_step_rec_destroy(stepd_step_rec_t *step)
+extern void stepd_step_rec_destroy(void)
 {
 	int i;
 
@@ -641,7 +633,7 @@ stepd_step_rec_destroy(stepd_step_rec_t *step)
 	env_array_free(step->argv);
 	step->argv = NULL;
 
-	_task_info_array_destroy(step);
+	_task_info_array_destroy();
 	if (step->eio) {
 		eio_handle_destroy(step->eio);
 		step->eio = NULL;
@@ -684,6 +676,7 @@ stepd_step_rec_destroy(stepd_step_rec_t *step)
 	}
 	xfree(step->node_name);
 	xfree(step->het_job_task_cnts);
+	xfree(step->het_job_step_task_cnts);
 	if (step->het_job_nnodes != NO_VAL) {
 		for (i = 0; i < step->het_job_nnodes; i++)
 			xfree(step->het_job_tids[i]);
@@ -700,10 +693,14 @@ stepd_step_rec_destroy(stepd_step_rec_t *step)
 	xfree(step->tres_freq);
 	xfree(step->user_name);
 	xfree(step->x11_xauthority);
+
+	if (step->switch_step)
+		switch_g_stepinfo_free(step->switch_step);
+
 	xfree(step);
 }
 
-extern srun_info_t *srun_info_create(slurm_cred_t *cred,
+extern srun_info_t *srun_info_create(slurm_cred_t *cred, char *alloc_tls_cert,
 				     slurm_addr_t *resp_addr,
 				     slurm_addr_t *ioaddr, uid_t uid,
 				     uint16_t protocol_version)
@@ -722,6 +719,7 @@ extern srun_info_t *srun_info_create(slurm_cred_t *cred,
 	if (!cred) return srun;
 
 	srun->key = slurm_cred_get_signature(cred);
+	srun->tls_cert = xstrdup(alloc_tls_cert);
 
 	if (ioaddr != NULL)
 		srun->ioaddr    = *ioaddr;
@@ -734,6 +732,7 @@ extern void
 srun_info_destroy(srun_info_t *srun)
 {
 	xfree(srun->key);
+	xfree(srun->tls_cert);
 	xfree(srun);
 }
 

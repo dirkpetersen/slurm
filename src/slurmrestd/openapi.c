@@ -34,6 +34,7 @@
 \*****************************************************************************/
 
 #include "src/common/data.h"
+#include "src/common/http.h"
 #include "src/common/plugrack.h"
 #include "src/common/read_config.h"
 #include "src/common/xassert.h"
@@ -126,6 +127,7 @@ typedef struct {
 #define MAGIC_OAS 0x1218eeee
 typedef struct {
 	int magic; /* MAGIC_OAS */
+	const char **mime_types;
 	data_t *spec;
 	data_t *tags;
 	data_t *paths;
@@ -137,6 +139,7 @@ typedef struct {
 	data_t *license;
 	data_t *servers;
 	data_t *security;
+	data_t *x_slurm;
 	/* tracked references per data_parser */
 	void **references;
 } openapi_spec_t;
@@ -165,7 +168,7 @@ static const struct {
 	struct {
 		char *name;
 		char *desc;
-	} tags[3];
+	} tags[4];
 	struct {
 		char *url;
 	} servers[1];
@@ -205,6 +208,10 @@ static const struct {
 		{
 			.name = "slurmdb",
 			.desc = "methods that query slurmdbd",
+		},
+		{
+			.name = "util",
+			.desc = "utilities available directly through slurmrestd",
 		},
 		{
 			.name = "openapi",
@@ -303,7 +310,7 @@ static const http_status_code_t *response_status_codes = NULL;
 static const http_status_code_t default_response_status_codes[] = {
 	HTTP_STATUS_CODE_SUCCESS_OK,
 	HTTP_STATUS_CODE_DEFAULT,
-	HTTP_STATUS_NONE
+	HTTP_STATUS_CODE_INVALID,
 };
 
 static char *_entry_to_string(entry_t *entry);
@@ -527,7 +534,7 @@ static void _check_openapi_path_binding(const openapi_path_binding_t *op_path)
 		xassert(method->response.description &&
 			method->response.description[0]);
 		xassert(method->method > HTTP_REQUEST_INVALID);
-		xassert(method->method < HTTP_REQUEST_MAX);
+		xassert(method->method < HTTP_REQUEST_INVALID_MAX);
 		xassert(method->tags && method->tags[0]);
 		xassert(method->response.type > DATA_PARSER_TYPE_INVALID);
 		xassert(method->response.type < DATA_PARSER_TYPE_MAX);
@@ -928,9 +935,7 @@ extern int init_openapi(const char *plugin_list, plugrack_foreach_t listf,
 	paths = list_create(_list_delete_path_t);
 
 	/* must have JSON plugin to parse the openapi.json */
-	if ((rc = serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL)))
-		fatal("Plugin serializer/json failed to load: %s",
-		      slurm_strerror(rc));
+	serializer_required(MIME_TYPE_JSON);
 
 	if ((rc = _bind_paths(openapi_paths, NULL)))
 		fatal("Unable to bind openapi specification paths: %s",
@@ -1115,7 +1120,7 @@ static char *_get_method_operationId(openapi_spec_t *spec, path_t *path,
 static int _populate_method(path_t *path, openapi_spec_t *spec, data_t *dpath,
 			    const openapi_path_binding_method_t *method)
 {
-	const char **mime_types = get_mime_type_array();
+	const char **mime_types = spec->mime_types;
 	void *refs = &spec->references[_resolve_parser_index(path->parser)];
 	data_t *dmethod = data_set_dict(data_key_set(dpath,
 		get_http_method_string_lc(method->method)));
@@ -1130,6 +1135,9 @@ static int _populate_method(path_t *path, openapi_spec_t *spec, data_t *dpath,
 	if (method->description)
 		data_set_string(data_key_set(dmethod, "description"),
 				method->description);
+
+	if (data_parser_g_is_deprecated(path->parser))
+		data_set_bool(data_key_set(dmethod, "deprecated"), true);
 
 	{
 		char *opid = _get_method_operationId(spec, path, method);
@@ -1247,8 +1255,9 @@ static int _foreach_add_path(void *x, void *arg)
 	xassert(!data_key_get(spec->paths, path->path));
 	dpath = data_set_dict(data_key_set(spec->paths, path->path));
 
-	for (int i = 0; !rc && bound->methods[i].method; i++)
-		rc = _populate_method(path, spec, dpath, &bound->methods[i]);
+	for (int i = 0; !rc && path->methods[i].method; i++)
+		rc = _populate_method(path, spec, dpath,
+				      path->methods[i].bound);
 
 	return rc;
 }
@@ -1257,6 +1266,7 @@ static int _foreach_count_path(void *x, void *arg)
 {
 	path_t *path = x;
 	openapi_spec_t *spec = arg;
+	const char **mime_types = spec->mime_types;
 	const openapi_path_binding_t *bound = path->bound;
 	void *refs;
 
@@ -1268,10 +1278,9 @@ static int _foreach_count_path(void *x, void *arg)
 
 	refs = &spec->references[_resolve_parser_index(path->parser)];
 
-	for (int i = 0; bound->methods[i].method; i++) {
+	for (int i = 0; path->methods[i].method; i++) {
 		const openapi_path_binding_method_t *method =
-			&bound->methods[i];
-		const char **mime_types = get_mime_type_array();
+			path->methods[i].bound;
 
 		if (method->parameters &&
 		    data_parser_g_increment_reference(path->parser,
@@ -1310,14 +1319,15 @@ static int _foreach_count_path(void *x, void *arg)
 	return SLURM_SUCCESS;
 }
 
-extern int generate_spec(data_t *dst)
+extern int generate_spec(data_t *dst, const char **mime_types)
 {
 	openapi_spec_t spec = {
 		.magic = MAGIC_OAS,
 		.spec = dst,
+		.mime_types = mime_types,
 	};
 	data_t *security1, *security2, *security3;
-	char *version_at = NULL;
+	data_t *openapi_plugins, *data_parsers, *slurm_version;
 	char *version = xstrdup_printf("Slurm-%s", SLURM_VERSION_STRING);
 	int parsers_count;
 
@@ -1336,11 +1346,16 @@ extern int generate_spec(data_t *dst)
 	spec.info = data_set_dict(data_key_set(spec.spec, "info"));
 	spec.contact = data_set_dict(data_key_set(spec.info, "contact"));
 	spec.license = data_set_dict(data_key_set(spec.info, "license"));
+	spec.x_slurm = data_set_dict(data_key_set(spec.info, "x-slurm"));
 	spec.servers = data_set_list(data_key_set(spec.spec, "servers"));
 	spec.security = data_set_list(data_key_set(spec.spec, "security"));
 	security1 = data_set_dict(data_list_append(spec.security));
 	security2 = data_set_dict(data_list_append(spec.security));
 	security3 = data_set_dict(data_list_append(spec.security));
+	data_parsers =
+		data_set_list(data_key_set(spec.x_slurm, "data_parsers"));
+	openapi_plugins = data_set_list(data_key_set(spec.x_slurm, "openapi"));
+	slurm_version = data_set_dict(data_key_set(spec.x_slurm, "version"));
 
 	data_set_string(data_key_set(spec.spec, "openapi"),
 			openapi_spec.openapi_version);
@@ -1349,12 +1364,30 @@ extern int generate_spec(data_t *dst)
 			openapi_spec.info.desc);
 	data_set_string(data_key_set(spec.info, "termsOfService"),
 			openapi_spec.info.tos);
-
-	/* Populate OAS version */
-	for (int i = 0; i < plugins->count; i++)
-		xstrfmtcatat(version, &version_at, "&%s", plugins->types[i]);
 	data_set_string_own(data_key_set(spec.info, "version"), version);
 
+	/* Populate info spec extension x-slurm with data_parsers and flags */
+	for (int i = 0; i < parsers_count; i++) {
+		data_t *tmp_data = data_list_append(data_parsers);
+
+		data_set_dict(tmp_data);
+		data_set_string(data_key_set(tmp_data, "plugin"),
+				data_parser_get_plugin_version(parsers[i]));
+		if (data_parser_g_dump_flags(parsers[i],
+					     data_key_set(tmp_data, "flags")))
+			fatal_abort("data_parser_g_dump_flags() failed");
+	}
+
+	/* Populate info spec extension x-slurm with openapi plugins */
+	for (int i = 0; i < plugins->count; i++)
+		data_set_string(data_list_append(openapi_plugins),
+				plugins->types[i]);
+
+	data_set_string(data_key_set(slurm_version, "major"), SLURM_MAJOR);
+	data_set_string(data_key_set(slurm_version, "micro"), SLURM_MICRO);
+	data_set_string(data_key_set(slurm_version, "minor"), SLURM_MINOR);
+	data_set_string(data_key_set(spec.x_slurm, "release"),
+			SLURM_VERSION_STRING);
 	data_set_string(data_key_set(spec.contact, "name"),
 			openapi_spec.info.contact.name);
 	data_set_string(data_key_set(spec.contact, "url"),
@@ -1444,7 +1477,7 @@ extern int generate_spec(data_t *dst)
 
 static int _op_handler_openapi(openapi_ctxt_t *ctxt)
 {
-	return generate_spec(ctxt->resp);
+	return generate_spec(ctxt->resp, get_mime_type_array());
 }
 
 static bool _on_error(void *arg, data_parser_type_t type, int error_code,
@@ -1610,7 +1643,7 @@ static void _populate_openapi_results(openapi_ctxt_t *ctxt,
 extern int wrap_openapi_ctxt_callback(const char *context_id,
 				      http_request_method_t method,
 				      data_t *parameters, data_t *query,
-				      int tag, data_t *resp, void *auth,
+				      int tag, data_t *resp, void *db_conn,
 				      data_parser_t *parser,
 				      const openapi_path_binding_t *op_path,
 				      const openapi_resp_meta_t *plugin_meta)
@@ -1650,16 +1683,17 @@ extern int wrap_openapi_ctxt_callback(const char *context_id,
 
 	if (op_path->flags & OP_BIND_NO_SLURMDBD) {
 		; /* Do not attempt to open a connection to slurmdbd */
-	} else if (slurm_conf.accounting_storage_type &&
-		   !(ctxt.db_conn = openapi_get_db_conn(auth))) {
+	} else if (!(ctxt.db_conn = db_conn)) {
 		if (op_path->flags & OP_BIND_REQUIRE_SLURMDBD)
-			openapi_resp_error(&ctxt, (rc = ESLURM_DB_CONNECTION),
-					   XSTRINGIFY(openapi_get_db_conn),
-					   "Failed to open slurmdbd connection");
+			openapi_resp_error(
+				&ctxt, (rc = ESLURM_DB_CONNECTION),
+				XSTRINGIFY(openapi_get_db_conn),
+					"Failed to open slurmdbd connection");
 		else
-			openapi_resp_warn(&ctxt,
-					  XSTRINGIFY(openapi_get_db_conn),
-					  "Failed to open connection to slurmdbd. Response fields may not be fully populated or empty.");
+			openapi_resp_warn(
+				&ctxt,
+				XSTRINGIFY(openapi_get_db_conn),
+					"Failed to open connection to slurmdbd. Response fields may not be fully populated or empty.");
 	} else {
 		rc = data_parser_g_assign(ctxt.parser,
 					  DATA_PARSER_ATTR_DBCONN_PTR,

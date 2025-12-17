@@ -92,7 +92,7 @@ struct jobacctinfo {
 	uint32_t current_weighted_power;
 	uint32_t tres_count; /* count of tres in the usage array's */
 	uint32_t *tres_ids; /* array of tres_count of the tres id's */
-	List tres_list; /* list of tres we are dealing with */
+	list_t *tres_list; /* list of tres we are dealing with */
 	uint64_t *tres_usage_in_max; /* tres max usage in data */
 	uint64_t *tres_usage_in_max_nodeid; /* tres max usage in data node id */
 	uint64_t *tres_usage_in_max_taskid; /* tres max usage in data task id */
@@ -136,6 +136,8 @@ extern int jobacct_gather_add_task(pid_t pid, jobacct_id_t *jobacct_id,
 				   int poll);
 /* must free jobacctinfo_t if not NULL */
 extern jobacctinfo_t *jobacct_gather_stat_task(pid_t pid, bool update_data);
+
+extern void jobacct_gather_stat_all_task(jobacctinfo_t *ret_jobacct);
 /*
  * Find task by pid and remove from tracked task list.
  *

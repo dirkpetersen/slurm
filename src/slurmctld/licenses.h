@@ -39,18 +39,79 @@
 #ifndef _LICENSES_H
 #define _LICENSES_H
 
+#include "src/common/bitstring.h"
 #include "src/common/list.h"
 #include "src/slurmctld/slurmctld.h"
 
+#define HRES_MODE_OFF 0x00
+#define HRES_MODE_1 0x01
+#define HRES_MODE_2 0x02
+#define HRES_MODE_3 0x03
+
+#define MAX_HIERARCHY_DEPTH 16
+
 typedef struct {
+	uint16_t lic_id;
+	uint16_t hres_id;
+} licenses_id_t;
+
+typedef uint16_t path_idx_t[MAX_HIERARCHY_DEPTH];
+
+typedef struct {
+	uint32_t capacity;
+	bitstr_t *node_bitmap;
+	path_idx_t path_idx;
+} hres_leaf_t;
+
+typedef struct {
+	uint32_t *avail_hres;
+	uint32_t *avail_hres_orig;
+	uint16_t depth;
+	uint16_t hres_per_node;
+	uint16_t layers_cnt; /* size of avail_hres */
+	hres_leaf_t *leaf;
+	uint16_t leaf_cnt; /* size of leaf */
+	licenses_id_t root_id;
+	bool test_only;
+	int topology_idx;
+} hres_select_t;
+
+typedef struct {
+	list_t *base;
+	uint32_t base_usage;
+	uint16_t depth; /* depth of layout */
+	uint16_t idx; /* internal index in hres_select_t -> avail_hres array */
+	uint16_t layers_cnt; /* count of layers, set only for root*/
+	uint16_t leaf_cnt; /* count of leafs, set only for root*/
+	uint16_t level; /* level - 0 for leaf */
+	uint16_t parent_id; /* lic_id of parent - NO_VAL16 for root */
+	path_idx_t path_idx;
+	int topology_idx;
+	char *topology_name;
+	uint32_t total;
+	list_t *variables; /* list of hres_variable_t */
+} hres_rec_t;
+
+typedef struct {
+	char *name;
+	uint32_t value;
+} hres_variable_t;
+
+typedef struct {
+	licenses_id_t id;
 	char *		name;		/* name associated with a license */
-	uint32_t	total;		/* total license configued */
+	bool op_or; /* Whether the licenses were requested with AND or OR */
+	uint32_t	total;		/* total license configured */
 	uint32_t	used;		/* used licenses */
 	uint32_t	reserved;	/* currently reserved licenses */
 	uint8_t         remote;	        /* non-zero if remote (from database) */
 	uint32_t last_deficit;		/* last calculated deficit */
 	uint32_t last_consumed;		/* consumed count (for remote) */
-	time_t last_update;		/* last updated timestamp (for remote) */
+	time_t last_update; /* last updated timestamp (for remote) */
+	bitstr_t *node_bitmap;
+	char *nodes;
+	uint8_t mode;
+	hres_rec_t hres_rec; /* mode_3 specific structure*/
 } licenses_t;
 
 /*
@@ -59,16 +120,46 @@ typedef struct {
 typedef struct xlist bf_licenses_t;
 
 typedef struct {
-	char *name;
+	licenses_id_t id;
 	uint32_t remaining;
 	slurmctld_resv_t *resv_ptr;
 } bf_license_t;
 
-extern list_t *cluster_license_list;
 extern time_t last_license_update;
 
 /* Initialize licenses on this system based upon slurm.conf */
 extern int license_init(char *licenses);
+
+extern int hres_init(void);
+extern int hres_filter(job_record_t *job_ptr, bitstr_t *node_bitmap);
+
+extern bool hres_select_check(hres_select_t *hres_select,
+			      uint16_t hres_leaf_idx);
+
+extern void hres_select_return(hres_select_t *hres_select,
+			       uint16_t hres_leaf_idx);
+
+extern void hres_create_select(job_record_t *job_ptr);
+
+extern uint32_t hres_get_capacity(hres_select_t *hres_select, int leaf_idx);
+
+extern uint16_t hres_select_find_leaf(hres_select_t *hres_select, int node_inx);
+
+extern void hres_select_free(job_record_t *job_ptr);
+
+extern void hres_select_print(hres_select_t *hres_select);
+
+extern void hres_pre_select(job_record_t *job_ptr, bool test_only);
+
+extern void hres_variable_free(void *x);
+
+extern void slurm_bf_hres_pre_select(job_record_t *job_ptr,
+				     bf_licenses_t *bf_licenses);
+
+extern int hres_filter_with_list(job_record_t *job_ptr, bitstr_t *node_bitmap,
+				 list_t *license_list);
+extern void slurm_bf_hres_filter(job_record_t *job_ptr, bitstr_t *node_bitmap,
+				 bf_licenses_t *bf_licenses);
 
 /* Update licenses on this system based upon slurm.conf.
  * Remove all previously allocated licenses */
@@ -87,11 +178,13 @@ extern void license_free_rec(void *x);
 
 /*
  * license_copy - create a copy of license list
- * IN license_list_src - job license list to be copied
  * RET a copy of the license list
  */
 extern list_t *license_copy(list_t *license_list_src);
+extern list_t *cluster_license_copy(void);
 
+extern licenses_t *license_find_rec_by_id(list_t *license_list,
+					  licenses_id_t id);
 /*
  * license_job_get - Get the licenses required for a job
  * IN job_ptr - job identification
@@ -109,12 +202,16 @@ extern int license_job_get(job_record_t *job_ptr, bool restore);
 extern void license_job_merge(job_record_t *job_ptr);
 
 /*
- * license_job_return - Return the licenses allocated to a job
+ * Return the licenses allocated to a job to the provided list
  * IN job_ptr - job identification
+ * IN license_list - list of license_t records
+ * IN locked - if the license_mutex is locked or not
+ * IN future - if true, don't modify the job record
  * RET SLURM_SUCCESS or failure code
  */
 extern int license_job_return_to_list(job_record_t *job_ptr,
-				      list_t *license_list);
+				      list_t *license_list, bool locked,
+				      bool future);
 
 /*
  * license_job_return - Return the licenses allocated to a job
@@ -129,10 +226,12 @@ extern int license_job_return(job_record_t *job_ptr);
  * IN job_ptr - job identification
  * IN when    - time to check
  * IN reboot    - true if node reboot required to start job
+ * IN check_preempt_licenses - If false, do not look for licenses to preempt
  * RET: SLURM_SUCCESS, EAGAIN (not available now), SLURM_ERROR (never runnable)
  */
 extern int license_job_test_with_list(job_record_t *job_ptr, time_t when,
-				      bool reboot, list_t *license_list);
+				      bool reboot, list_t *license_list,
+				      bool check_preempt_licenses);
 
 /*
  * license_job_test - Test if the licenses required for a job are available
@@ -157,7 +256,7 @@ extern int license_job_test(job_record_t *job_ptr, time_t when,
  * RET license_list, must be destroyed by caller
  */
 extern list_t *license_validate(char *licenses, bool validate_configured,
-				bool validate_existing,
+				bool validate_existing, bool hres,
 				uint64_t *tres_req_cnt, bool *valid);
 
 /*
@@ -165,6 +264,12 @@ extern list_t *license_validate(char *licenses, bool validate_configured,
  *	names found in the two lists
  */
 extern bool license_list_overlap(list_t *list_1, list_t *list_2);
+
+/*
+ * license_list_overlap_non_hres - test if there is any overlap in non-hres
+ *	licenses names found in the two lists
+ */
+extern bool license_list_overlap_non_hres(list_t *list_1, list_t *list_2);
 
 /*
  * Given a list of license_t records, return a license string.
@@ -218,6 +323,11 @@ extern char *bf_licenses_to_string(bf_licenses_t *licenses_list);
  * functions is wrapped in a macro that avoids the function call when a NULL
  * licenses list is provided as the first argument.
  */
+#define bf_hres_filter(_x, _y, _z) \
+	(_z ? slurm_bf_hres_filter(_x, _y, _z) : NULL)
+extern void slurm_bf_hres_filter(job_record_t *job_ptr, bitstr_t *node_bitmap,
+				 bf_licenses_t *bf_license_list);
+
 #define bf_licenses_copy(_x) (_x ? slurm_bf_licenses_copy(_x) : NULL)
 extern bf_licenses_t *slurm_bf_licenses_copy(bf_licenses_t *licenses_src);
 
@@ -229,9 +339,11 @@ extern void slurm_bf_licenses_deduct(bf_licenses_t *licenses,
 extern void slurm_bf_licenses_transfer(bf_licenses_t *licenses,
 				       job_record_t *job_ptr);
 
-#define bf_licenses_avail(_x, _y) (_x ? slurm_bf_licenses_avail(_x, _y) : true)
+#define bf_licenses_avail(_x, _y, _z) \
+	(_x ? slurm_bf_licenses_avail(_x, _y, _z) : true)
 extern bool slurm_bf_licenses_avail(bf_licenses_t *licenses,
-				    job_record_t *job_ptr);
+				    job_record_t *job_ptr,
+				    bitstr_t *node_bitmap);
 
 #define bf_licenses_equal(_x, _y) (_x ? slurm_bf_licenses_equal(_x, _y) : true)
 extern bool slurm_bf_licenses_equal(bf_licenses_t *a, bf_licenses_t *b);

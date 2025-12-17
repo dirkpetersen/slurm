@@ -62,7 +62,7 @@
  * the resource is not locked by a writer.
  *
  * So, if the resource is locked by an unspecified number of readers,
- * and a writer trys to lock the resource, then the writer will be blocked
+ * and a writer tries to lock the resource, then the writer will be blocked
  * until all of the previous readers have unlocked the resource.  But,
  * just before the writer checked to see if there were any readers locking
  * the resource, the writer incremented the writers waiting semaphore,
@@ -97,7 +97,7 @@
 typedef enum {
 	NO_LOCK,
 	READ_LOCK,
-	WRITE_LOCK
+	WRITE_LOCK,
 }	lock_level_t;
 
 /* slurmctld specific data structures to lock via APIs */
@@ -107,6 +107,7 @@ typedef struct {
 	lock_level_t node;
 	lock_level_t part;
 	lock_level_t fed;
+	lock_level_t select_node;
 }	slurmctld_lock_t;
 
 typedef enum {
@@ -115,6 +116,7 @@ typedef enum {
 	NODE_LOCK,
 	PART_LOCK,
 	FED_LOCK,
+	SELECT_NODE_LOCK,
 }	lock_datatype_t;
 
 #ifndef NDEBUG
@@ -129,9 +131,5 @@ extern void lock_slurmctld (slurmctld_lock_t lock_levels);
 extern void unlock_slurmctld (slurmctld_lock_t lock_levels);
 
 extern int report_locks_set(void);
-
-/* un/lock semaphore used for saving state of slurmctld */
-extern void lock_state_files ( void );
-extern void unlock_state_files ( void );
 
 #endif

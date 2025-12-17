@@ -53,11 +53,13 @@
 #include "src/common/macros.h"
 #include "src/common/net.h"
 #include "src/common/read_config.h"
+#include "src/common/threadpool.h"
 #include "src/common/uid.h"
 #include "src/common/x11_util.h"
 #include "src/common/xmalloc.h"
-#include "src/common/xsignal.h"
 #include "src/common/xstring.h"
+
+#include "src/interfaces/conn.h"
 
 #include "src/slurmd/slurmstepd/slurmstepd.h"
 #include "src/slurmd/slurmstepd/slurmstepd_job.h"
@@ -68,7 +70,7 @@ static uid_t job_uid;
 static bool local_xauthority = false;
 static char hostname[HOST_NAME_MAX] = {0};
 
-static eio_handle_t *eio_handle;
+static eio_handle_t *eio_handle = NULL;
 
 /* Target salloc/srun host/port */
 static slurm_addr_t alloc_node;
@@ -97,29 +99,31 @@ static bool _x11_socket_readable(eio_obj_t *obj)
 
 static int _x11_socket_read(eio_obj_t *obj, list_t *objs)
 {
-	eio_obj_t *e1, *e2;
+	void *conn = NULL;
 	slurm_msg_t req, resp;
 	net_forward_msg_t rpc;
 	slurm_addr_t sin;
 	int *local, *remote;
+	char *srun_tls_cert = obj->arg;
 	int rc;
 
 	local = xmalloc(sizeof(*local));
 	remote = xmalloc(sizeof(*remote));
 
-	if ((*local = slurm_accept_msg_conn(obj->fd, &sin)) == -1) {
+	if ((*local = slurm_accept_conn(obj->fd, &sin)) == -1) {
 		error("accept call failure, shutting down");
 		goto shutdown;
 	}
 
-	*remote = slurm_open_msg_conn(&alloc_node);
-	if (*remote < 0) {
+	if (!(conn = slurm_open_msg_conn(&alloc_node, srun_tls_cert))) {
 		error("%s: slurm_open_msg_conn(%pA): %m",
 		      __func__, &alloc_node);
 		goto shutdown;
 	}
 
-	rpc.job_id = job_id;
+	*remote = conn_g_get_fd(conn);
+
+	rpc.step_id.job_id = job_id;
 	rpc.flags = 0;
 	rpc.port = x11_target_port;
 	rpc.target = x11_target;
@@ -132,7 +136,7 @@ static int _x11_socket_read(eio_obj_t *obj, list_t *objs)
 	slurm_msg_set_r_uid(&req, job_uid);
 	req.data = &rpc;
 
-	slurm_send_recv_msg(*remote, &req, &resp, 0);
+	slurm_send_recv_msg(conn, &req, &resp, 0);
 
 	if (resp.msg_type != RESPONSE_SLURM_RC) {
 		error("Unexpected response on setup, forwarding failed.");
@@ -149,11 +153,12 @@ static int _x11_socket_read(eio_obj_t *obj, list_t *objs)
 
 	slurm_free_msg_members(&resp);
 
-	/* setup eio to handle both sides of the connection now */
-	e1 = eio_obj_create(*local, &half_duplex_ops, remote);
-	e2 = eio_obj_create(*remote, &half_duplex_ops, local);
-	eio_new_obj(eio_handle, e1);
-	eio_new_obj(eio_handle, e2);
+	net_set_nodelay(*local, true, NULL);
+	net_set_nodelay(*remote, true, NULL);
+
+	if (half_duplex_add_objs_to_handle(eio_handle, local, remote, conn)) {
+		goto shutdown;
+	}
 
 	debug("%s: X11 forwarding setup successful", __func__);
 
@@ -169,12 +174,13 @@ shutdown:
 	return SLURM_ERROR;
 }
 
-extern int shutdown_x11_forward(stepd_step_rec_t *step)
+extern int shutdown_x11_forward(void)
 {
 	int rc = SLURM_SUCCESS;
 
 	debug("x11 forwarding shutdown in progress");
-	eio_signal_shutdown(eio_handle);
+	if (eio_handle)
+		eio_signal_shutdown(eio_handle);
 
 	if (step->x11_xauthority) {
 		if (local_xauthority) {
@@ -199,7 +205,7 @@ extern int shutdown_x11_forward(stepd_step_rec_t *step)
  * IN: job
  * OUT: SLURM_SUCCESS or SLURM_ERROR
  */
-extern int setup_x11_forward(stepd_step_rec_t *step)
+extern int setup_x11_forward(void)
 {
 	int listen_socket = -1;
 	uint16_t port;
@@ -243,19 +249,9 @@ extern int setup_x11_forward(stepd_step_rec_t *step)
 		xfree(home);
 	} else {
 		/* use a node-local XAUTHORITY file instead of ~/.Xauthority */
-		int fd;
 		local_xauthority = true;
 		step->x11_xauthority = slurm_get_tmp_fs(conf->node_name);
 		xstrcat(step->x11_xauthority, "/.Xauthority-XXXXXX");
-
-		/* protect against weak file permissions in old glibc */
-		umask(0077);
-		if ((fd = mkstemp(step->x11_xauthority)) == -1) {
-			error("%s: failed to create temporary XAUTHORITY file: %m",
-			      __func__);
-			goto shutdown;
-		}
-		close(fd);
 	}
 
 	/*
@@ -278,6 +274,8 @@ extern int setup_x11_forward(stepd_step_rec_t *step)
 
 	eio_handle = eio_handle_create(0);
 	obj = eio_obj_create(listen_socket, &x11_socket_ops, NULL);
+	obj->arg = xstrdup(srun->tls_cert);
+
 	eio_new_initial_obj(eio_handle, obj);
 	slurm_thread_create_detached(_eio_thread, NULL);
 

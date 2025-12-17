@@ -43,6 +43,8 @@
 #include "slurm/slurm.h"
 #include "src/slurmctld/slurmctld.h"
 
+#include "src/common/dynamic_plugin_data.h"
+
 #include "src/interfaces/gres.h"
 #include "src/interfaces/select.h"
 
@@ -50,8 +52,53 @@ typedef enum {
 	TOPO_DATA_TOPOLOGY_PTR,
 	TOPO_DATA_REC_CNT,
 	TOPO_DATA_EXCLUSIVE_TOPO,
+	TOPO_DATA_TCTX_IDX,
 } topology_data_t;
 
+typedef enum {
+	TOPO_JOBINFO_SEGMENT_LIST,
+} topology_jobinfo_type_t;
+
+typedef struct slurm_conf_block {
+	char *block_name; /* name of this block */
+	char *nodes; /* names of nodes directly connect to this block */
+} slurm_conf_block_t;
+
+typedef struct slurm_conf_switches {
+	uint32_t link_speed; /* link speed, arbitrary units */
+	char *nodes; /* names of nodes directly connect to
+		      * this switch, if any */
+	char *switch_name; /* name of this switch */
+	char *switches; /* names if child switches directly
+			 * connected to this switch, if any */
+} slurm_conf_switches_t;
+
+typedef struct topology_ctx {
+	bool cluster_default; /* topo used when operation not tied with part */
+	void *config; /* topology_tree_config_t*, topology_block_config_t*, or
+		       * NULL based on plugin value. */
+	int idx;
+	char *name;
+	char *plugin;
+	char *topo_conf;
+	void *plugin_ctx;
+} topology_ctx_t;
+
+typedef struct {
+	int config_cnt; /* size of config array */
+	slurm_conf_switches_t *switch_configs; /* array of switch configs */
+} topology_tree_config_t;
+
+typedef struct {
+	int config_cnt; /* size of config array */
+	slurm_conf_block_t *block_configs; /* array of block configs */
+	list_t *block_sizes; /* list of int* */
+} topology_block_config_t;
+
+typedef struct {
+	topology_ctx_t *tctx; /* array of topology_ctx_t */
+	int tctx_num; /* size of array */
+} topology_ctx_array_t;
 
 typedef struct topology_eval {
 	bitstr_t **avail_core; /* available core bitmap, UPDATED */
@@ -72,9 +119,8 @@ typedef struct topology_eval {
 	uint32_t req_nodes; /* number of requested nodes */
 	bool trump_others; /* If ->eval_nodes and set do not consider other
 			    * algorithms. Only use ->eval_nodes. */
+	topology_ctx_t *tctx;
 } topology_eval_t;
-
-extern char *topo_conf;
 
 /*****************************************************************************\
  *  Slurm topology functions
@@ -106,10 +152,24 @@ extern int topology_get_plugin_id(void);
  */
 
 /*
+ * topology_g_add_rm_node - update the node's topology affiliation according to
+ * the node's topology_str
+ *
+ * A NULL/empty topology_str will remove the node from the topologies.
+ *
+ * IN node_ptr
+ */
+extern int topology_g_add_rm_node(node_record_t *node_ptr);
+
+/*
  * topology_g_build_config - build or rebuild system topology information
  *	after a system startup or reconfiguration.
  */
 extern int topology_g_build_config(void);
+
+extern int topology_g_destroy_config(void);
+
+extern char *topology_g_get_config(void);
 
 /*
  * topology_g_eval_nodes - Evaluate topology based on the topology plugin when
@@ -117,7 +177,18 @@ extern int topology_g_build_config(void);
  */
 extern int topology_g_eval_nodes(topology_eval_t *topo_eval);
 
-extern int topology_g_whole_topo(bitstr_t *node_mask);
+extern int topology_g_whole_topo(bitstr_t *node_mask, int idx);
+
+extern bool topology_g_whole_topo_enabled(int idx);
+
+/*
+ * topology_g_get_bitmap - Get bitmap of nodes in topo group
+ *
+ * IN name of topo group
+ * RET bitmap of nodes from _record_table (do not free)
+ */
+extern bitstr_t *topology_g_get_bitmap(char *name);
+
 /*
  * topology_g_generate_node_ranking  -  populate node_rank fields
  * NOTE: This operation is only supported by those topology plugins for
@@ -143,7 +214,7 @@ extern int topology_g_get_node_addr(char *node_name, char **addr,
  * OUT: sp_hl - hostlist_t *** - The array of hostlists that will be malloced
  * OUT: count - int * - The count of created hostlists
  * IN: tree_width - int - Max width of each branch on the tree.
- * RET: SLURM_SUCCESS - int
+ * RET: int - the number of levels opened in the tree, or SLURM_ERROR
  *
  * Note: Created hostlist will have to be freed independently using
  *       hostlist_destroy by the caller.
@@ -156,40 +227,106 @@ extern int topology_g_split_hostlist(hostlist_t *hl,
 
 /* Get various information from the topology plugin
  * IN - type see topology_data_t
+ * IN - topology name
  * OUT data
  *     type = TOPO_DATA_TOPOLOGY_PTR - the system topology - Returned value must
- *                                     be freed using topology_g_topology_free.
+ *                                     be freed using topology_g_topoinfo_free.
  * RET         - slurm error code
- * NOTE: returned value must be freed using topology_g_topology_free
+ * NOTE: returned value must be freed using topology_g_topoinfo_free
  */
-extern int topology_g_get(topology_data_t type, void *data);
+extern int topology_g_get(topology_data_t type, char *name, void *data);
+
+/* free storage previously allocated for a system topology
+ * IN jobinfo  - the system topology to be freed
+ * RET         - slurm error code
+ */
+extern int topology_g_topoinfo_free(dynamic_plugin_data_t *topoinfo);
 
 /* pack a mchine independent form system topology
  * OUT buffer  - buffer with node topology appended
  * IN protocol_version - slurm protocol version of client
  * RET         - slurm error code
  */
-extern int topology_g_topology_pack(dynamic_plugin_data_t *topoinfo,
+extern int topology_g_topoinfo_pack(dynamic_plugin_data_t *topoinfo,
 				    buf_t *buffer,
 				    uint16_t protocol_version);
 
-extern int topology_g_topology_print(dynamic_plugin_data_t *topoinfo,
-				     char *nodes_list, char **out);
+extern int topology_g_topoinfo_print(dynamic_plugin_data_t *topoinfo,
+				     char *nodes_list, char *unit, char **out);
 
 /* unpack a system topology from a buffer
  * OUT topoinfo - the system topology
  * IN  buffer  - buffer with system topology read from current pointer loc
  * IN protocol_version - slurm protocol version of client
  * RET         - slurm error code
- * NOTE: returned value must be freed using topology_g_topology_free
+ * NOTE: returned value must be freed using topology_g_topoinfo_free
  */
-extern int topology_g_topology_unpack(dynamic_plugin_data_t **topoinfo,
+extern int topology_g_topoinfo_unpack(dynamic_plugin_data_t **topoinfo,
 				      buf_t *buffer,
 				      uint16_t protocol_version);
-/* free storage previously allocated for a system topology
- * IN jobinfo  - the system topology to be freed
- * RET         - slurm error code
- */
-extern int topology_g_topology_free(dynamic_plugin_data_t *topoinfo);
 
+/* free storage allocated for topology job info
+ * IN jobinfo_plugin_data - pointer to topology job info to free
+ */
+extern void topology_g_jobinfo_free(
+	dynamic_plugin_data_t *jobinfo_plugin_data);
+
+/* pack topology job info into buffer
+ * IN jobinfo_plugin_data - pointer to topology job info to pack
+ * IN buffer - data will be packed into this preexisting buffer
+ * IN protocol_version - job's version
+ */
+extern void topology_g_jobinfo_pack(
+	dynamic_plugin_data_t *jobinfo_plugin_data,
+	buf_t *buffer,
+	uint16_t protocol_version);
+
+/* unpack topology job info from buffer
+ * IN jobinfo_plugin_data - address of pointer to new job info data. Must be
+ *	free'd with topology_g_jobinfo_free()
+ * IN buffer - data will be packed into this pre-existing buffer
+ * IN protocol_version - job's version
+ * RET - SLURM_SUCCESS or error.
+ */
+extern int topology_g_jobinfo_unpack(
+	dynamic_plugin_data_t **jobinfo_plugin_data,
+	buf_t *buffer,
+	uint16_t protocol_version);
+
+/* Get data from topology job info
+ * IN type - specify the type of data to be retrieved
+ * IN jobinfo_plugin_data - get data from this job info
+ * OUT data - pointer to new data
+ * RET - SLURM_SUCCESS means data points to the requested data, otherwise error.
+ */
+extern int topology_g_jobinfo_get(
+	topology_jobinfo_type_t type,
+	dynamic_plugin_data_t *jobinfo_plugin_data,
+	void *data);
+
+/* Return fragmentation score of given bitmap
+ * IN node_mask - aviabled nodes
+ * RET: fragmentation
+ */
+extern uint32_t topology_g_get_fragmentation(bitstr_t *node_mask);
+
+/*
+ * topology_g_get_topology_str - return the node's topology_str according to
+ * the current topology configuration
+ *
+ * IN node_ptr
+ * RET topology_str
+ */
+extern char *topology_g_get_topology_str(node_record_t *node_ptr);
+
+/* Note this does not free tctx->tctx */
+extern void free_topology_ctx(topology_ctx_t *tctx_ptr);
+
+extern void free_topology_block_config(topology_block_config_t *config);
+
+extern void free_topology_tree_config(topology_tree_config_t *config);
+
+extern void free_block_conf(slurm_conf_block_t *config);
+
+extern void free_switch_conf(slurm_conf_switches_t *config);
 #endif

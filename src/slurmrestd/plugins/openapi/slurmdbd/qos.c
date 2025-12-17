@@ -62,7 +62,7 @@ static int _foreach_update_qos(void *x, void *arg)
 
 	/* Search for a QOS with the same id and/or name, if set */
 	if (qos->id || qos->name) {
-		List qos_list = NULL;
+		list_t *qos_list = NULL;
 
 		if (qos->id) {
 			/* Need to free string copy of id with xfree_ptr */
@@ -95,7 +95,7 @@ static int _foreach_update_qos(void *x, void *arg)
 		rc = resp_error(ctxt, ESLURM_REST_INVALID_QUERY, __func__,
 				"Cannot create a QOS without a name");
 	} else if (!found_qos) {
-		List qos_add_list = list_create(NULL);
+		list_t *qos_add_list = list_create(NULL);
 
 		/* The QOS was not found, so create a new QOS */
 		debug("%s: adding qos request: name=%s description=%s",
@@ -122,7 +122,7 @@ static int _foreach_update_qos(void *x, void *arg)
 			/*
 			 * If the new QOS list is empty but the QOS had a
 			 * preempt list before, then we need to set this special
-			 * entry to notify slurmdbd that this is explicilty
+			 * entry to notify slurmdbd that this is explicitly
 			 * empty and not a no change request.
 			 *
 			 * If we always set this value, then slurmdbd will
@@ -176,6 +176,7 @@ static int _op_handler_qos(ctxt_t *ctxt, slurmdb_qos_cond_t *qos_cond)
 					 qos_list, ctxt);
 	} else if (ctxt->method == HTTP_REQUEST_POST) {
 		openapi_resp_single_t post = { 0 };
+		openapi_resp_single_t *post_ptr = &post;
 
 		if (!DATA_PARSE(ctxt->parser, OPENAPI_SLURMDBD_QOS_RESP, post,
 				ctxt->query, ctxt->parent_path) &&
@@ -183,6 +184,7 @@ static int _op_handler_qos(ctxt_t *ctxt, slurmdb_qos_cond_t *qos_cond)
 			qos_list = post.response;
 			update_qos(ctxt, true, qos_list);
 		}
+		FREE_OPENAPI_RESP_COMMON_CONTENTS(post_ptr);
 	} else {
 		resp_error(ctxt, ESLURM_REST_INVALID_QUERY, __func__,
 			   "Unsupported HTTP method requested: %s",
@@ -211,7 +213,8 @@ extern int op_handler_single_qos(ctxt_t *ctxt)
 	qos_cond = xmalloc(sizeof(*qos_cond));
 	qos_cond->name_list = list_create(xfree_ptr);
 	list_append(qos_cond->name_list, params.name);
-	qos_cond->with_deleted = query.with_deleted;
+	if (query.with_deleted)
+		qos_cond->flags |= QOS_COND_FLAG_WITH_DELETED;
 
 	rc = _op_handler_qos(ctxt, qos_cond);
 

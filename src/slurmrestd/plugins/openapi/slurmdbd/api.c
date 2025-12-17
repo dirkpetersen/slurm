@@ -49,35 +49,13 @@
 #include "src/slurmrestd/operations.h"
 #include "api.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "select" for Slurm node selection) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load select plugins if the plugin_type string has a
- * prefix of "select/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Slurm OpenAPI slurmdbd";
 const char plugin_type[] = "openapi/slurmdbd";
-const uint32_t plugin_id = 111;
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
+/* Required for openapi plugins: */
+const uint32_t plugin_id = 111;
 
 const openapi_resp_meta_t plugin_meta = {
 	.plugin = {
@@ -122,6 +100,20 @@ const openapi_path_binding_t openapi_paths[] = {
 					.description = "Job description",
 				},
 				.parameters = DATA_PARSER_OPENAPI_SLURMDBD_JOB_PARAM,
+			},
+			{
+				.method = HTTP_REQUEST_POST,
+				.tags = tags,
+				.summary = "Update job",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_JOB_MODIFY_RESP,
+					.description = "Job update results",
+				},
+				.parameters = DATA_PARSER_OPENAPI_SLURMDBD_JOB_PARAM,
+				.body = {
+					.type = DATA_PARSER_JOB_MODIFY,
+					.description = "Job update description",
+				},
 			},
 			{0}
 		},
@@ -652,6 +644,19 @@ const openapi_path_binding_t openapi_paths[] = {
 				},
 				.query = DATA_PARSER_JOB_CONDITION,
 			},
+			{
+				.method = HTTP_REQUEST_POST,
+				.tags = tags,
+				.summary = "Update jobs",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_JOB_MODIFY_RESP,
+					.description = "Job update results",
+				},
+				.body = {
+					.type = DATA_PARSER_OPENAPI_JOB_MODIFY_REQ,
+					.description = "Job update description",
+				},
+			},
 			{0}
 		},
 		.flags = OP_FLAGS,
@@ -673,15 +678,32 @@ const openapi_path_binding_t openapi_paths[] = {
 		},
 		.flags = OP_FLAGS,
 	},
+	{
+		.path = "/slurmdb/{data_parser}/ping/",
+		.callback = op_handler_ping,
+		.methods = (openapi_path_binding_method_t[]) {
+			{
+				.method = HTTP_REQUEST_GET,
+				.tags = tags,
+				.summary = "ping test",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_SLURMDBD_PING_RESP,
+					.description = "results of ping test",
+				},
+			},
+			{0}
+		},
+		.flags = OP_FLAGS,
+	},
 	{0}
 };
 
-extern int db_query_list_funcname(ctxt_t *ctxt, List *list,
+extern int db_query_list_funcname(ctxt_t *ctxt, list_t **list,
 				  db_list_query_func_t func, void *cond,
 				  const char *func_name, const char *caller,
 				  bool ignore_empty_result)
 {
-	List l;
+	list_t *l;
 	int rc = SLURM_SUCCESS;
 
 	xassert(!*list);
@@ -701,25 +723,22 @@ extern int db_query_list_funcname(ctxt_t *ctxt, List *list,
 
 	if (rc == SLURM_NO_CHANGE_IN_DATA) {
 		if (ignore_empty_result) {
-			resp_warn(ctxt, caller,
-				  "%s(0x%" PRIxPTR ") reports nothing changed",
-				  func_name, (uintptr_t) ctxt->db_conn);
+			resp_warn(ctxt, caller, "%s() reports nothing changed",
+				  func_name);
 			rc = SLURM_SUCCESS;
 		}
 	}
 
 	if (rc) {
-		return resp_error(ctxt, rc, caller, "%s(0x%" PRIxPTR ") failed",
-				  func_name, (uintptr_t) ctxt->db_conn);
+		return resp_error(ctxt, rc, caller, "%s failed", func_name);
 	}
 
 	if (!list_count(l)) {
 		FREE_NULL_LIST(l);
 
 		if (!ignore_empty_result) {
-			resp_warn(ctxt, caller,
-				  "%s(0x%" PRIxPTR ") found nothing",
-				  func_name, (uintptr_t) ctxt->db_conn);
+			resp_warn(ctxt, caller, "%s() found nothing",
+				  func_name);
 		}
 	} else {
 		*list = l;
@@ -728,15 +747,64 @@ extern int db_query_list_funcname(ctxt_t *ctxt, List *list,
 	return rc;
 }
 
-extern int db_query_rc_funcname(ctxt_t *ctxt, List list,
+extern int db_query_rc_funcname(ctxt_t *ctxt, list_t *list,
 				db_rc_query_func_t func, const char *func_name,
 				const char *caller)
 {
 	int rc;
 
 	if ((rc = func(ctxt->db_conn, list)))
-		return resp_error(ctxt, rc, caller, "%s(0x%" PRIxPTR ") failed",
-				  func_name, (uintptr_t) ctxt->db_conn);
+		return resp_error(ctxt, rc, caller, "%s() failed", func_name);
+
+	return rc;
+}
+
+extern int db_modify_list_funcname(ctxt_t *ctxt, list_t **list, void *cond,
+				   void *obj, db_list_modify_func_t func,
+				   const char *func_name, const char *caller,
+				   bool ignore_empty_result)
+{
+	list_t *l;
+	int rc = SLURM_SUCCESS;
+
+	xassert(!*list);
+
+	if (!ctxt->db_conn)
+		return ESLURM_DB_CONNECTION;
+
+	errno = 0;
+	l = func(ctxt->db_conn, cond, obj);
+
+	if (errno) {
+		rc = errno;
+		FREE_NULL_LIST(l);
+	} else if (!l) {
+		rc = ESLURM_REST_INVALID_QUERY;
+	}
+
+	if (rc == SLURM_NO_CHANGE_IN_DATA) {
+		if (ignore_empty_result) {
+			resp_warn(ctxt, caller, "%s() reports nothing changed",
+				  func_name);
+			rc = SLURM_SUCCESS;
+		}
+	}
+
+	if (rc) {
+		return resp_error(ctxt, rc, caller, "%s failed", func_name);
+	}
+
+	if (!list_count(l)) {
+		FREE_NULL_LIST(l);
+
+		if (!ignore_empty_result) {
+			resp_warn(ctxt, caller, "%s() found nothing",
+				  func_name);
+		}
+	} else {
+		*list = l;
+		db_query_commit(ctxt);
+	}
 
 	return rc;
 }
@@ -745,7 +813,7 @@ extern int db_modify_rc_funcname(ctxt_t *ctxt, void *cond, void *obj,
 				 db_rc_modify_func_t func,
 				 const char *func_name, const char *caller)
 {
-	List changed;
+	list_t *changed;
 	int rc = SLURM_SUCCESS;
 
 	errno = 0;
@@ -755,8 +823,7 @@ extern int db_modify_rc_funcname(ctxt_t *ctxt, void *cond, void *obj,
 		else
 			rc = SLURM_ERROR;
 
-		return resp_error(ctxt, rc, caller, "%s(0x%" PRIxPTR ") failed",
-				  func_name, (uintptr_t) ctxt->db_conn);
+		return resp_error(ctxt, rc, caller, "%s() failed", func_name);
 	}
 
 	FREE_NULL_LIST(changed);
@@ -771,8 +838,7 @@ extern void db_query_commit_funcname(ctxt_t *ctxt, const char *caller)
 
 	if ((rc = slurmdb_connection_commit(ctxt->db_conn, true)))
 		resp_error(ctxt, rc, caller,
-			   "slurmdb_connection_commit(0x%" PRIxPTR ") failed",
-			   (uintptr_t) ctxt->db_conn);
+			   "slurmdb_connection_commit() failed");
 }
 
 /* Case insensitive string match */

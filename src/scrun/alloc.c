@@ -244,8 +244,10 @@ static int _stage_in()
 	return rc;
 }
 
-static void *_on_connection(conmgr_fd_t *con, void *arg)
+static void *_on_connection(conmgr_callback_args_t conmgr_args, void *arg)
 {
+	conmgr_fd_t *con = conmgr_args.con;
+
 	debug("%s:[%s] new srun connection",
 	      __func__, conmgr_fd_get_name(con));
 
@@ -253,26 +255,27 @@ static void *_on_connection(conmgr_fd_t *con, void *arg)
 	return con;
 }
 
-static int _on_msg(conmgr_fd_t *con, slurm_msg_t *msg, void *arg)
+static int _on_msg(conmgr_callback_args_t conmgr_args, slurm_msg_t *msg,
+		   int unpack_rc, void *arg)
 {
+	conmgr_fd_t *con = conmgr_args.con;
 	int rc = SLURM_SUCCESS;
 	xassert(arg == con);
+
+	if (unpack_rc || !msg->auth_ids_set) {
+		error("%s: [%s] rejecting malformed RPC and closing connection: %s",
+		      __func__, conmgr_fd_get_name(con),
+		      slurm_strerror(unpack_rc));
+		slurm_free_msg(msg);
+		return unpack_rc;
+	}
 
 	switch (msg->msg_type)
 	{
 	case SRUN_PING:
 	{
 		/* if conmgr is alive then always respond success */
-		slurm_msg_t resp_msg;
-		return_code_msg_t rc_msg = {
-			.return_code = SLURM_SUCCESS,
-		};
-
-		response_init(&resp_msg, msg, RESPONSE_SLURM_RC, &rc_msg);
-
-		rc = conmgr_queue_write_msg(con, &resp_msg);
-		/* nothing to xfree() */
-
+		rc = slurm_send_rc_msg(msg, SLURM_SUCCESS);
 		debug("%s:[%s] srun RPC PING has been PONGED",
 		      __func__, conmgr_fd_get_name(con));
 		break;
@@ -300,8 +303,8 @@ static int _on_msg(conmgr_fd_t *con, slurm_msg_t *msg, void *arg)
 	{
 		srun_user_msg_t *um = msg->data;
 
-		debug("%s:[%s] JobId=%u srun user message RPC",
-		      __func__, conmgr_fd_get_name(con), um->job_id);
+		debug("%s:[%s] %pI srun user message RPC",
+		      __func__, conmgr_fd_get_name(con), &um->step_id);
 
 		print_multi_line_string(um->msg, -1, LOG_LEVEL_INFO);
 		break;
@@ -338,12 +341,15 @@ static int _on_msg(conmgr_fd_t *con, slurm_msg_t *msg, void *arg)
 		      rpc_num2string(msg->msg_type));
 	}
 
+	slurm_free_msg(msg);
 	return rc;
 }
 
-static void _on_finish(void *arg)
+static void _on_finish(conmgr_callback_args_t conmgr_args, void *arg)
 {
-	conmgr_fd_t *con = arg;
+	conmgr_fd_t *con = conmgr_args.con;
+
+	xassert(con == arg);
 
 	if (get_log_level() > LOG_LEVEL_DEBUG) {
 		read_lock_state();
@@ -385,32 +391,31 @@ static uint32_t _setup_listener(void)
 	xassert(port > 0);
 	debug("%s: listening for srun RPCs on port=%hu", __func__, port);
 
-	if ((rc = conmgr_process_fd(CON_TYPE_RPC, fd, fd, events, NULL, 0,
-				    NULL)))
+	if ((rc = conmgr_process_fd(CON_TYPE_RPC, fd, fd, &events, CON_FLAG_NONE,
+				    NULL, 0, NULL, NULL)))
 		fatal("%s: conmgr refused fd=%d: %s",
 		      __func__, fd, slurm_strerror(rc));
 
 	return port;
 }
 
-static void _pending_callback(uint32_t job_id)
+static void _pending_callback(slurm_step_id_t *step_id)
 {
-	info("waiting on pending job allocation %u", job_id);
+	info("waiting on pending job allocation %pI", step_id);
 }
 
 /* check allocation has all nodes ready */
-extern void check_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
-			     conmgr_work_status_t status, const char *tag,
-			     void *arg)
+extern void check_allocation(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	/* there must be only 1 thread that will call this at any one time */
 	static long delay = 1;
 	bool bail = false;
-	int rc, job_id;
+	slurm_step_id_t step_id;
+	int rc;
 
 	read_lock_state();
 	bail = (state.status != CONTAINER_ST_CREATING);
-	job_id = state.jobid;
+	step_id = state.step_id;
 	unlock_state();
 
 	if (bail) {
@@ -426,20 +431,20 @@ extern void check_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
 		return;
 	}
 
-	if (status != CONMGR_WORK_STATUS_RUN) {
+	if (conmgr_args.status != CONMGR_WORK_STATUS_RUN) {
 		debug("%s: bailing due to callback status %s",
-		      __func__, conmgr_work_status_string(status));
+		      __func__, conmgr_work_status_string(conmgr_args.status));
 		stop_anchor(ESLURM_ALREADY_DONE);
 		return;
 	}
 
 	if (get_log_level() >= LOG_LEVEL_DEBUG) {
 		read_lock_state();
-		debug("%s: checking JobId=%d for nodes ready",
-		      __func__, state.jobid);
+		debug("%s: checking %pI for nodes ready",
+		      __func__, &state.step_id);
 		unlock_state();
 	}
-	rc = slurm_job_node_ready(job_id);
+	rc = slurm_job_node_ready(step_id.job_id);
 	if ((rc == READY_JOB_ERROR) || (rc == EAGAIN)) {
 		delay *= 2;
 		if ((delay < 0) || (delay > MAX_DELAY))
@@ -447,18 +452,17 @@ extern void check_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
 
 		if (get_log_level() >= LOG_LEVEL_DEBUG) {
 			read_lock_state();
-			debug("%s: rechecking JobId=%d for nodes ready in %ld ns",
-			      __func__, state.jobid, delay);
+			debug("%s: rechecking %pI for nodes ready in %ld ns",
+			      __func__, &state.step_id, delay);
 			unlock_state();
 		}
-		conmgr_add_delayed_work(NULL, check_allocation, delay, 0, NULL,
-					"check_allocation");
+		conmgr_add_work_delayed_fifo(check_allocation, NULL, delay, 0);
 	} else if ((rc == READY_JOB_FATAL) || !(rc & READY_JOB_STATE)) {
 		/* job failed! */
 		if (get_log_level() >= LOG_LEVEL_DEBUG) {
 			read_lock_state();
-			debug("%s: JobId=%d failed. Bailing on checking for nodes: %s",
-			      __func__, state.jobid, slurm_strerror(rc));
+			debug("%s: %pI failed. Bailing on checking for nodes: %s",
+			      __func__, &state.step_id, slurm_strerror(rc));
 			unlock_state();
 		}
 		stop_anchor(ESLURM_ALREADY_DONE);
@@ -467,7 +471,7 @@ extern void check_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
 		/* job is ready! */
 		if (get_log_level() >= LOG_LEVEL_DEBUG) {
 			read_lock_state();
-			debug("%s: JobId=%d is ready", __func__, state.jobid);
+			debug("%s: %pI is ready", __func__, &state.step_id);
 			unlock_state();
 		}
 
@@ -475,8 +479,7 @@ extern void check_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
 			stop_anchor(rc);
 		} else {
 			/* we have a job now. see if creating is done */
-			conmgr_add_work(NULL, on_allocation,
-					 CONMGR_WORK_TYPE_FIFO, NULL, __func__);
+			conmgr_add_work_fifo(on_allocation, NULL);
 		}
 	}
 }
@@ -555,15 +558,15 @@ static void _alloc_job(void)
 		char *user = uid_to_string(alloc->uid);
 		char *group = gid_to_string(alloc->gid);
 
-		debug("allocated jobId=%u user[%u]=%s group[%u]=%s",
-		      alloc->job_id, alloc->uid, user, alloc->uid, group);
+		debug("allocated %pI user[%u]=%s group[%u]=%s",
+		      &alloc->step_id, alloc->uid, user, alloc->uid, group);
 
 		xfree(user);
 		xfree(group);
 	}
 
 	write_lock_state();
-	state.jobid = alloc->job_id;
+	state.step_id = alloc->step_id;
 
 	/* take job env (if any) for srun calls later */
 	SWAP(state.job_env, alloc->environment);
@@ -597,13 +600,11 @@ static void _alloc_job(void)
 	slurm_free_resource_allocation_response_msg(alloc);
 }
 
-extern void get_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
-			   conmgr_work_status_t status, const char *tag,
-			   void *arg)
+extern void get_allocation(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	int rc;
 	job_info_msg_t *jobs = NULL;
-	int job_id;
+	slurm_step_id_t step_id;
 	char *job_id_str = getenv("SLURM_JOB_ID");
 	bool existing_allocation = false;
 
@@ -618,7 +619,7 @@ extern void get_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
 		}
 
 		write_lock_state();
-		state.jobid = job_id = id.step_id.job_id;
+		state.step_id = step_id = id.step_id;
 		state.existing_allocation = existing_allocation = true;
 
 		/* scrape SLURM_* from calling env */
@@ -627,31 +628,31 @@ extern void get_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
 					    (const char **) environ);
 		unlock_state();
 
-		debug("Running under existing JobId=%u", job_id);
+		debug("Running under existing %pI", &step_id);
 	} else {
 		_alloc_job();
 
 		read_lock_state();
-		job_id = state.jobid;
+		step_id = state.step_id;
 		unlock_state();
 	}
 
 	/* alloc response is too sparse. get full job info */
-	rc = slurm_load_job(&jobs, job_id, 0);
+	rc = slurm_load_job(&jobs, step_id.job_id, 0);
 	if (rc || !jobs || (jobs->record_count <= 0)) {
 		/* job not found or already died ? */
 		if ((rc == SLURM_ERROR) && errno)
 			rc = errno;
 
-		error("%s: unable to find JobId=%u: %s",
-		      __func__, job_id, slurm_strerror(rc));
+		error("%s: unable to find %pI: %s",
+		      __func__, &step_id, slurm_strerror(rc));
 
 		stop_anchor(rc);
 		return;
 	}
 
 	/* grab the first job */
-	xassert(jobs->job_array->job_id == job_id);
+	xassert(jobs->job_array->step_id.job_id == step_id.job_id);
 
 	write_lock_state();
 	if (existing_allocation) {
@@ -672,8 +673,7 @@ extern void get_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
 			for (int i = 0; state.job_env[i]; i++)
 				debug("Job env[%d]=%s", i, state.job_env[i]);
 		else
-			debug("JobId=%u did not provide an environment",
-			      job_id);
+			debug("%pI did not provide an environment", &step_id);
 		unlock_state();
 	}
 
@@ -683,10 +683,8 @@ extern void get_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
 		if ((rc = _stage_in()))
 			stop_anchor(rc);
 		else
-			conmgr_add_work(NULL, on_allocation,
-					 CONMGR_WORK_TYPE_FIFO, NULL, __func__);
+			conmgr_add_work_fifo(on_allocation, NULL);
 	} else {
-		conmgr_add_delayed_work(NULL, check_allocation, 0, 1, NULL,
-					 "check_allocation");
+		conmgr_add_work_delayed_fifo(check_allocation, NULL, 0, 1);
 	}
 }

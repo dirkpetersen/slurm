@@ -46,9 +46,10 @@
 
 #include "src/common/data.h"
 #include "src/common/pack.h"
-#include "src/common/slurm_protocol_api.h"
 #include "src/common/read_config.h"
 #include "src/common/run_in_daemon.h"
+#include "src/common/slurm_protocol_api.h"
+#include "src/common/slurm_protocol_defs.h"
 #include "src/common/uid.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
@@ -56,35 +57,13 @@
 
 #include "auth_jwt.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "JWT authentication plugin";
 const char plugin_type[] = "auth/jwt";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
+/* Required for auth plugins: */
 const uint32_t plugin_id = AUTH_PLUGIN_JWT;
-const uint32_t plugin_version   = SLURM_VERSION_NUMBER;
 const bool hash_enable = false;
 
 typedef struct {
@@ -109,6 +88,10 @@ static char *claim_field = NULL;
 static __thread char *thread_token = NULL;
 static __thread char *thread_username = NULL;
 
+extern auth_token_t *auth_p_cred_generate(const char *token,
+					  const char *username, uid_t uid,
+					  gid_t gid);
+
 /*
  * This plugin behaves differently than the others in that it needs to operate
  * asynchronously. If we're running in one of the daemons, it's presumed that
@@ -121,7 +104,7 @@ static __thread char *thread_username = NULL;
  *		the current thread.
  *	auth_p_thread_clear() - free any thread_config memory
  *	auth_p_token_generate() - creates a JWT to be passed back to the
- *		requestor for a given username and duration.
+ *		requester for a given username and duration.
  */
 
 static void _check_key_permissions(const char *path, int bad_perms)
@@ -151,7 +134,7 @@ static data_for_each_cmd_t _build_jwks_keys(data_t *d, void *arg)
 	if (!(kid = data_get_string(data_key_get(d, "kid"))))
 		fatal("%s: failed to load kid field", __func__);
 
-	/* Ignore non-RS256 keys in the JWKS if algorthim is provided */
+	/* Ignore non-RS256 keys in the JWKS if algorithm is provided */
 	if ((alg = data_get_string(data_key_get(d, "alg"))) &&
 	    xstrcasecmp(alg, "RS256"))
 		return DATA_FOR_EACH_CONT;
@@ -180,8 +163,7 @@ static void _init_jwks(void)
 
 	_check_key_permissions(key_file, S_IWOTH);
 
-	if (serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))
-		fatal("%s: serializer_g_init() failed", __func__);
+	serializer_required(MIME_TYPE_JSON);
 
 	debug("loading jwks file `%s`", key_file);
 	if (!(buf = create_mmap_buf(key_file))) {
@@ -273,13 +255,11 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	xfree(claim_field);
 	FREE_NULL_DATA(jwks);
 	FREE_NULL_BUFFER(key);
-
-	return SLURM_SUCCESS;
 }
 
 extern auth_token_t *auth_p_create(char *auth_info, uid_t r_uid, void *data,
@@ -345,7 +325,7 @@ static data_for_each_cmd_t _verify_rs256_jwt(data_t *d, void *arg)
  */
 extern int auth_p_verify(auth_token_t *cred, char *auth_info)
 {
-	int rc;
+	int rc, auth_rc = ESLURM_AUTH_CRED_INVALID;
 	const char *alg;
 	jwt_t *unverified_jwt = NULL, *jwt = NULL;
 	char *username = NULL;
@@ -431,6 +411,7 @@ extern int auth_p_verify(auth_token_t *cred, char *auth_info)
 
 	if (jwt_get_grant_int(jwt, "exp") < time(NULL)) {
 		error("%s: token expired", __func__);
+		auth_rc = ESLURM_AUTH_EXPIRED;
 		goto fail;
 	}
 
@@ -456,7 +437,7 @@ extern int auth_p_verify(auth_token_t *cred, char *auth_info)
 		/* if they match, ignore it, they were being redundant */
 		xfree(username);
 	} else {
-		uid_t uid;
+		uid_t uid = NO_VAL;
 		if (uid_from_string(username, &uid)) {
 			error("%s: uid_from_string failure", __func__);
 			goto fail;
@@ -479,11 +460,13 @@ fail:
 	if (jwt)
 		jwt_free(jwt);
 	xfree(username);
-	return SLURM_ERROR;
+	return auth_rc;
 }
 
 extern void auth_p_get_ids(auth_token_t *cred, uid_t *uid, gid_t *gid)
 {
+	uid_t pw_uid = NO_VAL;
+
 	*uid = SLURM_AUTH_NOBODY;
 	*gid = SLURM_AUTH_NOBODY;
 
@@ -500,8 +483,9 @@ extern void auth_p_get_ids(auth_token_t *cred, uid_t *uid, gid_t *gid)
 		return;
 	}
 
-	if (uid_from_string(cred->username, &cred->uid))
+	if (uid_from_string(cred->username, &pw_uid))
 		return;
+	cred->uid = pw_uid;
 
 	if (((cred->gid = gid_from_uid(cred->uid)) == (gid_t) -1))
 		return;
@@ -515,7 +499,7 @@ extern void auth_p_get_ids(auth_token_t *cred, uid_t *uid, gid_t *gid)
 extern char *auth_p_get_host(auth_token_t *cred)
 {
 	if (!cred) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return NULL;
 	}
 
@@ -526,7 +510,7 @@ extern char *auth_p_get_host(auth_token_t *cred)
 extern int auth_p_get_data(auth_token_t *cred, char **data, uint32_t *len)
 {
 	if (!cred) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return SLURM_ERROR;
 	}
 
@@ -538,7 +522,7 @@ extern int auth_p_get_data(auth_token_t *cred, char **data, uint32_t *len)
 extern void *auth_p_get_identity(auth_token_t *cred)
 {
 	if (!cred) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return NULL;
 	}
 
@@ -551,7 +535,7 @@ extern int auth_p_pack(auth_token_t *cred, buf_t *buf,
 	char *pack_this = (thread_token) ? thread_token : token;
 
 	if (!buf) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return SLURM_ERROR;
 	}
 
@@ -569,31 +553,29 @@ extern int auth_p_pack(auth_token_t *cred, buf_t *buf,
 
 extern auth_token_t *auth_p_unpack(buf_t *buf, uint16_t protocol_version)
 {
-	auth_token_t *cred = NULL;
-	uint32_t uint32_tmp;
+	char *token = NULL, *username = NULL;
 
 	if (!buf) {
-		slurm_seterrno(ESLURM_AUTH_BADARG);
+		errno = ESLURM_AUTH_BADARG;
 		return NULL;
 	}
 
-	cred = xmalloc(sizeof(*cred));
-	cred->verified = false;		/* just to be explicit */
-
 	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		safe_unpackstr_xmalloc(&cred->token, &uint32_tmp, buf);
-		safe_unpackstr_xmalloc(&cred->username, &uint32_tmp, buf);
+		safe_unpackstr(&token, buf);
+		safe_unpackstr(&username, buf);
 	} else {
 		error("%s: unknown protocol version %u",
 		      __func__, protocol_version);
 		goto unpack_error;
 	}
 
-	return cred;
+	return auth_p_cred_generate(token, username, SLURM_AUTH_NOBODY,
+				    SLURM_AUTH_NOBODY);
 
 unpack_error:
-	slurm_seterrno(ESLURM_AUTH_UNPACK);
-	auth_p_destroy(cred);
+	errno = ESLURM_AUTH_UNPACK;
+	xfree(token);
+	xfree(username);
 	return NULL;
 }
 
@@ -677,4 +659,33 @@ extern char *auth_p_token_generate(const char *username, int lifespan)
 fail:
 	jwt_free(jwt);
 	return NULL;
+}
+
+extern int auth_p_get_reconfig_fd(void)
+{
+	return -1;
+}
+
+extern auth_token_t *auth_p_cred_generate(const char *token,
+					  const char *username, uid_t uid,
+					  gid_t gid)
+{
+	auth_token_t *cred = NULL;
+
+	if (!token || !token[0]) {
+		error("%s: required token not provided", __func__);
+		errno = ESLURM_AUTH_CRED_INVALID;
+		return NULL;
+	}
+
+	/* Allocate a new credential. */
+	cred = xmalloc(sizeof(*cred));
+	*cred = (auth_token_t) {
+		.token = xstrdup(token),
+		.username = xstrdup(username),
+		.uid = uid,
+		.gid = gid,
+	};
+
+	return cred;
 }

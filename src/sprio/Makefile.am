@@ -2,7 +2,6 @@
 # Makefile for sprio
 
 AUTOMAKE_OPTIONS = foreign
-CLEANFILES = core.*
 
 AM_CPPFLAGS = -I$(top_srcdir)
 
@@ -25,4 +24,3 @@ $(sprio_DEPENDENCIES) : force
 	@cd `dirname $@` && $(MAKE) `basename $@`
 
 sprio_LDFLAGS = $(CMD_LDFLAGS)
-

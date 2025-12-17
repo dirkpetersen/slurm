@@ -40,7 +40,7 @@
 #define CGROUP_READ_COUNT 4092
 
 /* How much to wait for a pid to be removed from one cgroup. */
-#define MAX_MOVE_WAIT 1000 /* Miliseconds */
+#define MAX_MOVE_WAIT 1000 /* Milliseconds */
 
 /* These are defined here so when we link with something other than
  * the slurmctld we will have these symbols defined.  They will get
@@ -195,7 +195,7 @@ extern int common_file_read_uints(char *file_path, void **values, int *nb,
 	if ((fsize = _read_cg_file(file_path, &buf)) < 0)
 		return SLURM_ERROR;
 
-	/* count values (splitted by \n) */
+	/* count values (split by \n) */
 	i = 0;
 	p = buf;
 	while (xstrchr(p, '\n') != NULL) {
@@ -465,6 +465,8 @@ extern void common_cgroup_ns_destroy(xcgroup_ns_t *cgns)
 	xfree(cgns->mnt_point);
 	xfree(cgns->mnt_args);
 	xfree(cgns->subsystems);
+	xfree(cgns->init_cg_path);
+	FREE_NULL_BITMAP(cgns->avail_controllers);
 }
 
 extern void common_cgroup_destroy(xcgroup_t *cg)

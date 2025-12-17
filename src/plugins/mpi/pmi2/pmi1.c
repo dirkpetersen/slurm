@@ -190,9 +190,7 @@ _handle_barrier_in(int fd, int lrank, client_req_t *req)
 				rc,
 				"mpi/pmi2: failed to send temp kvs");
 			/* cancel the step to avoid tasks hang */
-			slurm_kill_job_step(job_info.step_id.job_id,
-					    job_info.step_id.step_id,
-					    SIGKILL, 0);
+			slurm_kill_job_step(&job_info.step_id, SIGKILL, 0);
 		} else {
 			waiting_kvs_resp = 1;
 		}
@@ -227,8 +225,7 @@ _handle_abort(int fd, int lrank, client_req_t *req)
 {
 	debug3("mpi/pmi2: in _handle_abort");
 	/* no response needed. just cancel the job */
-	slurm_kill_job_step(job_info.step_id.job_id, job_info.step_id.step_id,
-			    SIGKILL, 0);
+	slurm_kill_job_step(&job_info.step_id, SIGKILL, 0);
 	debug3("mpi/pmi2: out _handle_abort");
 	return SLURM_SUCCESS;
 }
@@ -454,14 +451,14 @@ _handle_mcmd(int fd, int lrank, client_req_t *req)
 		pmi1_spawn = spawn_req_new();
 		client_req_get_int(req, TOTSPAWNS_KEY,
 				   (int *)&pmi1_spawn->subcmd_cnt);
-		pmi1_spawn->subcmds = xmalloc(pmi1_spawn->subcmd_cnt *
+		pmi1_spawn->subcmds = xcalloc(pmi1_spawn->subcmd_cnt,
 					      sizeof(spawn_subcmd_t *));
 		client_req_get_int(req, PREPUTNUM_KEY,
 				   (int *)&pmi1_spawn->preput_cnt);
-		pmi1_spawn->pp_keys =
-			xmalloc(pmi1_spawn->preput_cnt * sizeof(char *));
-		pmi1_spawn->pp_vals =
-			xmalloc(pmi1_spawn->preput_cnt * sizeof(char *));
+		pmi1_spawn->pp_keys = xcalloc(pmi1_spawn->preput_cnt,
+					      sizeof(char *));
+		pmi1_spawn->pp_vals = xcalloc(pmi1_spawn->preput_cnt,
+					      sizeof(char *));
 		for (i = 0; i < pmi1_spawn->preput_cnt; i ++) {
 			snprintf(buf, 64, PREPUTKEY_KEY"%d", i);
 			client_req_get_str(req, buf, &pmi1_spawn->pp_keys[i]);

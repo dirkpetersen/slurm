@@ -7,12 +7,14 @@ man5_MANS = \
 	gres.conf.5 \
 	helpers.conf.5 \
 	job_container.conf.5 \
-	knl.conf.5 \
 	mpi.conf.5 \
+	namespace.yaml.5 \
 	oci.conf.5 \
+	resources.yaml.5 \
 	slurm.conf.5 \
 	slurmdbd.conf.5 \
-	topology.conf.5
+	topology.conf.5 \
+	topology.yaml.5
 
 if HAVE_MAN2HTML
 
@@ -23,12 +25,14 @@ html_DATA = \
 	gres.conf.html \
 	helpers.conf.html \
 	job_container.conf.html \
-	knl.conf.html \
 	mpi.conf.html \
+	namespace.yaml.html \
 	oci.conf.html \
+	resources.yaml.html \
 	slurm.conf.html \
 	slurmdbd.conf.html \
-	topology.conf.html
+	topology.conf.html \
+	topology.yaml.html
 
 MOSTLYCLEANFILES = ${html_DATA}
 

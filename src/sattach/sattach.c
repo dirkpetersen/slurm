@@ -42,8 +42,6 @@
 
 #include "slurm/slurm.h"
 
-#include "src/api/step_io.h"
-
 #include "src/common/bitstring.h"
 #include "src/common/eio.h"
 #include "src/common/fd.h"
@@ -52,13 +50,19 @@
 #include "src/common/macros.h"
 #include "src/common/net.h"
 #include "src/common/read_config.h"
-#include "src/interfaces/auth.h"
-#include "src/interfaces/cred.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
+#include "src/common/threadpool.h"
+#include "src/common/xmalloc.h"
 #include "src/common/xsignal.h"
 #include "src/common/xstring.h"
-#include "src/common/xmalloc.h"
+
+#include "src/interfaces/auth.h"
+#include "src/interfaces/certgen.h"
+#include "src/interfaces/certmgr.h"
+#include "src/interfaces/conn.h"
+
+#include "src/api/step_io.h"
 
 #include "src/sattach/attach.h"
 #include "src/sattach/opt.h"
@@ -68,15 +72,13 @@ static void _mpir_cleanup(void);
 static void _mpir_dump_proctable(void);
 static void _pty_restore(void);
 static void print_layout_info(slurm_step_layout_t *layout);
-static slurm_cred_t *_generate_fake_cred(slurm_step_id_t stepid,
-					uid_t uid, char *nodelist,
-					uint32_t node_cnt);
+static char *_generate_io_key(void);
 static uint32_t _nodeid_from_layout(slurm_step_layout_t *layout,
 				    uint32_t taskid);
 static void _set_exit_code(void);
 static int _attach_to_tasks(slurm_step_id_t stepid,
 			    slurm_step_layout_t *layout,
-			    slurm_cred_t *fake_cred,
+			    char *io_key,
 			    uint16_t num_resp_ports,
 			    uint16_t *resp_ports,
 			    int num_io_ports,
@@ -118,11 +120,10 @@ int sattach(int argc, char **argv)
 {
 	log_options_t logopt = LOG_OPTS_STDERR_ONLY;
 	slurm_step_layout_t *layout;
-	slurm_cred_t *fake_cred;
 	message_thread_state_t *mts;
 	uint32_t jobid, stepid;
 	client_io_t *io;
-	char *hosts;
+	char *io_key = NULL;
 
 	slurm_init(NULL);
 	log_init(xbasename(argv[0]), logopt, 0, NULL);
@@ -137,11 +138,6 @@ int sattach(int argc, char **argv)
 		logopt.stderr_level -= opt.quiet;
 		logopt.prefix_level = 1;
 		log_alter(logopt, 0, NULL);
-	}
-
-	if (cred_g_init() != SLURM_SUCCESS) {
-		error("failed to initialize cred plugin");
-		exit(error_exit);
 	}
 
 	/* FIXME: this does not work with hetsteps */
@@ -169,16 +165,11 @@ int sattach(int argc, char **argv)
 			_nodeid_from_layout(layout, opt.fds.input.taskid);
 	}
 
-	if (layout->front_end)
-		hosts = layout->front_end;
-	else
-		hosts = layout->node_list;
-	fake_cred = _generate_fake_cred(opt.selected_step->step_id,
-					opt.uid, hosts, layout->node_cnt);
+	io_key = _generate_io_key();
 	mts = _msg_thr_create(layout->node_cnt, layout->task_cnt);
 
 	io = client_io_handler_create(opt.fds, layout->task_cnt,
-				      layout->node_cnt, fake_cred,
+				      layout->node_cnt, io_key,
 				      opt.labelio, NO_VAL, NO_VAL);
 	client_io_handler_start(io);
 
@@ -197,7 +188,7 @@ int sattach(int argc, char **argv)
 		xsignal_block(pty_sigarray);
 	}
 
-	_attach_to_tasks(opt.selected_step->step_id, layout, fake_cred,
+	_attach_to_tasks(opt.selected_step->step_id, layout, io_key,
 			 mts->num_resp_port, mts->resp_port,
 			 io->num_listen, io->listenport,
 			 mts->tasks_started);
@@ -213,6 +204,9 @@ int sattach(int argc, char **argv)
 	client_io_handler_finish(io);
 	client_io_handler_destroy(io);
 	_mpir_cleanup();
+	xfree(io_key);
+	log_fini();
+	slurm_fini();
 
 	return global_rc;
 }
@@ -278,44 +272,22 @@ static void print_layout_info(slurm_step_layout_t *layout)
 	hostlist_destroy(nl);
 }
 
-
-/* return a faked job credential */
-static slurm_cred_t *_generate_fake_cred(slurm_step_id_t stepid,
-					uid_t uid, char *nodelist,
-					uint32_t node_cnt)
+/*
+ * The io_key requires a modest amount of entropy to prevent someone guessing
+ * it, then racing to initiate a connection to the sattach command.
+ * By (ab)using the auth token generation mechanisms, the key should be
+ * sufficiently random for our purposes. (An attacker would need to request
+ * an auth key be generated at the same time by the same uid on the same host.)
+ */
+static char *_generate_io_key(void)
 {
-	slurm_cred_t *cred;
-	slurm_cred_arg_t *arg = xmalloc(sizeof(*arg));
+	char *key = auth_g_create(AUTH_DEFAULT_INDEX, slurm_conf.authinfo,
+				  0, NULL, 0);
 
-	arg->step_id.job_id = stepid.job_id;
-	arg->step_id.step_id = stepid.step_id;
-	arg->step_id.step_het_comp = stepid.step_het_comp;
-	arg->uid = uid;
+	if (!key)
+		fatal("failed to generate a suitable io_key");
 
-	arg->job_hostlist = nodelist;
-	arg->job_nhosts = node_cnt;
-
-	arg->step_hostlist = nodelist;
-
-	arg->job_core_bitmap = bit_alloc(node_cnt);
-	bit_set_all(arg->job_core_bitmap);
-	arg->step_core_bitmap = bit_alloc(node_cnt);
-	bit_set_all(arg->step_core_bitmap);
-
-	arg->cores_per_socket = xmalloc(sizeof(uint16_t));
-	arg->cores_per_socket[0] = 1;
-	arg->sockets_per_node = xmalloc(sizeof(uint16_t));
-	arg->sockets_per_node[0] = 1;
-	arg->sock_core_rep_count = xmalloc(sizeof(uint32_t));
-	arg->sock_core_rep_count[0] = node_cnt;
-
-	cred = slurm_cred_faker(arg);
-
-	/* Don't free, this memory will be free'd later */
-	arg->job_hostlist = NULL;
-	arg->step_hostlist = NULL;
-	slurm_cred_free_args(arg);
-	return cred;
+	return key;
 }
 
 void _handle_response_msg(slurm_msg_type_t msg_type, void *msg,
@@ -355,7 +327,8 @@ void _handle_response_msg(slurm_msg_type_t msg_type, void *msg,
 	}
 }
 
-void _handle_response_msg_list(List other_nodes_resp, bitstr_t *tasks_started)
+void _handle_response_msg_list(list_t *other_nodes_resp,
+			       bitstr_t *tasks_started)
 {
 	list_itr_t *itr;
 	ret_data_info_t *ret_data_info = NULL;
@@ -383,7 +356,7 @@ void _handle_response_msg_list(List other_nodes_resp, bitstr_t *tasks_started)
  */
 static int _attach_to_tasks(slurm_step_id_t stepid,
 			    slurm_step_layout_t *layout,
-			    slurm_cred_t *fake_cred,
+			    char *io_key,
 			    uint16_t num_resp_ports,
 			    uint16_t *resp_ports,
 			    int num_io_ports,
@@ -391,10 +364,9 @@ static int _attach_to_tasks(slurm_step_id_t stepid,
 			    bitstr_t *tasks_started)
 {
 	slurm_msg_t msg;
-	List nodes_resp = NULL;
+	list_t *nodes_resp = NULL;
 	int timeout = slurm_conf.msg_timeout * 1000; /* sec to msec */
-	reattach_tasks_request_msg_t reattach_msg;
-	char *hosts;
+	reattach_tasks_request_msg_t reattach_msg = { 0 };
 
 	slurm_msg_t_init(&msg);
 
@@ -402,20 +374,23 @@ static int _attach_to_tasks(slurm_step_id_t stepid,
 	reattach_msg.num_resp_port = num_resp_ports;
 	reattach_msg.resp_port = resp_ports; /* array of response ports */
 	reattach_msg.num_io_port = num_io_ports;
-	reattach_msg.io_key = slurm_cred_get_signature(fake_cred);
+	reattach_msg.io_key = xstrdup(io_key);
 	reattach_msg.io_port = io_ports;
+	if (conn_tls_enabled()) {
+		if (!(reattach_msg.tls_cert = conn_g_get_own_public_cert())) {
+			error("Could not get self signed certificate for step IO");
+			return SLURM_ERROR;
+		}
+	}
 
 	slurm_msg_set_r_uid(&msg, SLURM_AUTH_UID_ANY);
 	msg.msg_type = REQUEST_REATTACH_TASKS;
 	msg.data = &reattach_msg;
-	msg.protocol_version = layout->start_protocol_ver;
+	msg.protocol_version = MIN(SLURM_PROTOCOL_VERSION,
+				   layout->start_protocol_ver);
 
-	if (layout->front_end)
-		hosts = layout->front_end;
-	else
-		hosts = layout->node_list;
 	fwd_set_alias_addrs(layout->alias_addrs);
-	nodes_resp = slurm_send_recv_msgs(hosts, &msg, timeout);
+	nodes_resp = slurm_send_recv_msgs(layout->node_list, &msg, timeout);
 	if (nodes_resp == NULL) {
 		error("slurm_send_recv_msgs failed: %m");
 		return SLURM_ERROR;
@@ -424,6 +399,7 @@ static int _attach_to_tasks(slurm_step_id_t stepid,
 	_handle_response_msg_list(nodes_resp, tasks_started);
 	FREE_NULL_LIST(nodes_resp);
 	xfree(reattach_msg.io_key);
+	xfree(reattach_msg.tls_cert);
 
 	return SLURM_SUCCESS;
 }

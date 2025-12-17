@@ -40,7 +40,7 @@
 
 static int _set_cond(int *start, int argc, char **argv,
 		     slurmdb_reservation_cond_t *reservation_cond,
-		     List format_list)
+		     list_t *format_list)
 {
 	int i;
 	int set = 0;
@@ -54,15 +54,10 @@ static int _set_cond(int *start, int argc, char **argv,
 	}
 
 	for (i=(*start); i<argc; i++) {
-		end = parse_option_end(argv[i]);
-		if (!end)
-			command_len=strlen(argv[i]);
-		else {
-			command_len=end-1;
-			if (argv[i][end] == '=') {
-				end++;
-			}
-		}
+		int op_type;
+		end = parse_option_end(argv[i], &op_type, &command_len);
+		if (!common_verify_option_syntax(argv[i], op_type, false))
+			continue;
 
 		if (!xstrncasecmp(argv[i], "Set", MAX(command_len, 3))) {
 			i--;
@@ -143,11 +138,11 @@ static int _set_cond(int *start, int argc, char **argv,
  */
 int sacctmgr_list_reservation(int argc, char **argv)
 {
-        List reservation_list;
+        list_t *reservation_list;
 	list_itr_t *itr;
 	list_itr_t *itr2;
-	List format_list;
-	List print_fields_list;
+	list_t *format_list;
+	list_t *print_fields_list;
         slurmdb_reservation_cond_t *reservation_cond =
 		xmalloc(sizeof(slurmdb_reservation_cond_t));
         slurmdb_reservation_rec_t *reservation;

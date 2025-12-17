@@ -633,10 +633,10 @@ static int _add_clus_res(mysql_conn_t *mysql_conn, slurmdb_res_rec_t *res,
 	return rc;
 }
 
-static List _get_clus_res(mysql_conn_t *mysql_conn, uint32_t res_id,
-			  char *extra)
+static list_t *_get_clus_res(mysql_conn_t *mysql_conn, uint32_t res_id,
+			     char *extra)
 {
-	List ret_list;
+	list_t *ret_list;
 	char *query = NULL, *tmp = NULL;
 	MYSQL_RES *result = NULL;
 	MYSQL_ROW row;
@@ -694,7 +694,7 @@ static List _get_clus_res(mysql_conn_t *mysql_conn, uint32_t res_id,
 }
 
 extern int as_mysql_add_res(mysql_conn_t *mysql_conn, uint32_t uid,
-			    List res_list)
+			    list_t *res_list)
 {
 	list_itr_t *itr = NULL;
 	int rc = SLURM_SUCCESS;
@@ -757,14 +757,14 @@ extern int as_mysql_add_res(mysql_conn_t *mysql_conn, uint32_t uid,
 	return rc;
 }
 
-extern List as_mysql_get_res(mysql_conn_t *mysql_conn, uid_t uid,
-			     slurmdb_res_cond_t *res_cond)
+extern list_t *as_mysql_get_res(mysql_conn_t *mysql_conn, uid_t uid,
+				slurmdb_res_cond_t *res_cond)
 {
 	char *query = NULL;
 	char *extra = NULL;
 	char *clus_extra = NULL;
 	char *tmp = NULL;
-	List res_list = NULL;
+	list_t *res_list = NULL;
 	int i=0;
 	MYSQL_RES *result = NULL;
 	MYSQL_ROW row;
@@ -833,7 +833,7 @@ extern List as_mysql_get_res(mysql_conn_t *mysql_conn, uid_t uid,
 	res_list = list_create(slurmdb_destroy_res_rec);
 	while ((row = mysql_fetch_row(result))) {
 		uint32_t id = 0;
-		List clus_res_list = NULL;
+		list_t *clus_res_list = NULL;
 		slurmdb_res_rec_t *res;
 
 		if (row[RES_REQ_ID] && row[RES_REQ_ID][0])
@@ -893,20 +893,23 @@ extern List as_mysql_get_res(mysql_conn_t *mysql_conn, uid_t uid,
 	return res_list;
 }
 
-extern List as_mysql_remove_res(mysql_conn_t *mysql_conn, uint32_t uid,
-				slurmdb_res_cond_t *res_cond)
+extern list_t *as_mysql_remove_res(mysql_conn_t *mysql_conn, uint32_t uid,
+				   slurmdb_res_cond_t *res_cond)
 {
-	List ret_list = NULL;
+	list_t *ret_list = NULL;
 	char *name_char = NULL, *clus_char = NULL;
-	char *user_name = NULL;
 	char *query = NULL, *extra = NULL, *clus_extra = NULL;
-	time_t now = time(NULL);
 	MYSQL_RES *result = NULL;
 	MYSQL_ROW row;
 	int query_clusters;
 	bool res_added = 0;
 	bool have_clusters = 0;
 	int last_res = -1;
+	remove_common_args_t args = {
+		.mysql_conn = mysql_conn,
+		.table = clus_res_table,
+		.type = DBD_REMOVE_CLUS_RES,
+	};
 
 	if (!res_cond) {
 		error("we need something to remove");
@@ -1023,32 +1026,32 @@ extern List as_mysql_remove_res(mysql_conn_t *mysql_conn, uint32_t uid,
 
 	xfree(query);
 
-	user_name = uid_to_string((uid_t) uid);
+	args.name_char = clus_char;
+	args.user_name = uid_to_string((uid_t) uid);
+	args.now = time(NULL);
+
 	if (query_clusters) {
-		remove_common(mysql_conn, DBD_REMOVE_CLUS_RES,
-			      now, user_name, clus_res_table,
-			      clus_char, NULL, NULL, NULL, NULL, NULL);
+		remove_common(&args);
 	} else {
-		remove_common(mysql_conn, DBD_REMOVE_CLUS_RES,
-			      now, user_name, clus_res_table,
-			      clus_char, NULL, NULL, NULL, NULL, NULL);
-		remove_common(mysql_conn, DBD_REMOVE_RES,
-			      now, user_name, res_table,
-			      name_char, NULL, NULL, NULL, NULL, NULL);
+		remove_common(&args);
+
+		args.name_char = name_char;
+		args.table = res_table;
+		remove_common(&args);
 	}
 
 	xfree(clus_char);
 	xfree(name_char);
-	xfree(user_name);
+	xfree(args.user_name);
 
 	return ret_list;
 }
 
-extern List as_mysql_modify_res(mysql_conn_t *mysql_conn, uint32_t uid,
-				slurmdb_res_cond_t *res_cond,
-				slurmdb_res_rec_t *res)
+extern list_t *as_mysql_modify_res(mysql_conn_t *mysql_conn, uint32_t uid,
+				   slurmdb_res_cond_t *res_cond,
+				   slurmdb_res_rec_t *res)
 {
-	List ret_list = NULL;
+	list_t *ret_list = NULL;
 	char *vals = NULL, *clus_vals = NULL;
 	time_t now = time(NULL);
 	char *user_name = NULL, *tmp = NULL, *col_names = NULL;
@@ -1203,8 +1206,8 @@ extern List as_mysql_modify_res(mysql_conn_t *mysql_conn, uint32_t uid,
 		if ((res->flags & SLURMDB_RES_FLAG_ABSOLUTE) &&
 		    (res->flags & SLURMDB_RES_FLAG_REMOVE)) {
 		} else if ((res->flags & SLURMDB_RES_FLAG_ABSOLUTE) ||
-		    (slurm_atoul(row[RES_REQ_FLAGS]) &
-		     SLURMDB_RES_FLAG_ABSOLUTE)) {
+			   (slurm_atoul(row[RES_REQ_FLAGS]) &
+			    SLURMDB_RES_FLAG_ABSOLUTE)) {
 			total_pos = slurm_atoul(row[RES_REQ_COUNT]);
 			percent_str = "";
 		}

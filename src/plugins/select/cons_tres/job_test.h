@@ -43,6 +43,7 @@ extern uint64_t def_mem_per_gpu;
 extern bool preempt_strict_order;
 extern bool preempt_for_licenses;
 extern int preempt_reorder_cnt;
+extern bool soft_time_limit;
 
 /*
  * job_test - Given a specification of scheduling requirements,
@@ -59,11 +60,12 @@ extern int preempt_reorder_cnt;
  * IN mode - SELECT_MODE_RUN_NOW   (0): try to schedule job now
  *           SELECT_MODE_TEST_ONLY (1): test if job can ever run
  *           SELECT_MODE_WILL_RUN  (2): determine when and where job can run
- * IN preemptee_candidates - List of pointers to jobs which can be preempted.
+ * IN preemptee_candidates - list of pointers to jobs which can be preempted.
  * IN/OUT preemptee_job_list - Pointer to list of job pointers. These are the
  *		jobs to be preempted to initiate the pending job. Not set
  *		if mode=SELECT_MODE_TEST_ONLY or input pointer is NULL.
  * IN resv_exc_ptr - Various TRES which the job can NOT use.
+ * IN will_run_ptr - Pointer to data specific to WILL_RUN mode
  * RET zero on success, EINVAL otherwise
  * globals (passed via select_p_node_init):
  *	node_record_count - count of nodes configured
@@ -78,8 +80,9 @@ extern int preempt_reorder_cnt;
 extern int job_test(job_record_t *job_ptr, bitstr_t *bitmap,
 		    uint32_t min_nodes, uint32_t max_nodes,
 		    uint32_t req_nodes, uint16_t mode,
-		    List preemptee_candidates,
-		    List *preemptee_job_list,
-		    resv_exc_t *resv_exc_ptr);
+		    list_t *preemptee_candidates,
+		    list_t **preemptee_job_list,
+		    resv_exc_t *resv_exc_ptr,
+		    will_run_data_t *will_run_ptr);
 
 #endif /* !_CONS_TRES_JOB_TEST_H */

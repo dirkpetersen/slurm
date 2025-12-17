@@ -1,5 +1,5 @@
 /*****************************************************************************\
- * src/slurmd/common/slurmstepd_init.c - slurmstepd intialization code
+ * src/slurmd/common/slurmstepd_init.c - slurmstepd initialization code
  *****************************************************************************
  *  Copyright (C) 2005 The Regents of the University of California.
  *  Produced at Lawrence Livermore National Laboratory (cf, DISCLAIMER).
@@ -108,7 +108,7 @@ extern int unpack_slurmd_conf_lite_no_alloc(slurmd_conf_t *conf, buf_t *buffer)
 		safe_unpackstr(&conf->logfile, buffer);
 		safe_unpack32(&conf->debug_level, buffer);
 		safe_unpack32(&conf->syslog_debug, buffer);
-		safe_unpackstr_xmalloc(&conf->stepd_loc, &uint32_tmp, buffer);
+		safe_unpackstr(&conf->stepd_loc, buffer);
 		safe_unpackbool(&conf->daemonize, buffer);
 		safe_unpackstr(&conf->node_topo_addr, buffer);
 		safe_unpackstr(&conf->node_topo_pattern, buffer);
@@ -147,7 +147,6 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	/* accounting_storage_pass */
 	/* accounting_storage_port */
 	packstr(slurm_conf.accounting_storage_type, buffer);
-	/* accounting_storage_user */
 	/* acct_gather_conf */
 	packstr(slurm_conf.acct_gather_energy_type, buffer);
 	packstr(slurm_conf.acct_gather_profile_type, buffer);
@@ -183,6 +182,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	packstr_array(slurm_conf.epilog, slurm_conf.epilog_cnt, buffer);
 	/* epilog_msg_time */
 	/* epilog_slurmctld */
+	/* epilog_timeout */
 	/* fed_params */
 	/* first_job_id */
 	/* fs_dampening_factor */
@@ -196,6 +196,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	/* health_check_interval */
 	/* health_check_node_state */
 	/* health_check_program */
+	/* http_parser_type */
 	/* inactive_limit */
 	/* interactive_step_opts */
 	packstr(slurm_conf.job_acct_gather_freq, buffer);
@@ -209,7 +210,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	/* job_comp_port */
 	/* job_comp_type */
 	/* job_comp_user */
-	packstr(slurm_conf.job_container_plugin, buffer);
+	packstr(slurm_conf.namespace_plugin, buffer);
 	/* job_defaults_list */
 	pack16(slurm_conf.job_file_append, buffer);
 	/* job_requeue */
@@ -235,6 +236,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	pack16(slurm_conf.max_tasks_per_node, buffer);
 	/* mcs_plugin */
 	/* mcs_plugin_params */
+	/* metrics_type */
 	/* min_job_age */
 	/* mpi_conf */
 	packstr(slurm_conf.mpi_default, buffer);
@@ -243,7 +245,6 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	/* next_job_id */
 	/* node_features_conf */
 	/* node_features_plugins */
-	/* node_prefix */
 	/* over_time_limit */
 	packstr(slurm_conf.plugindir, buffer);
 	packstr(slurm_conf.plugstack, buffer);
@@ -271,9 +272,9 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	/* private_data */
 	packstr(slurm_conf.proctrack_type, buffer);
 	packstr_array(slurm_conf.prolog, slurm_conf.prolog_cnt, buffer);
-	/* prolog_epilog_timeout */
 	pack16(slurm_conf.prolog_flags, buffer);
 	/* prolog_slurmctld */
+	/* prolog_timeout */
 	pack16(slurm_conf.propagate_prio_process, buffer);
 	packstr(slurm_conf.propagate_rlimits, buffer);
 	packstr(slurm_conf.propagate_rlimits_except, buffer);
@@ -349,6 +350,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	pack32(slurm_conf.task_plugin_param, buffer);
 	packstr(slurm_conf.task_prolog, buffer);
 	pack16(slurm_conf.tcp_timeout, buffer);
+	packstr(slurm_conf.tls_params, buffer);
 	packstr(slurm_conf.tls_type, buffer);
 	packstr(slurm_conf.tmp_fs, buffer);
 	packstr(slurm_conf.topology_param, buffer);
@@ -356,6 +358,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	pack16(slurm_conf.tree_width, buffer);
 	packstr(slurm_conf.unkillable_program, buffer);
 	pack16(slurm_conf.unkillable_timeout, buffer);
+	/* url_parser_type */
 	/* version */
 	pack16(slurm_conf.vsize_factor, buffer);
 	pack16(slurm_conf.wait_time, buffer);
@@ -377,7 +380,6 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 	/* accounting_storage_pass */
 	/* accounting_storage_port */
 	safe_unpackstr(&slurm_conf.accounting_storage_type, buffer);
-	/* accounting_storage_user */
 	/* acct_gather_conf */
 	safe_unpackstr(&slurm_conf.acct_gather_energy_type, buffer);
 	safe_unpackstr(&slurm_conf.acct_gather_profile_type, buffer);
@@ -416,6 +418,7 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 			     buffer);
 	/* epilog_msg_time */
 	/* epilog_slurmctld */
+	/* epilog_timeout */
 	/* fed_params */
 	/* first_job_id */
 	/* fs_dampening_factor */
@@ -442,7 +445,7 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 	/* job_comp_port */
 	/* job_comp_type */
 	/* job_comp_user */
-	safe_unpackstr(&slurm_conf.job_container_plugin, buffer);
+	safe_unpackstr(&slurm_conf.namespace_plugin, buffer);
 	/* job_defaults_list */
 	safe_unpack16(&slurm_conf.job_file_append, buffer);
 	/* job_requeue */
@@ -476,7 +479,6 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 	/* next_job_id */
 	/* node_features_conf */
 	/* node_features_plugins */
-	/* node_prefix */
 	/* over_time_limit */
 	safe_unpackstr(&slurm_conf.plugindir, buffer);
 	safe_unpackstr(&slurm_conf.plugstack, buffer);
@@ -505,9 +507,9 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 	safe_unpackstr(&slurm_conf.proctrack_type, buffer);
 	safe_unpackstr_array(&slurm_conf.prolog, &slurm_conf.prolog_cnt,
 			     buffer);
-	/* prolog_epilog_timeout */
 	safe_unpack16(&slurm_conf.prolog_flags, buffer);
 	/* prolog_slurmctld */
+	/* prolog_timeout */
 	safe_unpack16(&slurm_conf.propagate_prio_process, buffer);
 	safe_unpackstr(&slurm_conf.propagate_rlimits, buffer);
 	safe_unpackstr(&slurm_conf.propagate_rlimits_except, buffer);
@@ -583,6 +585,7 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 	safe_unpack32(&slurm_conf.task_plugin_param, buffer);
 	safe_unpackstr(&slurm_conf.task_prolog, buffer);
 	safe_unpack16(&slurm_conf.tcp_timeout, buffer);
+	safe_unpackstr(&slurm_conf.tls_params, buffer);
 	safe_unpackstr(&slurm_conf.tls_type, buffer);
 	safe_unpackstr(&slurm_conf.tmp_fs, buffer);
 	safe_unpackstr(&slurm_conf.topology_param, buffer);
@@ -611,7 +614,7 @@ extern void pack_stepd_reconf(buf_t *buffer, uint16_t protocol_version)
 	 * able to communicate with an older slurmstepd if the slurmd process
 	 * has been upgraded.
 	 */
-	if (protocol_version >= SLURM_23_11_PROTOCOL_VERSION) {
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
 		packstr_array(slurm_conf.control_addr, slurm_conf.control_cnt,
 			      buffer);
 		packstr(slurm_conf.slurmctld_addr, buffer);

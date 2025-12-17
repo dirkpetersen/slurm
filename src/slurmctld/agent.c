@@ -88,8 +88,8 @@
 #include "src/common/run_command.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_socket.h"
+#include "src/common/threadpool.h"
 #include "src/common/uid.h"
-#include "src/common/xsignal.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
@@ -97,7 +97,6 @@
 #include "src/interfaces/select.h"
 
 #include "src/slurmctld/agent.h"
-#include "src/slurmctld/front_end.h"
 #include "src/slurmctld/job_scheduler.h"
 #include "src/slurmctld/locks.h"
 #include "src/slurmctld/ping_nodes.h"
@@ -112,7 +111,6 @@
 #define MAX_RPC_PACK_CNT	100
 #define RPC_PACK_MAX_AGE	1	/* Rebuild data over 1 seconds old */
 #define DUMP_RPC_COUNT 		25
-#define HOSTLIST_MAX_SIZE 	80
 #define MAIL_PROG_TIMEOUT 120 /* Timeout in seconds */
 #define AGENT_SHUTDOWN_WAIT 3
 
@@ -160,6 +158,7 @@ typedef struct {
 	void **msg_args_pptr;		/* RPC data to be used */
 	uint16_t msg_flags;		/* Flags to be added to msg*/
 	uint16_t protocol_version;	/* if set, use this version */
+	char *tls_cert;
 } agent_info_t;
 
 typedef struct {
@@ -175,6 +174,7 @@ typedef struct {
 	void *msg_args_ptr;		/* ptr to RPC data to be used */
 	uint16_t msg_flags;		/* Flags to be added to msg*/
 	uint16_t protocol_version;	/* if set, use this version */
+	char *tls_cert;
 } task_info_t;
 
 typedef struct {
@@ -207,7 +207,6 @@ static void _queue_update_node(char *node_name);
 static void _queue_update_srun(slurm_step_id_t *step_id);
 static int  _setup_requeue(agent_arg_t *agent_arg_ptr, thd_t *thread_ptr,
 			   int *count, int *spot);
-static void _sig_handler(int dummy);
 static void *_thread_per_group_rpc(void *args);
 static int   _valid_agent_arg(agent_arg_t *agent_arg_ptr);
 static void *_wdog(void *args);
@@ -470,6 +469,7 @@ static agent_info_t *_make_agent_info(agent_arg_t *agent_arg_ptr)
 	agent_info_ptr->msg_args_pptr  = &agent_arg_ptr->msg_args;
 	agent_info_ptr->msg_flags = agent_arg_ptr->msg_flags;
 	agent_info_ptr->protocol_version = agent_arg_ptr->protocol_version;
+	agent_info_ptr->tls_cert = agent_arg_ptr->tls_cert;
 
 	if (!agent_info_ptr->thread_count)
 		return agent_info_ptr;
@@ -490,14 +490,10 @@ static agent_info_t *_make_agent_info(agent_arg_t *agent_arg_ptr)
 	    (agent_arg_ptr->msg_type != SRUN_STEP_MISSING)	&&
 	    (agent_arg_ptr->msg_type != SRUN_STEP_SIGNAL)	&&
 	    (agent_arg_ptr->msg_type != SRUN_JOB_COMPLETE)) {
-#ifdef HAVE_FRONT_END
-		split = true;
-#else
 		/* Sending message to a possibly large number of slurmd.
 		 * Push all message forwarding to slurmd in order to
 		 * offload as much work from slurmctld as possible. */
 		split = false;
-#endif
 		agent_info_ptr->get_reply = true;
 	} else {
 		/* Message is going to one node (for srun) or we want
@@ -572,6 +568,7 @@ static task_info_t *_make_task_data(agent_info_t *agent_info_ptr, int inx)
 	task_info_ptr->msg_args_ptr      = *agent_info_ptr->msg_args_pptr;
 	task_info_ptr->msg_flags = agent_info_ptr->msg_flags;
 	task_info_ptr->protocol_version  = agent_info_ptr->protocol_version;
+	task_info_ptr->tls_cert = agent_info_ptr->tls_cert;
 
 	return task_info_ptr;
 }
@@ -717,14 +714,16 @@ static void _notify_slurmctld_jobs(agent_info_t *agent_ptr)
 	} else if (agent_ptr->msg_type == RESPONSE_RESOURCE_ALLOCATION) {
 		resource_allocation_response_msg_t *msg =
 			*agent_ptr->msg_args_pptr;
-		step_id.job_id = msg->job_id;
+		step_id.job_id = msg->step_id.job_id;
+		step_id.sluid = msg->step_id.sluid;
 	} else if (agent_ptr->msg_type == RESPONSE_HET_JOB_ALLOCATION) {
 		list_t *het_alloc_list = *agent_ptr->msg_args_pptr;
 		resource_allocation_response_msg_t *msg;
 		if (!het_alloc_list || (list_count(het_alloc_list) == 0))
 			return;
 		msg = list_peek(het_alloc_list);
-		step_id.job_id  = msg->job_id;
+		step_id.job_id = msg->step_id.job_id;
+		step_id.sluid = msg->step_id.sluid;
 	} else if ((agent_ptr->msg_type == SRUN_JOB_COMPLETE)		||
 		   (agent_ptr->msg_type == SRUN_REQUEST_SUSPEND)	||
 		   (agent_ptr->msg_type == SRUN_STEP_MISSING)		||
@@ -758,21 +757,48 @@ static void _notify_slurmctld_nodes(agent_info_t *agent_ptr,
 
 	/* Notify slurmctld of non-responding nodes */
 	if (no_resp_cnt) {
+		/* Locks: Write job, write node, read federation */
+		slurmctld_lock_t job_write_lock = { .job = WRITE_LOCK,
+						    .node = WRITE_LOCK,
+						    .fed = READ_LOCK };
 		/* Update node table data for non-responding nodes */
 		if (agent_ptr->msg_type == REQUEST_BATCH_JOB_LAUNCH) {
 			/* Requeue the request */
 			batch_job_launch_msg_t *launch_msg_ptr =
-					*agent_ptr->msg_args_pptr;
-			uint32_t job_id = launch_msg_ptr->job_id;
-			/* Locks: Write job, write node, read federation */
-			slurmctld_lock_t job_write_lock =
-				{ .job  = WRITE_LOCK,
-				  .node = WRITE_LOCK,
-				  .fed  = READ_LOCK };
+				*agent_ptr->msg_args_pptr;
 
 			lock_slurmctld(job_write_lock);
-			job_complete(job_id, slurm_conf.slurm_user_id,
-				     true, false, 0);
+			job_complete(&launch_msg_ptr->step_id,
+				     slurm_conf.slurm_user_id, true, false, 0);
+			unlock_slurmctld(job_write_lock);
+		} else if (agent_ptr->msg_type == REQUEST_LAUNCH_PROLOG) {
+			prolog_launch_msg_t *prolog_msg_ptr =
+				*agent_ptr->msg_args_pptr;
+			job_record_t *job_ptr;
+
+			lock_slurmctld(job_write_lock);
+			job_ptr = find_job_record(
+				prolog_msg_ptr->deprecated.job_id);
+			/*
+			 * We are about to give up on sending this RPC because
+			 * the receiver never ACK.
+			 *
+			 * In this extreme situation we assume slurmd never
+			 * realized it has to run a prolog, so the whole job,
+			 * if not batch, can be cancelled directly. Batch jobs
+			 * are requeued later, so we don't need to worry here.
+			 */
+			if (job_ptr && (job_ptr->state_reason == WAIT_PROLOG) &&
+			    job_ptr->prolog_launch_time &&
+			    !job_ptr->batch_flag) {
+				slurm_step_id_t step_id =
+					STEP_ID_FROM_JOB_RECORD(job_ptr);
+
+				error("%s: Revoking job %pI due to nodes not responding",
+				      __func__, &step_id);
+				job_complete(&step_id, slurm_conf.slurm_user_id,
+					     false, true, 1);
+			}
 			unlock_slurmctld(job_write_lock);
 		}
 	}
@@ -819,13 +845,9 @@ static void _notify_slurmctld_nodes(agent_info_t *agent_ptr,
 					locked = true;
 					lock_slurmctld(node_write_lock);
 				}
-#ifdef HAVE_FRONT_END
-				down_msg = "";
-#else
 				drain_nodes(*node_names, "Prolog/Epilog failure",
 				            slurm_conf.slurm_user_id);
 				down_msg = ", set to state DRAIN";
-#endif
 				error("Prolog/Epilog failure on nodes %s%s",
 				      *node_names, down_msg);
 				break;
@@ -834,13 +856,9 @@ static void _notify_slurmctld_nodes(agent_info_t *agent_ptr,
 					locked = true;
 					lock_slurmctld(node_write_lock);
 				}
-#ifdef HAVE_FRONT_END
-				down_msg = "";
-#else
 				drain_nodes(*node_names, "Duplicate jobid",
 				            slurm_conf.slurm_user_id);
 				down_msg = ", set to state DRAIN";
-#endif
 				error("Duplicate jobid on nodes %s%s",
 				      *node_names, down_msg);
 				break;
@@ -941,7 +959,6 @@ static void *_thread_per_group_rpc(void *args)
 	list_t *ret_list = NULL;
 	list_itr_t *itr;
 	ret_data_info_t *ret_data_info = NULL;
-	int sig_array[2] = {SIGUSR1, 0};
 	/* Locks: Write job, write node */
 	slurmctld_lock_t job_write_lock = {
 		NO_LOCK, WRITE_LOCK, WRITE_LOCK, NO_LOCK, READ_LOCK };
@@ -954,8 +971,6 @@ static void *_thread_per_group_rpc(void *args)
 	uint32_t job_id;
 
 	xassert(args != NULL);
-	xsignal(SIGUSR1, _sig_handler);
-	xsignal_unblock(sig_array);
 	is_kill_msg = (	(msg_type == REQUEST_KILL_TIMELIMIT)	||
 			(msg_type == REQUEST_KILL_PREEMPTED)	||
 			(msg_type == REQUEST_TERMINATE_JOB) );
@@ -986,6 +1001,8 @@ static void *_thread_per_group_rpc(void *args)
 	msg.data     = task_ptr->msg_args_ptr;
 	slurm_msg_set_r_uid(&msg, task_ptr->r_uid);
 	msg.flags |= task_ptr->msg_flags;
+	msg.tls_cert = task_ptr->tls_cert;
+	task_ptr->tls_cert = NULL;
 
 	if (thread_ptr->nodename)
 		log_flag(AGENT, "%s: sending %s to %s", __func__,
@@ -1036,7 +1053,8 @@ static void *_thread_per_group_rpc(void *args)
 			}
 		}
 		//info("sending %u to %s", msg_type, thread_ptr->nodename);
-		if (msg_type == SRUN_JOB_COMPLETE) {
+		if ((msg_type == SRUN_JOB_COMPLETE) ||
+		    (msg_type == SRUN_STEP_SIGNAL)) {
 			/*
 			 * The srun runs as a single thread, while the kernel
 			 * listen() may be queuing messages for further
@@ -1086,10 +1104,16 @@ static void *_thread_per_group_rpc(void *args)
 			kill_job_msg_t *kill_job;
 			kill_job = (kill_job_msg_t *)
 				task_ptr->msg_args_ptr;
+			job_record_t *job_ptr = NULL;
 			rc = SLURM_SUCCESS;
 			lock_slurmctld(job_write_lock);
-			if (job_epilog_complete(kill_job->step_id.job_id,
-						ret_data_info->node_name, rc))
+			if (!(job_ptr = find_job(&kill_job->step_id)))
+				debug("%s: unable to find %pI to mark epilog completed on node=%s with return_code=%u",
+				      __func__, &kill_job->step_id,
+				      ret_data_info->node_name, rc);
+			else if (job_epilog_complete(job_ptr,
+						     ret_data_info->node_name,
+						     rc))
 				run_scheduler = true;
 			unlock_slurmctld(job_write_lock);
 		}
@@ -1110,14 +1134,14 @@ static void *_thread_per_group_rpc(void *args)
 		    (ret_data_info->type != RESPONSE_FORWARD_FAILED)) {
 			batch_job_launch_msg_t *launch_msg_ptr =
 				task_ptr->msg_args_ptr;
-			job_id = launch_msg_ptr->job_id;
-			info("Killing non-startable batch JobId=%u: %s",
-			     job_id, slurm_strerror(rc));
+			info("Killing non-startable batch %pI: %s",
+			     &launch_msg_ptr->step_id, slurm_strerror(rc));
 			thread_state = DSH_DONE;
 			ret_data_info->err = thread_state;
 			lock_slurmctld(job_write_lock);
-			job_complete(job_id, slurm_conf.slurm_user_id,
-			             false, false, _wif_status());
+			job_complete(&launch_msg_ptr->step_id,
+				     slurm_conf.slurm_user_id, false, false,
+				     _wif_status());
 			unlock_slurmctld(job_write_lock);
 			continue;
 		} else if ((msg_type == RESPONSE_RESOURCE_ALLOCATION) &&
@@ -1127,13 +1151,13 @@ static void *_thread_per_group_rpc(void *args)
 			 * behind on the allocated nodes. */
 			resource_allocation_response_msg_t *msg_ptr =
 				task_ptr->msg_args_ptr;
-			job_id = msg_ptr->job_id;
-			info("Killing interactive JobId=%u: %s",
-			     job_id, slurm_strerror(rc));
+			info("Killing interactive %pI: %s",
+			     &msg_ptr->step_id, slurm_strerror(rc));
 			thread_state = DSH_FAILED;
 			lock_slurmctld(job_write_lock);
-			job_complete(job_id, slurm_conf.slurm_user_id,
-			             false, false, _wif_status());
+			job_complete(&msg_ptr->step_id,
+				     slurm_conf.slurm_user_id, false, false,
+				     _wif_status());
 			unlock_slurmctld(job_write_lock);
 			continue;
 		} else if ((msg_type == RESPONSE_HET_JOB_ALLOCATION) &&
@@ -1147,13 +1171,13 @@ static void *_thread_per_group_rpc(void *args)
 			    (list_count(het_alloc_list) == 0))
 				continue;
 			msg_ptr = list_peek(het_alloc_list);
-			job_id = msg_ptr->job_id;
-			info("Killing interactive JobId=%u: %s",
-			     job_id, slurm_strerror(rc));
+			info("Killing interactive %pI: %s",
+			     &msg_ptr->step_id, slurm_strerror(rc));
 			thread_state = DSH_FAILED;
 			lock_slurmctld(job_write_lock);
-			job_complete(job_id, slurm_conf.slurm_user_id,
-			             false, false, _wif_status());
+			job_complete(&msg_ptr->step_id,
+				     slurm_conf.slurm_user_id, false, false,
+				     _wif_status());
 			unlock_slurmctld(job_write_lock);
 			continue;
 		}
@@ -1224,7 +1248,7 @@ static void *_thread_per_group_rpc(void *args)
 			break;
 		case ESLURM_INVALID_JOB_ID:
 			/* Not indicative of a real error */
-		case ESLURMD_JOB_NOTRUNNING:
+		case ESLURMD_STEP_NOTRUNNING:
 			/* Not indicative of a real error */
 			log_flag(AGENT, "%s: RPC to node %s failed, job not running",
 				 __func__, ret_data_info->node_name);
@@ -1289,22 +1313,10 @@ cleanup:
 	return NULL;
 }
 
-/*
- * Signal handler.  We are really interested in interrupting hung communictions
- * and causing them to return EINTR. Multiple interrupts might be required.
- */
-static void _sig_handler(int dummy)
-{
-}
-
 static int _setup_requeue(agent_arg_t *agent_arg_ptr, thd_t *thread_ptr,
 			  int *count, int *spot)
 {
-#ifdef HAVE_FRONT_END
-	front_end_record_t *node_ptr;
-#else
 	node_record_t *node_ptr;
-#endif
 	ret_data_info_t *ret_data_info = NULL;
 	list_itr_t *itr;
 	int rc = 0;
@@ -1316,11 +1328,7 @@ static int _setup_requeue(agent_arg_t *agent_arg_ptr, thd_t *thread_ptr,
 		if (ret_data_info->err != DSH_NO_RESP)
 			continue;
 
-#ifdef HAVE_FRONT_END
-		node_ptr = find_front_end_record(ret_data_info->node_name);
-#else
 		node_ptr = find_node_record(ret_data_info->node_name);
-#endif
 		if (node_ptr &&
 		    (IS_NODE_DOWN(node_ptr) ||
 		     IS_NODE_POWERING_DOWN(node_ptr) ||
@@ -1351,11 +1359,7 @@ static int _setup_requeue(agent_arg_t *agent_arg_ptr, thd_t *thread_ptr,
  */
 static void _queue_agent_retry(agent_info_t * agent_info_ptr, int count)
 {
-#ifdef HAVE_FRONT_END
-	front_end_record_t *node_ptr;
-#else
 	node_record_t *node_ptr;
-#endif
 	agent_arg_t *agent_arg_ptr;
 	queued_request_t *queued_req_ptr = NULL;
 	thd_t *thread_ptr = agent_info_ptr->thread_struct;
@@ -1383,12 +1387,7 @@ static void _queue_agent_retry(agent_info_t * agent_info_ptr, int count)
 
 			debug("got the name %s to resend",
 			      thread_ptr[i].nodename);
-#ifdef HAVE_FRONT_END
-			node_ptr = find_front_end_record(
-						thread_ptr[i].nodename);
-#else
 			node_ptr = find_node_record(thread_ptr[i].nodename);
-#endif
 			if (node_ptr &&
 			    (IS_NODE_DOWN(node_ptr) ||
 			     IS_NODE_POWERING_DOWN(node_ptr) ||
@@ -1470,8 +1469,12 @@ static void *_agent_init(void *arg)
 					     &ts);
 		}
 		if (slurmctld_config.shutdown_time) {
-			slurm_mutex_unlock(&pending_mutex);
-			break;
+			if (!retry_list_size() ||
+			    (slurmctld_config.shutdown_time +
+			     AGENT_SHUTDOWN_WAIT < time(NULL))) {
+				slurm_mutex_unlock(&pending_mutex);
+				break;
+			}
 		}
 		mail_too = pending_mail;
 		min_wait = pending_wait_time;
@@ -1516,11 +1519,13 @@ static void *_agent_nodes_update(void *arg)
 			break;
 		}
 
-		if (!list_count(update_node_list))
-			continue;
-		lock_slurmctld(node_write_lock);
-		list_delete_all(update_node_list, _foreach_node_did_resp, NULL);
-		unlock_slurmctld(node_write_lock);
+		if (list_count(update_node_list)) {
+			lock_slurmctld(node_write_lock);
+			list_delete_all(update_node_list,
+					_foreach_node_did_resp, NULL);
+			unlock_slurmctld(node_write_lock);
+		}
+		ping_nodes_update();
 	}
 
 	return NULL;
@@ -1604,6 +1609,19 @@ extern void agent_fini(void)
 	struct timespec ts = {0, 0};
 	int rc = 0;
 
+	/*
+	 * Wait until we know that slurmctld_config.shutdown_time set. This way,
+	 * each helper thread that is checking slurmctld_config.shutdown_time to
+	 * know when to shutdown can immediately end its slurm_cond_timedwait()
+	 * loop rather than waiting for the next loop.
+	 */
+	slurm_mutex_lock(&slurmctld_config.shutdown_lock);
+	while (!slurmctld_config.shutdown_time) {
+		slurm_cond_wait(&slurmctld_config.shutdown_cond,
+				&slurmctld_config.shutdown_lock);
+	}
+	slurm_mutex_unlock(&slurmctld_config.shutdown_lock);
+
 	agent_trigger(999, true, true);
 
 	slurm_mutex_lock(&update_nodes_mutex);
@@ -1683,6 +1701,13 @@ extern void agent_pack_pending_rpc_stats(buf_t *buffer)
 		memset(rpc_stat_types,  0, sizeof(uint32_t) * MAX_RPC_PACK_CNT);
 
 		rpc_count = 0;
+
+		/* Free any hostlist strings */
+		if (rpc_host_list) {
+			for (i = 0; i < DUMP_RPC_COUNT; i++)
+				xfree(rpc_host_list[i]);
+		}
+
 		/* the other variables need not be cleared */
 	} else {		/* Allocate buffers for data */
 		stat_type_count = 0;
@@ -1691,9 +1716,6 @@ extern void agent_pack_pending_rpc_stats(buf_t *buffer)
 
 		rpc_count = 0;
 		rpc_host_list = xcalloc(DUMP_RPC_COUNT, sizeof(char *));
-		for (i = 0; i < DUMP_RPC_COUNT; i++) {
-			rpc_host_list[i] = xmalloc(HOSTLIST_MAX_SIZE);
-		}
 		rpc_type_list = xcalloc(DUMP_RPC_COUNT, sizeof(uint32_t));
 	}
 
@@ -1704,11 +1726,11 @@ extern void agent_pack_pending_rpc_stats(buf_t *buffer)
 		while ((queued_req_ptr = list_next(list_iter))) {
 			agent_arg_ptr = queued_req_ptr->agent_arg_ptr;
 			if (rpc_count < DUMP_RPC_COUNT) {
+				hostlist_t *hl = agent_arg_ptr->hostlist;
 				rpc_type_list[rpc_count] =
 						agent_arg_ptr->msg_type;
-				hostlist_ranged_string(agent_arg_ptr->hostlist,
-						HOSTLIST_MAX_SIZE,
-						rpc_host_list[rpc_count]);
+				rpc_host_list[rpc_count] =
+					hostlist_ranged_string_xmalloc(hl);
 				rpc_count++;
 			}
 			for (i = 0; i < MAX_RPC_PACK_CNT; i++) {
@@ -1957,21 +1979,18 @@ extern void agent_purge(void)
 {
 	int i;
 
-	if (retry_list) {
-		slurm_mutex_lock(&retry_mutex);
-		FREE_NULL_LIST(retry_list);
-		slurm_mutex_unlock(&retry_mutex);
-	}
-	if (defer_list) {
-		slurm_mutex_lock(&defer_mutex);
-		FREE_NULL_LIST(defer_list);
-		slurm_mutex_unlock(&defer_mutex);
-	}
-	if (mail_list) {
-		slurm_mutex_lock(&mail_mutex);
-		FREE_NULL_LIST(mail_list);
-		slurm_mutex_unlock(&mail_mutex);
-	}
+	slurm_mutex_lock(&retry_mutex);
+	FREE_NULL_LIST(retry_list);
+	slurm_mutex_unlock(&retry_mutex);
+
+	slurm_mutex_lock(&defer_mutex);
+	FREE_NULL_LIST(defer_list);
+	slurm_mutex_unlock(&defer_mutex);
+
+	slurm_mutex_lock(&mail_mutex);
+	FREE_NULL_LIST(mail_list);
+	slurm_mutex_unlock(&mail_mutex);
+
 	slurm_mutex_lock(&update_nodes_mutex);
 	FREE_NULL_LIST(update_node_list);
 	slurm_mutex_unlock(&update_nodes_mutex);
@@ -2306,7 +2325,7 @@ extern void mail_job_info(job_record_t *job_ptr, uint16_t mail_type)
 	slurm_mutex_unlock(&mail_mutex);
 }
 
-/* Test if a batch launch request should be defered
+/* Test if a batch launch request should be deferred
  * RET -1: abort the request, pending job cancelled
  *      0: execute the request now
  *      1: defer the request
@@ -2326,11 +2345,11 @@ static int _batch_launch_defer(queued_request_t *queued_req_ptr)
 	}
 
 	launch_msg_ptr = (batch_job_launch_msg_t *)agent_arg_ptr->msg_args;
-	job_ptr = find_job_record(launch_msg_ptr->job_id);
+	job_ptr = find_job(&launch_msg_ptr->step_id);
 	if ((job_ptr == NULL) ||
 	    (!IS_JOB_RUNNING(job_ptr) && !IS_JOB_SUSPENDED(job_ptr))) {
-		info("agent(batch_launch): removed pending request for cancelled JobId=%u",
-		     launch_msg_ptr->job_id);
+		info("agent(batch_launch): removed pending request for cancelled %pI",
+		     &launch_msg_ptr->step_id);
 		return -1;	/* job cancelled while waiting */
 	}
 
@@ -2342,23 +2361,12 @@ static int _batch_launch_defer(queued_request_t *queued_req_ptr)
 	}
 
 	if (job_ptr->wait_all_nodes) {
-		(void) job_node_ready(launch_msg_ptr->job_id, &tmp);
+		(void) job_node_ready(&launch_msg_ptr->step_id, &tmp);
 		if (tmp ==
 		    (READY_JOB_STATE | READY_NODE_STATE | READY_PROLOG_STATE)) {
 			nodes_ready = 1;
-			if (launch_msg_ptr->alias_list &&
-			    !xstrcmp(launch_msg_ptr->alias_list, "TBD")) {
-				/* Update launch RPC with correct node
-				 * aliases */
-				xfree(launch_msg_ptr->alias_list);
-				launch_msg_ptr->alias_list = xstrdup(job_ptr->
-								     alias_list);
-			}
 		}
 	} else {
-#ifdef HAVE_FRONT_END
-		nodes_ready = 1;
-#else
 		node_record_t *node_ptr;
 		char *hostname;
 
@@ -2366,8 +2374,8 @@ static int _batch_launch_defer(queued_request_t *queued_req_ptr)
 					agent_arg_ptr->hostlist);
 		node_ptr = find_node_record(hostname);
 		if (node_ptr == NULL) {
-			error("agent(batch_launch) removed pending request for JobId=%u, missing node %s",
-			      launch_msg_ptr->job_id, hostname);
+			error("agent(batch_launch) removed pending request for %pI, missing node %s",
+			      &launch_msg_ptr->step_id, hostname);
 			xfree(hostname);
 			return -1;	/* invalid request?? */
 		}
@@ -2377,7 +2385,6 @@ static int _batch_launch_defer(queued_request_t *queued_req_ptr)
 		    !IS_NODE_NO_RESPOND(node_ptr)) {
 			nodes_ready = 1;
 		}
-#endif
 	}
 
 	if ((slurm_conf.prolog_flags & PROLOG_FLAG_DEFER_BATCH) &&
@@ -2419,7 +2426,7 @@ static int _batch_launch_defer(queued_request_t *queued_req_ptr)
 	return 1;
 }
 
-/* Test if a job signal request should be defered
+/* Test if a job signal request should be deferred
  * RET -1: abort the request
  *      0: execute the request now
  *      1: defer the request
@@ -2433,11 +2440,10 @@ static int _signal_defer(queued_request_t *queued_req_ptr)
 
 	agent_arg_ptr = queued_req_ptr->agent_arg_ptr;
 	signal_msg_ptr = (signal_tasks_msg_t *)agent_arg_ptr->msg_args;
-	job_ptr = find_job_record(signal_msg_ptr->step_id.job_id);
 
-	if (job_ptr == NULL) {
-		info("agent(signal_task): removed pending request for cancelled JobId=%u",
-		     signal_msg_ptr->step_id.job_id);
+	if (!(job_ptr = find_job(&signal_msg_ptr->step_id))) {
+		info("agent(signal_task): removed pending request for cancelled %pI",
+		     &signal_msg_ptr->step_id);
 		return -1;	/* job cancelled while waiting */
 	}
 
@@ -2448,8 +2454,8 @@ static int _signal_defer(queued_request_t *queued_req_ptr)
 		queued_req_ptr->first_attempt = now;
 	} else if (difftime(now, queued_req_ptr->first_attempt) >=
 	           (2 * slurm_conf.batch_start_timeout)) {
-		error("agent waited too long for nodes to respond, abort signal of JobId=%u",
-		      job_ptr->job_id);
+		error("agent waited too long for nodes to respond, abort signal of %pJ",
+		      job_ptr);
 		return -1;
 	}
 

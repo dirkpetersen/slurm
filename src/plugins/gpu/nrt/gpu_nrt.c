@@ -48,39 +48,15 @@
 #define CONNECTED_DEVICES_SZ 100
 #define DEVICE_NAME_SZ 50
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - A string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - A string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "GPU NRT plugin";
 const char plugin_type[] = "gpu/nrt";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
-static int _count_devices(unsigned int *dev_count)
+static int _count_devices(uint32_t *dev_count)
 {
 	struct dirent *de;
-	unsigned int dev_num;
+	uint32_t dev_num;
 
 	DIR *dr = opendir(NEURON_SYSFS_PREFIX);
 
@@ -114,25 +90,24 @@ static char *_get_device_name(unsigned int dev_inx)
 
 	device_name = xmalloc(DEVICE_NAME_SZ);
 
-	if (!fscanf(fp, "%s", device_name))
+	if (!fgets(device_name, DEVICE_NAME_SZ, fp))
 		debug("Could not read Neuron device name");
-
-	xstrtolower(device_name);
+	gpu_common_underscorify_tolower(device_name);
 	xfree(sysfs_file);
 	fclose(fp);
 	return device_name;
 }
 
-static bool _is_link(int *link_nums, unsigned int dev_cnt, int dev_inx)
+static bool _is_link(int *link_nums, uint32_t dev_cnt, int dev_inx)
 {
-	for (unsigned int i = 0; i < dev_cnt; i++) {
+	for (uint32_t i = 0; i < dev_cnt; i++) {
 		if (link_nums[i] == dev_inx)
 			return true;
 	}
 	return false;
 }
 
-static char *_get_connected_devices(int dev_inx, unsigned int dev_cnt)
+static char *_get_connected_devices(int dev_inx, uint32_t dev_cnt)
 {
 	FILE *fp = NULL;
 	char *sysfs_file = NULL;
@@ -167,7 +142,7 @@ static char *_get_connected_devices(int dev_inx, unsigned int dev_cnt)
 		tok = strtok_r(NULL, ", ", &save_ptr);
 	}
 
-	for (unsigned int i = 0; i < dev_cnt; i++) {
+	for (uint32_t i = 0; i < dev_cnt; i++) {
 		if (_is_link(link_nums, num_links, i))
 			xstrfmtcat(links, "%s%d", i ? "," : "", 1);
 		else if (i == dev_inx)
@@ -186,7 +161,7 @@ static list_t *_get_system_gpu_list_neuron(node_config_load_t *node_conf)
 {
 	struct dirent *de;
 	unsigned int dev_inx;
-	unsigned int dev_cnt = 0;
+	uint32_t dev_cnt = 0;
 	list_t *gres_list_system = NULL;
 	DIR *dr = opendir(NEURON_SYSFS_PREFIX);
 
@@ -203,6 +178,7 @@ static list_t *_get_system_gpu_list_neuron(node_config_load_t *node_conf)
 			char *device_name = NULL;
 
 			gres_slurmd_conf_t gres_slurmd_conf = {
+				.config_flags = GRES_CONF_AUTODETECT,
 				.count = 1,
 				.cpu_cnt = node_conf->cpu_cnt,
 				.name = "gpu",
@@ -244,14 +220,12 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	debug("%s: unloading %s", __func__, plugin_name);
-
-	return SLURM_SUCCESS;
 }
 
-extern void gpu_p_get_device_count(unsigned int *device_count)
+extern void gpu_p_get_device_count(uint32_t *device_count)
 {
 	if (_count_devices(device_count) != SLURM_SUCCESS)
 		error("Failed to get device count from neuron sysfs interface");
@@ -366,7 +340,7 @@ extern int gpu_p_usage_read(pid_t pid, acct_gather_data_t *data)
  *	 // specific pids. As is this code just adds all memory being used across
  *	 // all cores on all devices
  *
- *	unsigned int device_count = 0;
+ *	uint32_t device_count = 0;
  *	int core_cnt = 0;
  *	bool track_gpumem;
  *

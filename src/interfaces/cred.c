@@ -65,6 +65,7 @@
 #include "src/common/xstring.h"
 #include "src/interfaces/cred.h"
 #include "src/interfaces/gres.h"
+#include "src/interfaces/switch.h"
 
 typedef struct {
 	slurm_cred_t *(*cred_create)	(slurm_cred_arg_t *cred_arg,
@@ -197,6 +198,8 @@ extern slurm_cred_t *slurm_cred_create(slurm_cred_arg_t *arg, bool sign_it,
 	xassert(arg);
 	xassert(g_context);
 
+	debug("%s: creating credential for %pI", __func__, &arg->step_id);
+
 	if (arg->uid == SLURM_AUTH_NOBODY) {
 		error("%s: refusing to create job %u credential for invalid user nobody",
 		      __func__, arg->step_id.job_id);
@@ -276,12 +279,15 @@ extern void slurm_cred_free_args(slurm_cred_arg_t *arg)
 	xfree(arg->job_mem_alloc_rep_count);
 	xfree(arg->job_node_addrs);
 	xfree(arg->job_partition);
+	xfree(arg->job_qos);
 	xfree(arg->job_reservation);
 	xfree(arg->job_std_err);
 	xfree(arg->job_std_in);
 	xfree(arg->job_std_out);
 	xfree(arg->step_mem_alloc);
 	xfree(arg->step_mem_alloc_rep_count);
+
+	switch_g_stepinfo_free(arg->switch_step);
 
 	xfree(arg);
 }
@@ -359,12 +365,12 @@ extern slurm_cred_arg_t *slurm_cred_verify(slurm_cred_t *cred)
 	/* NOTE: the verification checks that the credential was
 	 * created by SlurmUser or root */
 	if (!cred->verified) {
-		slurm_seterrno(ESLURMD_INVALID_JOB_CREDENTIAL);
+		errno = ESLURMD_INVALID_JOB_CREDENTIAL;
 		goto error;
 	}
 
 	if (now > (cred->ctime + cred_expire)) {
-		slurm_seterrno(ESLURMD_CREDENTIAL_EXPIRED);
+		errno = ESLURMD_CREDENTIAL_EXPIRED;
 		goto error;
 	}
 
@@ -372,9 +378,9 @@ extern slurm_cred_arg_t *slurm_cred_verify(slurm_cred_t *cred)
 	return cred->arg;
 
 error:
-	errnum = slurm_get_errno();
+	errnum = errno;
 	slurm_rwlock_unlock(&cred->mutex);
-	slurm_seterrno(errnum);
+	errno = errnum;
 	return NULL;
 }
 
@@ -518,11 +524,7 @@ extern void format_core_allocs(slurm_cred_t *credential, char *node_name,
 		      cred->job_hostlist);
 		return;
 	}
-#ifdef HAVE_FRONT_END
-	host_index = 0;
-#else
 	host_index = hostlist_find(hset, node_name);
-#endif
 	if ((host_index < 0) || (host_index >= cred->job_nhosts)) {
 		error("Invalid host_index %d for job %u",
 		      host_index, cred->step_id.job_id);
@@ -556,16 +558,6 @@ extern void format_core_allocs(slurm_cred_t *credential, char *node_name,
 			bit_set(job_core_bitmap, j);
 		if (bit_test(cred->step_core_bitmap, i))
 			bit_set(step_core_bitmap, j);
-	}
-
-	/* Scale CPU count, same as slurmd/req.c:_get_ncpus() */
-	if (i_last_bit <= i_first_bit)
-		error("step credential has no CPUs selected");
-	else {
-		uint32_t i = cpus / (i_last_bit - i_first_bit);
-		if (i > 1)
-			debug2("scaling CPU count by factor of %d (%u/(%u-%u)",
-			       i, cpus, i_last_bit, i_first_bit);
 	}
 
 	slurm_cred_get_mem(credential, node_name, __func__, job_mem_limit,
@@ -605,11 +597,7 @@ extern void get_cred_gres(slurm_cred_t *credential, char *node_name,
 		      cred->job_hostlist);
 		return;
 	}
-#ifdef HAVE_FRONT_END
-	host_index = 0;
-#else
 	host_index = hostlist_find(hset, node_name);
-#endif
 	hostlist_destroy(hset);
 	if ((host_index < 0) || (host_index >= cred->job_nhosts)) {
 		error("Invalid host_index %d for job %u",
@@ -745,8 +733,9 @@ extern sbcast_cred_t *unpack_sbcast_cred(buf_t *buffer, void *msg,
 
 extern void print_sbcast_cred(sbcast_cred_t *sbcast_cred)
 {
-	info("Sbcast_cred: JobId   %u", sbcast_cred->arg.job_id);
-	info("Sbcast_cred: StepId  %u", sbcast_cred->arg.step_id);
+	info("Sbcast_cred: JobId   %u", sbcast_cred->arg.step_id.job_id);
+	info("Sbcast_cred: HetJobId %u", sbcast_cred->arg.het_job_id);
+	info("Sbcast_cred: StepId  %u", sbcast_cred->arg.step_id.step_id);
 	info("Sbcast_cred: Nodes   %s", sbcast_cred->arg.nodes);
 	info("Sbcast_cred: ctime   %s", slurm_ctime2(&sbcast_cred->ctime));
 	info("Sbcast_cred: Expire  %s", slurm_ctime2(&sbcast_cred->arg.expiration));
@@ -823,4 +812,7 @@ extern void setup_cred_arg(slurm_cred_arg_t *cred_arg, job_record_t *job_ptr)
 
 	if (job_ptr->part_ptr)
 		cred_arg->job_partition = job_ptr->part_ptr->name;
+
+	if (job_ptr->qos_ptr)
+		cred_arg->job_qos = job_ptr->qos_ptr->name;
 }

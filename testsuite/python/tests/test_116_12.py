@@ -5,7 +5,8 @@ import atf
 import pytest
 import re
 import os
-from pathlib import Path
+
+# from pathlib import Path
 
 ERROR_TYPE = "error"
 OUTPUT_TYPE = "output"
@@ -125,7 +126,7 @@ def test_output_error_formatting(tmp_path):
     fpc.remove_file(file_err)
 
     # Test %u puts the user name in the file name
-    user_name = atf.get_user_name()
+    user_name = atf.properties["test-user"]
     file_out = fpc.create_file_path("u")
     atf.run_job(f"--output={file_out} -N1 -O id")
     file_out = fpc.get_tmp_file()
@@ -174,7 +175,6 @@ do
     srun -O --output={file_out} true
 done""",
     )
-    os.chmod(file_in, 0o0777)
     job_id = atf.submit_job_sbatch(f"-N{node_count} --output /dev/null {str(file_in)}")
     atf.wait_for_job_state(job_id, "DONE")
     tmp_dir_list = os.listdir(tmp_path)
@@ -191,7 +191,6 @@ do
     srun -O --error={file_err} true
 done""",
     )
-    os.chmod(file_in, 0o0777)
     job_id = atf.submit_job_sbatch(f"-N{node_count} --output /dev/null {str(file_in)}")
     atf.wait_for_job_state(job_id, "DONE")
     tmp_dir_list = os.listdir(tmp_path)
@@ -233,25 +232,39 @@ done""",
     atf.run_job(f"--output={file_out} printenv SLURMD_NODENAME")
     result_out = fpc.get_tmp_file()
     node_name = (tmp_path / result_out).read_text().rstrip()
-    node_host_name = atf.get_node_parameter(node_name, "NodeHostName")
-    node_addr = atf.get_node_parameter(node_name, "NodeAddr")
+    node_host_name = atf.get_node_parameter(node_name, "hostname")
+    node_addr = atf.get_node_parameter(node_name, "address")
     if node_addr != node_host_name and not atf.is_integer(node_addr[0]):
         node_host_name = node_addr
+
+    if atf.get_version("sbin/slurmd") >= (25, 11):
+        # Ticket 23357: Use the node_name instead of hostname in file name creation.
+        expected_name = node_name
+    else:
+        expected_name = node_host_name
+
     assert (
-        re.search(node_host_name, result_out) is not None
-    ), f"%N: Output file ({result_out}) does not contain NodeHostName ({node_host_name})"
+        re.search(expected_name, result_out) is not None
+    ), f"%N: Output file ({result_out}) does not contain the expected node name ({expected_name})"
     fpc.remove_file(result_out)
 
     job_id = atf.submit_job_srun(f"--error={file_err} true")
     node_name = atf.get_job_parameter(job_id, "NodeList")
-    node_host_name = atf.get_node_parameter(node_name, "NodeHostName")
-    node_addr = atf.get_node_parameter(node_name, "NodeAddr")
+    node_host_name = atf.get_node_parameter(node_name, "hostname")
+    node_addr = atf.get_node_parameter(node_name, "address")
     if node_addr != node_host_name and not atf.is_integer(node_addr[0]):
         node_host_name = node_addr
+
+    if atf.get_version("sbin/slurmd") >= (25, 11):
+        # Ticket 23357: Use the node_name instead of hostname in file name creation.
+        expected_name = node_name
+    else:
+        expected_name = node_host_name
+
     result_err = fpc.get_tmp_file()
     assert (
-        re.search(node_host_name, result_err) is not None
-    ), f"%N: Error file ({result_err}) does not contain NodeHostName ({node_host_name})"
+        re.search(expected_name, result_err) is not None
+    ), f"%N: Error file ({result_err}) does not contain the expected node name ({expected_name})"
     fpc.remove_file(result_err)
 
     # Test %A puts the Job array's master job allocation number in the file name
@@ -287,8 +300,8 @@ done""",
 
     # Test %a puts the Job array ID in the file name
     array_size = 2
-    file_out = fpc.create_file_path(f"A.%a")
-    file_err = fpc.create_file_path(f"A.%a", ERROR_TYPE)
+    file_out = fpc.create_file_path("A.%a")
+    file_err = fpc.create_file_path("A.%a", ERROR_TYPE)
     file_in = tmp_path / "file_in.A.a.input"
     atf.make_bash_script(file_in, f"""srun -O --output={file_out} hostname""")
     os.chmod(file_in, 0o0777)

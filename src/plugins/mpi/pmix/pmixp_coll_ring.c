@@ -164,7 +164,7 @@ int pmixp_coll_ring_unpack(buf_t *buf, pmixp_coll_type_t *type,
 	}
 	*nr = nprocs;
 
-	procs = xmalloc(sizeof(pmix_proc_t) * nprocs);
+	procs = xcalloc(nprocs, sizeof(pmix_proc_t));
 	*r = procs;
 
 	/* 3. get namespace/rank of particular process */
@@ -255,7 +255,7 @@ static int _ring_forward_data(pmixp_coll_ring_ctx_t *coll_ctx, uint32_t contrib_
 	hdr.seq = coll_ctx->seq;
 	hdr.hop_seq = hop_seq;
 	hdr.contrib_id = contrib_id;
-	pmixp_ep_t *ep = (pmixp_ep_t*)xmalloc(sizeof(*ep));
+	pmixp_ep_t *ep = xmalloc(sizeof(*ep));
 	pmixp_coll_ring_cbdata_t *cbdata = NULL;
 	uint32_t offset = 0;
 	buf_t *buf = _get_fwd_buf(coll_ctx);
@@ -504,7 +504,7 @@ int pmixp_coll_ring_init(pmixp_coll_t *coll, hostlist_t **hl)
 		coll_ctx->contrib_prev = 0;
 		coll_ctx->state = PMIXP_COLL_RING_SYNC;
 		// TODO bit vector
-		coll_ctx->contrib_map = xmalloc(sizeof(bool) * coll->peers_cnt);
+		coll_ctx->contrib_map = xcalloc(coll->peers_cnt, sizeof(bool));
 	}
 
 	return SLURM_SUCCESS;
@@ -624,8 +624,7 @@ int pmixp_coll_ring_check(pmixp_coll_t *coll, pmixp_coll_ring_msg_hdr_t *hdr)
 		PMIXP_ERROR("Bad collective seq. #%d from %s:%u, current is %d",
 			    hdr->seq, nodename, hdr->nodeid, coll->seq);
 		pmixp_debug_hang(0); /* enable hang to debug this! */
-		slurm_kill_job_step(pmixp_info_jobid(),
-				    pmixp_info_stepid(), SIGKILL, 0);
+		slurm_kill_job_step(pmixp_info_step_id(), SIGKILL, 0);
 		xfree(nodename);
 		return SLURM_SUCCESS;
 	} else if (PMIXP_COLL_REQ_SKIP == rc) {

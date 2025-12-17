@@ -47,6 +47,7 @@
 #include "slurm/slurm_errno.h"
 #include "src/common/slurm_xlator.h"
 
+#include "src/common/threadpool.h"
 #include "src/common/xstring.h"
 #include "src/slurmctld/job_scheduler.h"
 #include "src/slurmctld/locks.h"
@@ -54,45 +55,21 @@
 
 #define _DEBUG 0
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-const char plugin_name[]       	= "Job submit PBS plugin";
-const char plugin_type[]       	= "job_submit/pbs";
-const uint32_t plugin_version   = SLURM_VERSION_NUMBER;
+/* Required Slurm plugin symbols: */
+const char plugin_name[] = "Job submit PBS plugin";
+const char plugin_type[] = "job_submit/pbs";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
 static pthread_mutex_t depend_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-int init (void)
+extern int init(void)
 {
 	return SLURM_SUCCESS;
 }
 
-int fini (void)
+extern void fini(void)
 {
-	return SLURM_SUCCESS;
+	return;
 }
 
 static void _add_env(job_desc_msg_t *job_desc, char *new_env)
@@ -158,7 +135,7 @@ static void *_dep_agent(void *args)
 	    job_ptr->comment && strstr(job_ptr->comment, "on:")) {
 		char *new_depend = job_ptr->details->dependency;
 		job_ptr->details->dependency = NULL;
-		update_job_dependency(job_ptr, new_depend);
+		update_job_dependency(job_ptr, new_depend, false);
 		xfree(new_depend);
 		tok = strstr(job_ptr->comment, "on:");
 		cnt = strtol(tok + 3, &end_ptr, 10);

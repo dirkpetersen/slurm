@@ -56,9 +56,11 @@
 #include "src/common/read_config.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
+#include "src/common/threadpool.h"
 #include "src/common/timers.h"
-#include "src/common/xstring.h"
 #include "src/common/xmalloc.h"
+#include "src/common/xstring.h"
+
 #include "src/scancel/scancel.h"
 
 #define MAX_CANCEL_RETRY 10
@@ -72,7 +74,7 @@ static int  _confirmation(job_info_t *job_ptr, uint32_t step_id,
 			  uint32_t array_id);
 static void _filter_job_records(void);
 static void _load_job_records (void);
-static int  _multi_cluster(List clusters);
+static int _multi_cluster(list_t *clusters);
 static int  _proc_cluster(void);
 static int  _signal_job_by_str(void);
 static int  _verify_job_ids(void);
@@ -85,9 +87,8 @@ typedef struct job_cancel_info {
 	bool     array_flag;
 /* Note: Either set job_id_str OR job_id */
 	char *   job_id_str;
-	uint32_t job_id;
-	uint32_t step_id;
 	uint16_t sig;
+	slurm_step_id_t step_id;
 	int    * rc;
 	int             *num_active_threads;
 	pthread_mutex_t *num_active_threads_lock;
@@ -235,6 +236,7 @@ static int _ctld_signal_jobs(void)
 	char *job_type = "";
 	kill_jobs_msg_t kill_msg = {
 		.account = opt.account,
+		.admin_comment = opt.admin_comment,
 		.job_name = opt.job_name,
 		.jobs_array = opt.job_list,
 		.partition = opt.partition,
@@ -316,8 +318,7 @@ static int _ctld_signal_jobs(void)
 }
 
 /* _multi_cluster - process job cancellation across a list of clusters */
-static int
-_multi_cluster(List clusters)
+static int _multi_cluster(list_t *clusters)
 {
 	list_itr_t *itr;
 	int rc = 0, rc2;
@@ -342,7 +343,11 @@ _proc_cluster(void)
 		rc = _signal_job_by_str();
 		return rc;
 	}
-	if (opt.ctld && !has_job_steps())
+	/*
+	 * TODO:
+	 * Remove sibling restriction once --ctld has this logic implemented.
+	 */
+	if (opt.ctld && !(opt.sibling || has_job_steps() || has_fed_jobs()))
 		return _ctld_signal_jobs();
 
 	_load_job_records();
@@ -407,18 +412,19 @@ static int _verify_job_ids(void)
 	opt.job_pend  = xmalloc(sizeof(bool) * opt.job_cnt);
 	job_ptr = job_buffer_ptr->job_array;
 	for (i = 0; i < job_buffer_ptr->record_count; i++, job_ptr++) {
-		/* NOTE: We re-use the job's "assoc_id" value as a flag to
+		/* NOTE: We reuse the job's "assoc_id" value as a flag to
 		 * record if the job is referenced in the job list supplied
 		 * by the user. */
 		job_ptr->assoc_id = 0;
 		if (IS_JOB_FINISHED(job_ptr))
-			job_ptr->job_id = 0;
-		if (job_ptr->job_id == 0)
+			job_ptr->step_id.job_id = 0;
+		if (job_ptr->step_id.job_id == 0)
 			continue;
 
 		for (j = 0; j < opt.job_cnt; j++) {
 			if (opt.array_id[j] == NO_VAL) {
-				if ((opt.job_id[j] == job_ptr->job_id) ||
+				if ((opt.job_id[j] ==
+				     job_ptr->step_id.job_id) ||
 				    ((opt.job_id[j] == job_ptr->array_job_id) &&
 				     (opt.step_id[j] == SLURM_BATCH_SCRIPT))) {
 					opt.job_found[j] = true;
@@ -439,7 +445,7 @@ static int _verify_job_ids(void)
 			}
 		}
 		if (job_ptr->assoc_id == 0)
-			job_ptr->job_id = 0;
+			job_ptr->step_id.job_id = 0;
 	}
 
 	for (j = 0; j < opt.job_cnt; j++) {
@@ -493,63 +499,63 @@ static void _filter_job_records(void)
 			het_leader = job_ptr;
 
 		if (IS_JOB_FINISHED(job_ptr))
-			job_ptr->job_id = 0;
-		if (job_ptr->job_id == 0)
+			job_ptr->step_id.job_id = 0;
+		if (job_ptr->step_id.job_id == 0)
 			continue;
 
 		job_base_state = job_ptr->job_state & JOB_STATE_BASE;
 		if ((job_base_state != JOB_PENDING) &&
 		    (job_base_state != JOB_RUNNING) &&
 		    (job_base_state != JOB_SUSPENDED)) {
-			job_ptr->job_id = 0;
+			job_ptr->step_id.job_id = 0;
 			continue;
 		}
 
 		if (opt.account &&
 		    xstrcmp(job_ptr->account, opt.account)) {
-			job_ptr->job_id = 0;
+			job_ptr->step_id.job_id = 0;
 			continue;
 		}
 
 		if (opt.job_name &&
 		    xstrcmp(job_ptr->name, opt.job_name)) {
-			job_ptr->job_id = 0;
+			job_ptr->step_id.job_id = 0;
 			continue;
 		}
 
 		if (opt.partition &&
 		    xstrcmp(job_ptr->partition, opt.partition)) {
-			job_ptr->job_id = 0;
+			job_ptr->step_id.job_id = 0;
 			continue;
 		}
 
 		if (opt.qos && xstrcmp(job_ptr->qos, opt.qos)) {
-			job_ptr->job_id = 0;
+			job_ptr->step_id.job_id = 0;
 			continue;
 		}
 
 		if (opt.reservation &&
 		    xstrcmp(job_ptr->resv_name, opt.reservation)) {
-			job_ptr->job_id = 0;
+			job_ptr->step_id.job_id = 0;
 			continue;
 		}
 
 		if ((opt.state != JOB_END) &&
 		    (job_base_state != opt.state)) {
-			job_ptr->job_id = 0;
+			job_ptr->step_id.job_id = 0;
 			continue;
 		}
 
 		if ((opt.user_name) &&
 		    (job_ptr->user_id != opt.user_id)) {
-			job_ptr->job_id = 0;
+			job_ptr->step_id.job_id = 0;
 			continue;
 		}
 
 		if (opt.nodelist) {
 			hostset_t *hs = hostset_create(job_ptr->nodes);
 			if (!hostset_intersects(hs, opt.nodelist)) {
-				job_ptr->job_id = 0;
+				job_ptr->step_id.job_id = 0;
 				hostset_destroy(hs);
 				continue;
 			} else {
@@ -571,12 +577,12 @@ static void _filter_job_records(void)
 				job_key++;
 
 			if (xstrcmp(job_key, opt.wckey) != 0) {
-				job_ptr->job_id = 0;
+				job_ptr->step_id.job_id = 0;
 				continue;
 			}
 		}
 
-		if (het_leader && het_leader->job_id &&
+		if (het_leader && het_leader->step_id.job_id &&
 		    job_ptr->het_job_offset &&
 		    (job_ptr->het_job_id == het_leader->het_job_id)) {
 			/*
@@ -596,7 +602,7 @@ static void _filter_job_records(void)
 			 * job creation time (always leader first) and HetJobs
 			 * are created in a row.
 			 */
-			job_ptr->job_id = 0;
+			job_ptr->step_id.job_id = 0;
 			continue;
 		}
 
@@ -623,7 +629,7 @@ static char *_build_jobid_str(job_info_t *job_ptr, uint32_t array_id)
 		xstrfmtcat(result, "%u_%u",
 			   job_ptr->array_job_id, job_ptr->array_task_id);
 	} else {
-		xstrfmtcat(result, "%u", job_ptr->job_id);
+		xstrfmtcat(result, "%u", job_ptr->step_id.job_id);
 	}
 
 	return result;
@@ -647,8 +653,8 @@ static void _cancel_jobid_by_state(uint32_t job_state, int *rc)
 		job_ptr = job_buffer_ptr->job_array;
 		for (i = 0; i < job_buffer_ptr->record_count; i++, job_ptr++) {
 			if (IS_JOB_FINISHED(job_ptr))
-				job_ptr->job_id = 0;
-			if (job_ptr->job_id == 0)
+				job_ptr->step_id.job_id = 0;
+			if (job_ptr->step_id.job_id == 0)
 				continue;
 			if ((opt.step_id[j] != SLURM_BATCH_SCRIPT) &&
 			    IS_JOB_PENDING(job_ptr)) {
@@ -660,7 +666,8 @@ static void _cancel_jobid_by_state(uint32_t job_state, int *rc)
 
 			opt.job_found[j] = false;
 			if (opt.array_id[j] == NO_VAL) {
-				if ((opt.job_id[j] == job_ptr->job_id) ||
+				if ((opt.job_id[j] ==
+				     job_ptr->step_id.job_id) ||
 				    ((opt.job_id[j] == job_ptr->array_job_id) &&
 				     (opt.step_id[j] == SLURM_BATCH_SCRIPT))) {
 					opt.job_found[j] = true;
@@ -693,8 +700,8 @@ static void _cancel_jobid_by_state(uint32_t job_state, int *rc)
 			}
 			slurm_mutex_unlock(&num_active_threads_lock);
 
-			cancel_info = (job_cancel_info_t *)
-				      xmalloc(sizeof(job_cancel_info_t));
+			cancel_info = xmalloc(sizeof(*cancel_info));
+			cancel_info->step_id = SLURM_STEP_ID_INITIALIZER;
 			cancel_info->rc      = rc;
 			cancel_info->sig     = opt.signal;
 			cancel_info->num_active_threads = &num_active_threads;
@@ -712,12 +719,13 @@ static void _cancel_jobid_by_state(uint32_t job_state, int *rc)
 
 				if (opt.array_id[j] == NO_VAL ||
 				    opt.array_id[j] == INFINITE)
-					job_ptr->job_id = 0;
+					job_ptr->step_id.job_id = 0;
 				else
 					opt.job_id[j] = 0;
 			} else {
-				cancel_info->job_id = job_ptr->job_id;
-				cancel_info->step_id = opt.step_id[j];
+				cancel_info->step_id.job_id =
+					job_ptr->step_id.job_id;
+				cancel_info->step_id.step_id = opt.step_id[j];
 				slurm_thread_create_detached(_cancel_step_id,
 							     cancel_info);
 			}
@@ -752,8 +760,8 @@ _cancel_jobs_by_state(uint32_t job_state, int *rc)
 
 	for (i = 0; i < job_buffer_ptr->record_count; i++, job_ptr++) {
 		if (IS_JOB_FINISHED(job_ptr))
-			job_ptr->job_id = 0;
-		if (job_ptr->job_id == 0)
+			job_ptr->step_id.job_id = 0;
+		if (job_ptr->step_id.job_id == 0)
 			continue;
 
 		if ((job_state < JOB_END) &&
@@ -762,12 +770,12 @@ _cancel_jobs_by_state(uint32_t job_state, int *rc)
 
 		if (opt.interactive &&
 		    (_confirmation(job_ptr, SLURM_BATCH_SCRIPT, NO_VAL) == 0)) {
-			job_ptr->job_id = 0;
+			job_ptr->step_id.job_id = 0;
 			continue;
 		}
 
-		cancel_info = (job_cancel_info_t *)
-			xmalloc(sizeof(job_cancel_info_t));
+		cancel_info = xmalloc(sizeof(*cancel_info));
+		cancel_info->step_id = SLURM_STEP_ID_INITIALIZER;
 		cancel_info->job_id_str = _build_jobid_str(job_ptr, NO_VAL);
 		cancel_info->rc      = rc;
 		cancel_info->sig     = opt.signal;
@@ -786,7 +794,7 @@ _cancel_jobs_by_state(uint32_t job_state, int *rc)
 		slurm_mutex_unlock(&num_active_threads_lock);
 
 		slurm_thread_create_detached(_cancel_job_id, cancel_info);
-		job_ptr->job_id = 0;
+		job_ptr->step_id.job_id = 0;
 
 		if (opt.interactive) {
 			/* Print any error message for first job before
@@ -875,7 +883,7 @@ static void *
 _cancel_job_id (void *ci)
 {
 	int error_code = SLURM_SUCCESS, i;
-	job_cancel_info_t *cancel_info = (job_cancel_info_t *)ci;
+	job_cancel_info_t *cancel_info = ci;
 	uint16_t flags = 0;
 	char *job_type = "";
 	DEF_TIMERS;
@@ -896,7 +904,7 @@ _cancel_job_id (void *ci)
 				   cancel_info->array_task_id);
 		} else {
 			xstrfmtcat(cancel_info->job_id_str, "%u",
-				   cancel_info->job_id);
+				   cancel_info->step_id.job_id);
 		}
 	}
 
@@ -913,7 +921,7 @@ _cancel_job_id (void *ci)
 
 		END_TIMER;
 		slurm_mutex_lock(&max_delay_lock);
-		max_resp_time = MAX(max_resp_time, DELTA_TIMER);
+		max_resp_time = MAX(max_resp_time, TIMER_DURATION_USEC());
 		slurm_mutex_unlock(&max_delay_lock);
 
 		if ((error_code == 0) ||
@@ -923,12 +931,12 @@ _cancel_job_id (void *ci)
 		sleep(5 + i);
 	}
 	if (error_code) {
-		error_code = slurm_get_errno();
+		error_code = errno;
 		if ((opt.verbose > 0) ||
 		    ((error_code != ESLURM_ALREADY_DONE) &&
 		     (error_code != ESLURM_INVALID_JOB_ID))) {
 			_log_kill_job_error(cancel_info->job_id_str,
-					    slurm_strerror(slurm_get_errno()));
+					    slurm_strerror(error_code));
 		}
 		if (((error_code == ESLURM_ALREADY_DONE) ||
 		     (error_code == ESLURM_INVALID_JOB_ID)) &&
@@ -955,9 +963,7 @@ static void *
 _cancel_step_id (void *ci)
 {
 	int error_code = SLURM_SUCCESS, i;
-	job_cancel_info_t *cancel_info = (job_cancel_info_t *)ci;
-	uint32_t job_id  = cancel_info->job_id;
-	uint32_t step_id = cancel_info->step_id;
+	job_cancel_info_t *cancel_info = ci;
 	bool sig_set = true;
 	DEF_TIMERS;
 
@@ -977,33 +983,37 @@ _cancel_step_id (void *ci)
 				   cancel_info->array_task_id);
 		} else {
 			xstrfmtcat(cancel_info->job_id_str, "%u",
-				   cancel_info->job_id);
+				   cancel_info->step_id.job_id);
 		}
 	}
 
 	for (i = 0; i < MAX_CANCEL_RETRY; i++) {
 		if (cancel_info->sig == SIGKILL) {
 			verbose("Terminating step %s.%u",
-				cancel_info->job_id_str, step_id);
+				cancel_info->job_id_str,
+				cancel_info->step_id.step_id);
 		} else {
 			verbose("Signal %u to step %s.%u",
 				cancel_info->sig,
-				cancel_info->job_id_str, step_id);
+				cancel_info->job_id_str,
+				cancel_info->step_id.step_id);
 		}
 
 		_add_delay();
 		START_TIMER;
 		if ((!sig_set) || opt.ctld)
-			error_code = slurm_kill_job_step(job_id, step_id,
+			error_code = slurm_kill_job_step(&cancel_info->step_id,
 							 cancel_info->sig, 0);
 		else if (cancel_info->sig == SIGKILL)
-			error_code = slurm_terminate_job_step(job_id, step_id);
+			error_code =
+				slurm_terminate_job_step(&cancel_info->step_id);
 		else
-			error_code = slurm_signal_job_step(job_id, step_id,
-							   cancel_info->sig);
+			error_code =
+				slurm_signal_job_step(&cancel_info->step_id,
+						      cancel_info->sig);
 		END_TIMER;
 		slurm_mutex_lock(&max_delay_lock);
-		max_resp_time = MAX(max_resp_time, DELTA_TIMER);
+		max_resp_time = MAX(max_resp_time, TIMER_DURATION_USEC());
 		slurm_mutex_unlock(&max_delay_lock);
 
 		if ((error_code == 0) ||
@@ -1014,11 +1024,11 @@ _cancel_step_id (void *ci)
 		sleep(5 + i);
 	}
 	if (error_code) {
-		error_code = slurm_get_errno();
+		error_code = errno;
 		if ((opt.verbose > 0) || (error_code != ESLURM_ALREADY_DONE))
 			error("Kill job error on job step id %s: %s",
 		 	      cancel_info->job_id_str,
-			      slurm_strerror(slurm_get_errno()));
+			      slurm_strerror(error_code));
 
 		if ((error_code == ESLURM_ALREADY_DONE) &&
 		    (cancel_info->sig == SIGKILL)) {
@@ -1077,8 +1087,8 @@ static int _signal_job_by_str(void)
 	slurm_cond_init(&num_active_threads_cond, NULL);
 
 	for (i = 0; opt.job_list[i]; i++) {
-		cancel_info = (job_cancel_info_t *)
-			xmalloc(sizeof(job_cancel_info_t));
+		cancel_info = xmalloc(sizeof(*cancel_info));
+		cancel_info->step_id = SLURM_STEP_ID_INITIALIZER;
 		cancel_info->job_id_str = xstrdup(opt.job_list[i]);
 		cancel_info->rc      = &rc;
 		cancel_info->sig     = opt.signal;

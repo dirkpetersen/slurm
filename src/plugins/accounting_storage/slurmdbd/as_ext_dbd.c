@@ -34,6 +34,7 @@
 \*****************************************************************************/
 
 #include "src/common/slurm_xlator.h"
+#include "src/common/threadpool.h"
 
 #include "src/interfaces/accounting_storage.h"
 
@@ -44,7 +45,7 @@
 #include "dbd_conn.h"
 #include "as_ext_dbd.h"
 
-static List ext_conns_list;
+static list_t *ext_conns_list;
 static pthread_t ext_thread_tid = 0;
 static time_t ext_shutdown = 0;
 
@@ -57,12 +58,12 @@ static pthread_mutex_t ext_thread_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void _destroy_external_host_conns(void *object)
 {
-	persist_conn_t *conn = object;
+	persist_conn_t *pcon = object;
 	/*
 	 * Don't call dbd_conn_close() to prevent DBD_FINI being sent to
 	 * external DBDs.
 	 */
-	slurm_persist_conn_destroy(conn);
+	slurm_persist_conn_destroy(pcon);
 }
 
 /* don't connect now as it will block the ctld */
@@ -101,7 +102,7 @@ static void _create_ext_conns(void)
 {
 	char *ext_hosts;
 	char *tok = NULL, *save_ptr = NULL;
-	List new_list = list_create(_destroy_external_host_conns);
+	list_t *new_list = list_create(_destroy_external_host_conns);
 
 	if ((ext_hosts = xstrdup(slurm_conf.accounting_storage_ext_host)))
 		tok = strtok_r(ext_hosts, ",", &save_ptr);

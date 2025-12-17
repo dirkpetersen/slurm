@@ -38,17 +38,6 @@
 #include "src/common/xstring.h"
 #include <math.h>
 
-typedef struct slurm_conf_block {
-	char *block_name; /* name of this block */
-	char *nodes; /* names of nodes directly connect to this block */
-} slurm_conf_block_t;
-
-bitstr_t *blocks_nodes_bitmap = NULL;	/* nodes on any bblock */
-block_record_t *block_record_table = NULL;
-uint16_t bblock_node_cnt = 0;
-bitstr_t *block_levels = NULL;
-int block_record_cnt = 0;
-
 static s_p_hashtbl_t *conf_hashtbl = NULL;
 
 static void _destroy_block(void *ptr)
@@ -81,20 +70,14 @@ static int _parse_block(void **dest, slurm_parser_enum_t type,
 	s_p_get_string(&b->nodes, "Nodes", tbl);
 	s_p_hashtbl_destroy(tbl);
 
-	if (!b->nodes) {
-		error("block %s hasn't got nodes",
-		      b->block_name);
-		_destroy_block(b);
-		return -1;
-	}
-
 	*dest = (void *)b;
 
 	return 1;
 }
 
 /* Return count of block configuration entries read */
-static int _read_topo_file(slurm_conf_block_t **ptr_array[])
+static int _read_topo_file(slurm_conf_block_t **ptr_array[], char *topo_conf,
+			   block_context_t *ctx)
 {
 	static s_p_options_t block_options[] = {
 		{"BlockName", S_P_ARRAY, _parse_block, _destroy_block},
@@ -116,11 +99,11 @@ static int _read_topo_file(slurm_conf_block_t **ptr_array[])
 		      topo_conf);
 	}
 
-	FREE_NULL_BITMAP(block_levels);
-	block_levels = bit_alloc(16);
+	FREE_NULL_BITMAP(ctx->block_levels);
+	ctx->block_levels = bit_alloc(MAX_BLOCK_LEVELS);
 
 	if (!s_p_get_string(&tmp_str, "BlockSizes", conf_hashtbl)) {
-		bit_nset(block_levels, 0, 4);
+		bit_nset(ctx->block_levels, 0, 4);
 	} else {
 		char *save_ptr = NULL;
 		char *str_bsize = strtok_r(tmp_str, ",", &save_ptr);
@@ -131,13 +114,13 @@ static int _read_topo_file(slurm_conf_block_t **ptr_array[])
 			bsize = atoi(str_bsize);
 			if (bsize <= 0)
 				break;
-			if (!bblock_node_cnt)
-				bblock_node_cnt = bsize;
-			if (bsize % bblock_node_cnt) {
+			if (!ctx->bblock_node_cnt)
+				ctx->bblock_node_cnt = bsize;
+			if (bsize % ctx->bblock_node_cnt) {
 				bsize = -1;
 				break;
 			}
-			block_level = bsize / bblock_node_cnt;
+			block_level = bsize / ctx->bblock_node_cnt;
 			tmp = log2(block_level);
 			if (tmp != floor(tmp)) {
 				bsize = -1;
@@ -149,13 +132,13 @@ static int _read_topo_file(slurm_conf_block_t **ptr_array[])
 				bsize = -1;
 				break;
 			}
-			bit_set(block_levels, block_level);
+			bit_set(ctx->block_levels, block_level);
 
 			str_bsize = strtok_r(NULL, ",", &save_ptr);
 		}
-		if (bsize < 0) {
+		if (bsize <= 0) {
 			s_p_hashtbl_destroy(conf_hashtbl);
-			fatal("Invalid BlockLevels");
+			fatal("Invalid BlockSizes value: %s", str_bsize);
 		}
 	}
 	xfree(tmp_str);
@@ -169,111 +152,146 @@ static int _read_topo_file(slurm_conf_block_t **ptr_array[])
 	return count;
 }
 
-static void _log_blocks(void)
+static void _log_blocks(block_context_t *ctx)
 {
 	int i;
 	block_record_t *block_ptr;
 
-	block_ptr = block_record_table;
-	for (i = 0; i < block_record_cnt; i++, block_ptr++) {
+	block_ptr = ctx->block_record_table;
+	for (i = 0; i < ctx->block_count; i++, block_ptr++) {
 		debug("Block name:%s nodes:%s",
+		      block_ptr->name, block_ptr->nodes);
+	}
+
+	for (i = 0; i < ctx->ablock_count; i++, block_ptr++) {
+		debug("Aggregated Block name:%s nodes:%s",
 		      block_ptr->name, block_ptr->nodes);
 	}
 }
 
-/*
- * _node_name2bitmap - given a node name regular expression, build a bitmap
- *	representation, any invalid hostnames are added to a hostlist
- * IN node_names  - set of node namess
- * OUT bitmap     - set to bitmap, may not have all bits set on error
- * IN/OUT invalid_hostlist - hostlist of invalid host names, initialize to NULL
- * RET 0 if no error, otherwise EINVAL
- * NOTE: call FREE_NULL_BITMAP(bitmap) and hostlist_destroy(invalid_hostlist)
- *       to free memory when variables are no longer required
- */
-static int _node_name2bitmap(char *node_names, bitstr_t **bitmap,
-			     hostlist_t **invalid_hostlist)
+extern void block_record_table_destroy(block_context_t *ctx)
 {
-	char *this_node_name;
-	bitstr_t *my_bitmap;
-	hostlist_t *host_list;
-
-	my_bitmap = bit_alloc(node_record_count);
-	*bitmap = my_bitmap;
-
-	if (!node_names) {
-		error("_node_name2bitmap: node_names is NULL");
-		return EINVAL;
-	}
-
-	if (!(host_list = hostlist_create(node_names))) {
-		/* likely a badly formatted hostlist */
-		error("_node_name2bitmap: hostlist_create(%s) error",
-		      node_names);
-		return EINVAL;
-	}
-
-	while ((this_node_name = hostlist_shift(host_list)) ) {
-		node_record_t *node_ptr;
-		node_ptr = find_node_record(this_node_name);
-		if (node_ptr) {
-			bit_set(my_bitmap, node_ptr->index);
-		} else {
-			debug2("invalid node specified %s", this_node_name);
-			if (*invalid_hostlist) {
-				hostlist_push_host(*invalid_hostlist,
-						   this_node_name);
-			} else {
-				*invalid_hostlist =
-					hostlist_create(this_node_name);
-			}
-		}
-		free(this_node_name);
-	}
-	hostlist_destroy(host_list);
-
-	return SLURM_SUCCESS;
-}
-
-extern void block_record_table_destroy(void)
-{
-	if (!block_record_table)
+	if (!ctx->block_record_table)
 		return;
 
-	for (int i = 0; i < block_record_cnt; i++) {
-		xfree(block_record_table[i].name);
-		xfree(block_record_table[i].nodes);
-		FREE_NULL_BITMAP(block_record_table[i].node_bitmap);
+	for (int i = 0; i < ctx->block_count + ctx->ablock_count; i++) {
+		xfree(ctx->block_record_table[i].name);
+		xfree(ctx->block_record_table[i].nodes);
+		FREE_NULL_BITMAP(ctx->block_record_table[i].node_bitmap);
 	}
-	xfree(block_record_table);
-	block_record_cnt = 0;
+	xfree(ctx->block_record_table);
+	FREE_NULL_BITMAP(ctx->block_levels);
+	ctx->block_count = 0;
+	ctx->block_sizes_cnt = 0;
+	ctx->ablock_count = 0;
 }
 
-extern void block_record_validate(void)
+static int _cmp_block_level(const void *x, const void *y)
 {
-	slurm_conf_block_t *ptr, **ptr_array;
+	const block_record_t *b1 = x, *b2 = y;
+
+	if (b1->level > b2->level)
+		return 1;
+	else if (b1->level < b2->level)
+		return -1;
+	return 0;
+}
+
+static int _list_to_bitmap(void *x, void *arg)
+{
+	int *size = x;
+	block_context_t *ctx = arg;
+	int block_level;
+	double tmp;
+
+	if (*size <= 0)
+		return 1;
+
+	if (!ctx->bblock_node_cnt)
+		ctx->bblock_node_cnt = *size;
+
+	if (*size % ctx->bblock_node_cnt)
+		return 1;
+
+	block_level = *size / ctx->bblock_node_cnt;
+	tmp = log2(block_level);
+
+	if (tmp != floor(tmp))
+		return 1;
+
+	block_level = tmp;
+
+	if (block_level >= MAX_BLOCK_LEVELS)
+		return 1;
+
+	bit_set(ctx->block_levels, block_level);
+
+	return 0;
+}
+
+extern int block_record_validate(topology_ctx_t *tctx)
+{
+	slurm_conf_block_t *ptr, **ptr_array, **ptr_array_mem = NULL;
 	int i, j;
 	block_record_t *block_ptr, *prior_ptr;
 	hostlist_t *invalid_hl = NULL;
 	char *buf;
+	int level = 0;
+	int record_inx = 0;
+	int *aggregated_inx;
+	block_context_t *ctx = xmalloc(sizeof(*ctx));
 
-	block_record_table_destroy();
+	if (tctx->config) {
+		topology_block_config_t *block_config = tctx->config;
+		ctx->block_count = block_config->config_cnt;
+		ptr_array_mem =
+			xcalloc(ctx->block_count, sizeof(*ptr_array_mem));
+		ptr_array = ptr_array_mem;
+		for (int i = 0; i < ctx->block_count; i++)
+			ptr_array[i] = &block_config->block_configs[i];
 
-	block_record_cnt = _read_topo_file(&ptr_array);
-	if (block_record_cnt == 0) {
-		error("No blocks configured");
-		s_p_hashtbl_destroy(conf_hashtbl);
-		return;
+		ctx->block_levels = bit_alloc(MAX_BLOCK_LEVELS);
+
+		if (!list_count(block_config->block_sizes)) {
+			bit_nset(ctx->block_levels, 0, 4);
+		} else {
+			if (list_for_each(block_config->block_sizes,
+					  _list_to_bitmap, ctx) < 0) {
+				fatal("Invalid BlockSizes value in topology %s",
+				      tctx->name);
+			}
+			bit_set(ctx->block_levels, 0);
+		}
+
+	} else {
+		ctx->block_count =
+			_read_topo_file(&ptr_array, tctx->topo_conf, ctx);
 	}
 
-	block_record_table = xcalloc(block_record_cnt,
-				     sizeof(block_record_t));
-	block_ptr = block_record_table;
-	for (i = 0; i < block_record_cnt; i++, block_ptr++) {
+	if (ctx->block_count == 0) {
+		s_p_hashtbl_destroy(conf_hashtbl);
+		FREE_NULL_BITMAP(ctx->block_levels);
+		xfree(ctx);
+		xfree(ptr_array_mem);
+		fatal("No blocks configured, failed to create context for topology plugin");
+	}
+	/*
+	 *  Allocate more than enough space for all aggregated blocks
+	 */
+	ctx->block_record_table =
+		xcalloc((2 * ctx->block_count + MAX_BLOCK_LEVELS),
+			sizeof(block_record_t));
+	block_ptr = ctx->block_record_table;
+	for (i = 0; i < ctx->block_count; i++, block_ptr++) {
 		ptr = ptr_array[i];
+
+		if (!ptr->block_name) {
+			fatal("Can't create a block without a name");
+		}
+
 		block_ptr->name = xstrdup(ptr->block_name);
 		/* See if block name has already been defined. */
-		prior_ptr = block_record_table;
+		prior_ptr = ctx->block_record_table;
 		for (j = 0; j < i; j++, prior_ptr++) {
 			if (xstrcmp(block_ptr->name, prior_ptr->name) == 0) {
 				fatal("Block (%s) has already been defined",
@@ -285,48 +303,47 @@ extern void block_record_validate(void)
 
 		if (ptr->nodes) {
 			block_ptr->nodes = xstrdup(ptr->nodes);
-			if (_node_name2bitmap(ptr->nodes,
-					      &block_ptr->node_bitmap,
-					      &invalid_hl)) {
-				fatal("Invalid node name (%s) in block "
-				      "config (%s)",
+			if (node_name2bitmap(ptr->nodes, true,
+					     &block_ptr->node_bitmap,
+					     &invalid_hl)) {
+				fatal("Invalid node name (%s) in block config (%s)",
 				      ptr->nodes, ptr->block_name);
 			}
-			if (blocks_nodes_bitmap) {
-				bit_or(blocks_nodes_bitmap,
+			if (ctx->blocks_nodes_bitmap) {
+				bit_or(ctx->blocks_nodes_bitmap,
 				       block_ptr->node_bitmap);
 			} else {
-				blocks_nodes_bitmap = bit_copy(block_ptr->
-							       node_bitmap);
+				ctx->blocks_nodes_bitmap =
+					bit_copy(block_ptr->node_bitmap);
 			}
-			if (bblock_node_cnt == 0) {
-				bblock_node_cnt =
+			if (ctx->bblock_node_cnt == 0) {
+				ctx->bblock_node_cnt =
 					bit_set_count(block_ptr->node_bitmap);
-			} else if (bit_set_count(block_ptr->node_bitmap) <
-				   bblock_node_cnt) {
-				fatal("Block configuration (%s) children count lower than bblock_node_cnt",
-				      ptr->block_name);
 			}
+
 		} else {
-			fatal("Block configuration (%s) lacks children",
-			      ptr->block_name);
+			block_ptr->node_bitmap = bit_alloc(node_record_count);
 		}
 	}
-
-	if (blocks_nodes_bitmap) {
-		i = bit_clear_count(blocks_nodes_bitmap);
+	if (!ctx->bblock_node_cnt)
+		fatal("Blocks do not contain any nodes and the BlockSizes are not set");
+	if (ctx->blocks_nodes_bitmap) {
+		i = bit_clear_count(ctx->blocks_nodes_bitmap);
 		if (i > 0) {
 			char *tmp_nodes;
-			bitstr_t *tmp_bitmap = bit_copy(blocks_nodes_bitmap);
+			bitstr_t *tmp_bitmap =
+				bit_copy(ctx->blocks_nodes_bitmap);
 			bit_not(tmp_bitmap);
 			tmp_nodes = bitmap2node_name(tmp_bitmap);
-			warning("blocks lack access to %d nodes: %s",
+			warning("Blocks lack access to %d nodes: %s",
 				i, tmp_nodes);
 			xfree(tmp_nodes);
 			FREE_NULL_BITMAP(tmp_bitmap);
 		}
-	} else
-		fatal("blocks contain no nodes");
+	} else {
+		ctx->blocks_nodes_bitmap = bit_alloc(node_record_count);
+		warning("Blocks do not contain any nodes");
+	}
 
 	if (invalid_hl) {
 		buf = hostlist_ranged_string_xmalloc(invalid_hl);
@@ -335,6 +352,95 @@ extern void block_record_validate(void)
 		hostlist_destroy(invalid_hl);
 	}
 
+	while ((level = bit_ffs_from_bit(ctx->block_levels, level)) >= 0) {
+		if ((ctx->block_sizes[ctx->block_sizes_cnt++] = (1 << level)) >=
+		    ctx->block_count)
+			break;
+
+		level++;
+	}
+
+	ctx->blocks_nodes_cnt = bit_set_count(ctx->blocks_nodes_bitmap);
+
 	s_p_hashtbl_destroy(conf_hashtbl);
-	_log_blocks();
+
+	aggregated_inx = xcalloc(ctx->block_sizes_cnt, sizeof(int));
+	record_inx = ctx->block_count;
+
+	for (i = 0; i < ctx->block_count; i++) {
+		for (j = 1; j < ctx->block_sizes_cnt; j++) {
+			if (!(i % ctx->block_sizes[j])) {
+				int remaining_blocks = (ctx->block_count - i);
+
+				if ((ctx->block_sizes[j] > remaining_blocks) &&
+				    (ctx->block_sizes[j - 1] >=
+				     remaining_blocks)) {
+					aggregated_inx[j] = -1;
+					continue;
+				}
+				ctx->block_record_table[record_inx]
+					.block_index = record_inx;
+				ctx->block_record_table[record_inx].name =
+					xstrdup(ctx->block_record_table[i]
+							.name);
+				ctx->block_record_table[record_inx]
+					.node_bitmap =
+					bit_copy(ctx->block_record_table[i]
+							 .node_bitmap);
+				ctx->block_record_table[record_inx].level = j;
+				aggregated_inx[j] = record_inx;
+				record_inx++;
+			} else {
+				int tmp = aggregated_inx[j];
+				if (tmp < 0)
+					continue;
+				xstrfmtcat(ctx->block_record_table[tmp].name,
+					   ",%s",
+					   ctx->block_record_table[i].name);
+				bit_or(ctx->block_record_table[tmp].node_bitmap,
+				       ctx->block_record_table[i].node_bitmap);
+			}
+		}
+	}
+	xfree(aggregated_inx);
+
+	ctx->ablock_count = (record_inx - ctx->block_count);
+
+	qsort(ctx->block_record_table + ctx->block_count, ctx->ablock_count,
+	      sizeof(block_record_t), _cmp_block_level);
+
+	for (i = ctx->block_count; i < record_inx; i++) {
+		char *tmp_list = ctx->block_record_table[i].name;
+		hostlist_t *hl = hostlist_create(tmp_list);
+
+		if (hl == NULL)
+			fatal("Invalid BlockName: %s", tmp_list);
+
+		ctx->block_record_table[i].name =
+			hostlist_ranged_string_xmalloc(hl);
+		ctx->block_record_table[i].nodes =
+			bitmap2node_name(ctx->block_record_table[i]
+						 .node_bitmap);
+
+		hostlist_destroy(hl);
+		xfree(tmp_list);
+	}
+
+	_log_blocks(ctx);
+	tctx->plugin_ctx = ctx;
+	xfree(ptr_array_mem);
+	return SLURM_SUCCESS;
+}
+
+extern void block_record_update_block_config(topology_ctx_t *tctx, int idx)
+{
+	topology_block_config_t *block_config = tctx->config;
+	block_context_t *ctx = tctx->plugin_ctx;
+
+	if (!tctx->config)
+		return;
+
+	xfree(block_config->block_configs[idx].nodes);
+	block_config->block_configs[idx].nodes =
+		xstrdup(ctx->block_record_table[idx].nodes);
 }

@@ -6,7 +6,7 @@
 #
 # NOTE:    This assumes node names are of the form <alpha><number>, where
 #          the value of <number> indicates the nodes relative location.
-#          Change tha node name parsing logic as needed for other formats.
+#          Change the node name parsing logic as needed for other formats.
 ############################################################################
 # Copyright (C) 2002-2006 The Regents of the University of California.
 # Produced at Lawrence Livermore National Laboratory (cf, DISCLAIMER).
@@ -32,10 +32,6 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
 ############################################################################
 source ./globals
-
-if {[get_config_param "FrontendName"] ne "MISSING"} {
-	skip "This test is incompatible with FRONT_END systems"
-}
 
 # Various configurations allocate nodes, sockets, cores, cpus or threads;
 # not all of which are compatible with this test

@@ -80,6 +80,16 @@ typedef struct {
 #define remaining_buf(__buf)		(__buf->size - __buf->processed)
 #define size_buf(__buf)			(__buf->size)
 
+/* Initialize shadow buffer to point at data with size of bytes */
+#define SHADOW_BUF_INITIALIZER(data, bytes) \
+	(buf_t) { \
+		.magic = BUF_MAGIC, \
+		.head = (char *) (data), \
+		.size = (bytes), \
+		.processed = (bytes), \
+		.shadow = true, \
+	}
+
 typedef struct {
 	buf_t *header;
 	buf_t *auth;
@@ -115,13 +125,6 @@ extern int try_grow_buf(buf_t *buffer, uint32_t size);
  */
 extern int try_grow_buf_remaining(buf_t *buffer, uint32_t size);
 extern void *xfer_buf_data(buf_t *my_buf);
-/*
- * Swap data between two buffers
- * IN x - pointer to buffer to swap
- * IN y - pointer to buffer to swap
- * RET SLURM_SUCCESS or error
- */
-extern int swap_buf_data(buf_t *x, buf_t *y);
 
 extern void pack_time(time_t val, buf_t *buffer);
 extern int unpack_time(time_t *valp, buf_t *buffer);
@@ -178,6 +181,10 @@ extern int unpackstr_xmalloc_escaped(char **valp, uint32_t *size_valp,
 				     buf_t *buffer);
 extern int unpackstr_xmalloc_chooser(char **valp, uint32_t *size_valp,
 				     buf_t *buffer);
+extern void packstr_func(void *str, uint16_t protocol_version, buf_t *buffer);
+extern int safe_unpackstr_func(void **object,
+			       uint16_t protocol_version,
+			       buf_t *buffer);
 
 extern void packstr_array(char **valp, uint32_t size_val, buf_t *buffer);
 extern int unpackstr_array(char ***valp, uint32_t* size_val, buf_t *buffer);
@@ -330,12 +337,12 @@ extern int unpackmem_array(char *valp, uint32_t size_valp, buf_t *buffer);
 
 #define unpack_bit_str_hex(bitmap,buf) do {				\
 	char *tmp_str = NULL;						\
-	uint32_t _size, _tmp_uint32;					\
+	uint32_t _size;							\
 	xassert(*bitmap == NULL);					\
 	xassert(buf->magic == BUF_MAGIC);				\
 	safe_unpack32(&_size, buf);					\
 	if (_size != NO_VAL) {						\
-		safe_unpackstr_xmalloc(&tmp_str, &_tmp_uint32, buf);	\
+		safe_unpackstr(&tmp_str, buf);	\
 		if (_size) {						\
 			*bitmap = bit_alloc(_size);			\
 			if (bit_unfmt_hexmask(*bitmap, tmp_str)) {	\

@@ -3,11 +3,12 @@
 ############################################################################
 
 import atf
-import os
+
+# import os
 import pytest
 import re
 
-user_name = atf.get_user_name()
+user_name = atf.properties["test-user"]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -128,7 +129,7 @@ def test_file_io_options(
     # Build job script that will make content for both output and error files
     atf.make_bash_script(
         "original_in_file",
-        f"""
+        """
         id
         sleep aaa
         """,

@@ -1,5 +1,5 @@
 /*****************************************************************************\
- *  data_t parser plugin interface
+ *  data.h - data_t parser plugin interface
  *****************************************************************************
  *  Copyright (C) SchedMD LLC.
  *
@@ -63,7 +63,7 @@ typedef enum {
 	DATA_PARSER_UINT16_NO_VAL_STRUCT, /* UINT16_NO_VAL_t */
 	DATA_PARSER_UINT16_NO_VAL_STRUCT_PTR, /* UINT16_NO_VAL_t* */
 	DATA_PARSER_UINT32, /* uint32_t */
-	DATA_PARSER_UINT32_NO_VAL, /* uint32_t - maybe NO_VAL or INFINTE*/
+	DATA_PARSER_UINT32_NO_VAL, /* uint32_t - maybe NO_VAL or INFINITE*/
 	DATA_PARSER_UINT32_NO_VAL_STRUCT, /* UINT32_NO_VAL_t */
 	DATA_PARSER_UINT32_NO_VAL_STRUCT_PTR, /* UINT32_NO_VAL_t* */
 	DATA_PARSER_UINT64, /* uint64_t */
@@ -71,6 +71,8 @@ typedef enum {
 	DATA_PARSER_UINT64_NO_VAL_STRUCT, /* UINT64_NO_VAL_t */
 	DATA_PARSER_UINT64_NO_VAL_STRUCT_PTR, /* UINT64_NO_VAL_t* */
 	DATA_PARSER_INT32, /* int32_t */
+	DATA_PARSER_INT32_PTR, /* int32_t* */
+	DATA_PARSER_INT32_LIST, /* list_t* int32_t* */
 	DATA_PARSER_INT64, /* int64_t */
 	DATA_PARSER_INT64_NO_VAL, /* int64_t - NO_VAL64 or INFINTE64 */
 	DATA_PARSER_INT64_NO_VAL_STRUCT, /* INT64_NO_VAL_t */
@@ -99,9 +101,6 @@ typedef enum {
 	DATA_PARSER_OPENAPI_ACCOUNT_QUERY_PTR, /* openapi_account_query_t* */
 	DATA_PARSER_ACCOUNT_CONDITION, /* slurmdb_account_cond_t */
 	DATA_PARSER_ACCOUNT_CONDITION_PTR, /* slurmdb_account_cond_t* */
-	DATA_PARSER_ACCOUNT_CONDITION_WITH_ASSOC_V40, /* slurmdb_account_cond_t->flags&SLURMDB_ACCT_FLAG_WASSOC - TODO: Remove with v0.0.40 */
-	DATA_PARSER_ACCOUNT_CONDITION_WITH_WCOORD_V40, /* slurmdb_account_cond_t->flags&SLURMDB_ACCT_FLAG_WCOORD - TODO: Remove with v0.0.40 */
-	DATA_PARSER_ACCOUNT_CONDITION_WITH_DELETED_V40, /* slurmdb_account_cond_t->flags&SLURMDB_ACCT_FLAG_DELETED - TODO: Remove with v0.0.40 */
 	DATA_PARSER_ACCOUNT_LIST, /* list of slurmdb_account_rec_t* */
 	DATA_PARSER_ACCOUNT, /* slurmdb_account_rec_t */
 	DATA_PARSER_ACCOUNT_PTR, /* slurmdb_account_rec_t* */
@@ -126,6 +125,7 @@ typedef enum {
 	DATA_PARSER_ASSOC, /* slurmdb_assoc_rec_t */
 	DATA_PARSER_ASSOC_PTR, /* slurmdb_assoc_rec_t* */
 	DATA_PARSER_ASSOC_FLAGS, /* slurmdb_assoc_flags_t */
+	DATA_PARSER_ASSOC_CONDITION_FLAGS, /* slurmdb_assoc_cond_t->flags & ASSOC_FLAG_COND_* */
 	DATA_PARSER_ASSOC_USAGE, /* slurmdb_assoc_usage_t */
 	DATA_PARSER_ASSOC_USAGE_PTR, /* slurmdb_assoc_usage_t* */
 	DATA_PARSER_ASSOC_REC_SET, /* slurmdb_assoc_rec_t */
@@ -134,8 +134,7 @@ typedef enum {
 	DATA_PARSER_OPENAPI_ASSOCS_REMOVED_RESP_PTR, /* openapi_resp_single_t* */
 	DATA_PARSER_ASSOC_CONDITION, /* slurmdb_assoc_cond_t */
 	DATA_PARSER_ASSOC_CONDITION_PTR, /* slurmdb_assoc_cond_t* */
-	DATA_PARSER_CLASSIFICATION_TYPE, /* slurmdb_classification_type_t */
-	DATA_PARSER_CLUSTER_ACCT_REC_LIST, /* list of slurmdb_cluster_accounting_rec_t* */
+	DATA_PARSER_CLUSTER_ACCT_REC_LIST, /* list of slurmdb_cluster_accounting_rec_t* - REMOVED: v0.0.45 */
 	DATA_PARSER_CLUSTER_ACCT_REC, /* slurmdb_cluster_accounting_rec_t */
 	DATA_PARSER_CLUSTER_ACCT_REC_PTR, /* slurmdb_cluster_accounting_rec_t* */
 	DATA_PARSER_CLUSTER_CLASSIFICATION, /* uint16_t joined with slurmdb_classification_type_t */
@@ -171,6 +170,12 @@ typedef enum {
 	DATA_PARSER_JOB_LIST, /* list of slurmdb_job_rec_t* */
 	DATA_PARSER_JOB, /* slurmdb_job_rec_t */
 	DATA_PARSER_JOB_PTR, /* slurmdb_job_rec_t* */
+	DATA_PARSER_JOB_MODIFY, /* slurmdb_job_rec_t */
+	DATA_PARSER_JOB_MODIFY_PTR, /* slurmdb_job_rec_t */
+	DATA_PARSER_OPENAPI_JOB_MODIFY_REQ, /* openapi_resp_single_t */
+	DATA_PARSER_OPENAPI_JOB_MODIFY_REQ_PTR, /* openapi_resp_single_t */
+	DATA_PARSER_OPENAPI_JOB_MODIFY_RESP, /* list of strings in openapi_resp_single_t */
+	DATA_PARSER_OPENAPI_JOB_MODIFY_RESP_PTR, /* list of strings in openapi_resp_single_t */
 	DATA_PARSER_JOB_ASSOC_ID, /* slurmdb_job_rec_t->associd,cluster */
 	DATA_PARSER_JOB_CONDITION, /* slurmdb_job_cond_t */
 	DATA_PARSER_JOB_CONDITION_FLAGS, /* uint32_t - JOBCOND_FLAG_* */
@@ -195,6 +200,9 @@ typedef enum {
 	DATA_PARSER_STEP_INFO, /* job_step_info_t */
 	DATA_PARSER_STEP_INFO_PTR, /* job_step_info_t* */
 	DATA_PARSER_STEP_INFO_ARRAY, /* job_step_info_t* */
+	DATA_PARSER_STEP_INFO_STDIN_EXP, /* step_job_info_t->std_in (handles all pattern replacements) */
+	DATA_PARSER_STEP_INFO_STDOUT_EXP, /* step_job_info_t->std_out (handles all pattern replacements) */
+	DATA_PARSER_STEP_INFO_STDERR_EXP, /* step_job_info_t->std_err (handles all pattern replacements) */
 	DATA_PARSER_STEP, /* slurmdb_step_rec_t */
 	DATA_PARSER_STEP_PTR, /* slurmdb_step_rec_t* */
 	DATA_PARSER_STEP_LIST, /* List of slurmdb_step_rec_t* */
@@ -204,15 +212,18 @@ typedef enum {
 	DATA_PARSER_STEP_TRES_USAGE_MAX, /* slurmdb_step_rec_t->tres_usage_out_in_max(|_nodeid|taskid) */
 	DATA_PARSER_STEP_TRES_USAGE_MIN, /* slurmdb_step_rec_t->tres_usage_out_in_min(|_nodeid|taskid) */
 	DATA_PARSER_STEP_NAMES, /* uint32_t <-> SLURM_EXTERN_CONT,SLURM_BATCH_SCRIPT,SLURM_PENDING_STEP,SLURM_INTERACTIVE_STEP */
+	DATA_PARSER_STEP_STDIN_EXP, /* slurmdb_step_rec_t->std_in (handles all pattern replacements) */
+	DATA_PARSER_STEP_STDOUT_EXP, /* slurmdb_step_rec_t->std_out (handles all pattern replacements) */
+	DATA_PARSER_STEP_STDERR_EXP, /* slurmdb_step_rec_t->std_err (handles all pattern replacements) */
 	DATA_PARSER_JOB_USER, /* user/uid from slurmdb_job_rec_t* */
 	DATA_PARSER_NEED_PREREQS_FLAGS, /* need_t */
 	DATA_PARSER_QOS_ID, /* uint32_t of QOS->name or stringified QOS->id if name unresolvable */
-	DATA_PARSER_QOS_ID_LIST, /* List of char* of QOS ids */
+	DATA_PARSER_QOS_ID_LIST, /* List of char* of QOS ids - REMOVED: v0.0.45 */
 	DATA_PARSER_QOS_STRING_ID_LIST, /* List of char* of QOS ids */
 	DATA_PARSER_QOS_ID_STRING_CSV_LIST, /* List of char* of QOS ids */
 	DATA_PARSER_QOS_ID_STRING, /* char* of QOS id */
 	DATA_PARSER_QOS_NAME, /* char * of QOS name */
-	DATA_PARSER_QOS_NAME_LIST, /* List of char* of QOS names */
+	DATA_PARSER_QOS_NAME_LIST, /* List of char* of QOS names - REMOVED: v0.0.45 */
 	DATA_PARSER_QOS_NAME_CSV_LIST, /* List of char* of QOS names */
 	DATA_PARSER_QOS_PREEMPT_LIST, /* slurmdb_qos_rec_t->preempt_bitstr & preempt_list */
 	DATA_PARSER_QOS, /* slurmdb_qos_rec_t */
@@ -222,6 +233,7 @@ typedef enum {
 	DATA_PARSER_QOS_PREEMPT_MODES, /* slurmdb_qos_rec_t->preempt_mode & QOS_FLAG_* */
 	DATA_PARSER_QOS_CONDITION, /* slurmdb_qos_cond_t */
 	DATA_PARSER_QOS_CONDITION_PTR, /* slurmdb_qos_cond_t* */
+	DATA_PARSER_QOS_CONDITION_FLAGS, /* slurmdb_qos_cond_t->flags & QOS_FLAG_COND_* */
 	DATA_PARSER_OPENAPI_SLURMDBD_QOS_RESP, /* openapi_resp_single_t */
 	DATA_PARSER_OPENAPI_SLURMDBD_QOS_RESP_PTR, /* openapi_resp_single_t* */
 	DATA_PARSER_OPENAPI_SLURMDBD_QOS_REMOVED_RESP, /* openapi_resp_single_t */
@@ -232,7 +244,7 @@ typedef enum {
 	DATA_PARSER_OPENAPI_SLURMDBD_QOS_QUERY_PTR, /* openapi_qos_query_t* */
 	DATA_PARSER_RPC_ID, /* slurm_msg_type_t - uint16_t */
 	DATA_PARSER_SLURMDB_RPC_ID, /* slurmdbd_msg_type_t */
-	DATA_PARSER_SELECT_PLUGIN_ID, /* DEPRECATED v41: int (SELECT_PLUGIN_*) -> string */
+	DATA_PARSER_SELECT_PLUGIN_ID, /* Remove when 24.11 is no longer supported: int (SELECT_PLUGIN_*) -> string */
 	DATA_PARSER_STATS_REC_PTR, /* slurmdb_stats_rec_t* */
 	DATA_PARSER_STATS_REC, /* slurmdb_stats_rec_t */
 	DATA_PARSER_OPENAPI_SLURMDBD_STATS_RESP, /* openapi_resp_single_t */
@@ -249,12 +261,12 @@ typedef enum {
 	DATA_PARSER_SLURM_STEP_ID_PTR, /* slurm_step_id_t* */
 	DATA_PARSER_SLURM_STEP_ID_STRING, /* slurm_step_id_t -> SELECTED_STEP */
 	DATA_PARSER_SLURM_STEP_ID_STRING_PTR, /* slurm_step_id_t* -> SLURM_STEP_ID_STRING */
-	DATA_PARSER_SLURM_STEP_ID_STRING_LIST, /* list_t of slurm_step_id_t* */
+	DATA_PARSER_SLURM_STEP_ID_STRING_LIST, /* list_t of slurm_step_id_t* - REMOVED: v0.0.45 */
 	DATA_PARSER_STEP_ID, /* uint32_t of job step id */
 	DATA_PARSER_STEP_ID_PTR, /* uint32_t* of job step id */
 	DATA_PARSER_TASK_DISTRIBUTION, /* uint32_t <-> task_dist_states_t */
 	DATA_PARSER_TRES_STR, /* List of slurmdb_tres_rec_t* combined into a TRES string with TRES type/name instead of ID */
-	DATA_PARSER_TRES_ID_STR, /* List of slurmdb_tres_rec_t* combined into a TRES string with TRES id# instead of type/name */
+	DATA_PARSER_TRES_STR_BY_TYPE, /* List of slurmdb_tres_rec_t* combined into a TRES string with  TRES type/name=#,... format */
 	DATA_PARSER_TRES_LIST, /* List of slurmdb_tres_rec_t* */
 	DATA_PARSER_TRES, /* slurmdb_tres_rec_t */
 	DATA_PARSER_TRES_PTR, /* slurmdb_tres_rec_t* */
@@ -341,7 +353,13 @@ typedef enum {
 	DATA_PARSER_OPENAPI_PING_ARRAY_RESP, /* openapi_resp_single_t */
 	DATA_PARSER_OPENAPI_PING_ARRAY_RESP_PTR, /* openapi_resp_single_t* */
 	DATA_PARSER_CONTROLLER_PING_MODE, /* char * - verbose controller mode */
+	DATA_PARSER_CONTROLLER_PING_PRIMARY, /* int - true if controller is primary */
 	DATA_PARSER_CONTROLLER_PING_RESULT, /* bool - "UP" or "DOWN" */
+	DATA_PARSER_SLURMDBD_PING, /* controller_ping_t */
+	DATA_PARSER_SLURMDBD_PING_PTR, /* controller_ping_t* */
+	DATA_PARSER_SLURMDBD_PING_ARRAY, /* controller_ping_t (NULL terminated array) */
+	DATA_PARSER_OPENAPI_SLURMDBD_PING_RESP, /* openapi_resp_single_t */
+	DATA_PARSER_OPENAPI_SLURMDBD_PING_RESP_PTR, /* openapi_resp_single_t* */
 	DATA_PARSER_NODE, /* node_info_t */
 	DATA_PARSER_NODE_PTR, /* node_info_t* */
 	DATA_PARSER_NODE_ARRAY, /* node_info_t** (NULL terminated) */
@@ -354,14 +372,12 @@ typedef enum {
 	DATA_PARSER_OPENAPI_NODES_QUERY, /* openapi_nodes_query_t */
 	DATA_PARSER_OPENAPI_NODES_QUERY_PTR, /* openapi_nodes_query_t* */
 	DATA_PARSER_NODE_STATES, /* uint32_t & NODE_STATE_* */
-	DATA_PARSER_NODE_STATES_NO_VAL, /* uint32_t & NODE_STATE_* or NO_VAL */
-	DATA_PARSER_NODE_SELECT_ALLOC_MEMORY, /* node_info_t->select_nodeinfo  */
-	DATA_PARSER_NODE_SELECT_ALLOC_CPUS, /* node_info_t->select_nodeinfo  */
 	DATA_PARSER_NODE_SELECT_ALLOC_IDLE_CPUS, /* node_info_t->select_nodeinfo  */
-	DATA_PARSER_NODE_SELECT_TRES_USED, /* node_info_t->select_nodeinfo  */
-	DATA_PARSER_NODE_SELECT_TRES_WEIGHTED, /* node_info_t->select_nodeinfo  */
+	DATA_PARSER_NODE_SELECT_TRES_WEIGHTED, /* Remove when 25.05 is no longer supported: was removed field node_info_t->select_nodeinfo */
 	DATA_PARSER_UPDATE_NODE_MSG, /* update_node_msg_t */
 	DATA_PARSER_UPDATE_NODE_MSG_PTR, /* update_node_msg_t* */
+	DATA_PARSER_OPENAPI_CREATE_NODE_REQ, /* openapi_resp_single_t */
+	DATA_PARSER_OPENAPI_CREATE_NODE_REQ_PTR, /* openapi_resp_single_t* */
 	DATA_PARSER_OPENAPI_LICENSES_RESP, /* openapi_resp_license_info_msg_t */
 	DATA_PARSER_OPENAPI_LICENSES_RESP_PTR, /* openapi_resp_license_info_msg_t* */
 	DATA_PARSER_LICENSES, /* license_info_msg_t */
@@ -383,6 +399,9 @@ typedef enum {
 	DATA_PARSER_JOB_INFO_STDIN, /* slurm_job_info_t->stdin (handles % replacements) */
 	DATA_PARSER_JOB_INFO_STDOUT, /* slurm_job_info_t->stdout (handles % replacements) */
 	DATA_PARSER_JOB_INFO_STDERR, /* slurm_job_info_t->stderr (handles % replacements) */
+	DATA_PARSER_JOB_INFO_STDIN_EXP, /* slurm_job_info_t->stdin (handles all pattern replacements) */
+	DATA_PARSER_JOB_INFO_STDOUT_EXP, /* slurm_job_info_t->stdout (handles all pattern replacements) */
+	DATA_PARSER_JOB_INFO_STDERR_EXP, /* slurm_job_info_t->stderr (handles all pattern replacements) */
 	DATA_PARSER_JOB_FLAGS, /* uint64_t & KILL_INV_DEP/HAS_STATE_DIR/... */
 	DATA_PARSER_JOB_SHOW_FLAGS, /* uint32_t & SHOW_* */
 	DATA_PARSER_CORE_SPEC, /* uint16_t & ~CORE_SPEC_THREAD */
@@ -401,6 +420,21 @@ typedef enum {
 	DATA_PARSER_JOB_RES_SOCKET_PTR, /* JOB_RES_SOCKET_t* */
 	DATA_PARSER_JOB_RES_SOCKET_ARRAY, /* JOB_RES_SOCKET_t[] */
 	DATA_PARSER_JOB_MAIL_FLAGS, /* uint16_t & MAIL_JOB_* */
+	DATA_PARSER_LISTJOBS_INFO, /* listjobs_info_t */
+	DATA_PARSER_LISTJOBS_INFO_PTR, /* listjobs_info_t* */
+	DATA_PARSER_LISTJOBS_INFO_LIST, /* list_t of listjobs_info_t* */
+	DATA_PARSER_OPENAPI_LISTJOBS_INFO_RESP, /* openapi_resp_listjobs_info_t */
+	DATA_PARSER_OPENAPI_LISTJOBS_INFO_RESP_PTR, /* openapi_resp_listjobs_info_t* */
+	DATA_PARSER_LISTPIDS_INFO, /* listpids_info_t */
+	DATA_PARSER_LISTPIDS_INFO_PTR, /* listpids_info_t* */
+	DATA_PARSER_LISTPIDS_INFO_LIST, /* list_t of listpids_info_t* */
+	DATA_PARSER_OPENAPI_LISTPIDS_INFO_RESP, /* openapi_resp_listpids_info_t */
+	DATA_PARSER_OPENAPI_LISTPIDS_INFO_RESP_PTR, /* openapi_resp_listpids_info_t* */
+	DATA_PARSER_LISTSTEPS_INFO, /* liststeps_info_t */
+	DATA_PARSER_LISTSTEPS_INFO_PTR, /* liststeps_info_t* */
+	DATA_PARSER_LISTSTEPS_INFO_LIST, /* list_t of liststeps_info_t* */
+	DATA_PARSER_OPENAPI_LISTSTEPS_INFO_RESP, /* openapi_resp_liststeps_info_t */
+	DATA_PARSER_OPENAPI_LISTSTEPS_INFO_RESP_PTR, /* openapi_resp_liststeps_info_t* */
 	DATA_PARSER_NICE, /* uint32_t - nice value - NICE_OFFSET */
 	DATA_PARSER_MEM_PER_CPUS, /* uint64_t & MEM_PER_CPU */
 	DATA_PARSER_MEM_PER_NODE, /* uint64_t & ~MEM_PER_CPU */
@@ -410,11 +444,14 @@ typedef enum {
 	DATA_PARSER_JOB_SHARED, /* uint16_t - JOB_SHARED_* */
 	DATA_PARSER_JOB_EXCLUSIVE, /* uint16_t - JOB_SHARED_* */
 	DATA_PARSER_JOB_EXCLUSIVE_FLAGS, /* uint16_t - JOB_SHARED_* */
-	DATA_PARSER_ALLOCATED_CORES, /* DEPRECATED v41: uint32_t if slurm_conf.select_type_param & (CR_CORE|CR_SOCKET) */
-	DATA_PARSER_ALLOCATED_CPUS, /* DEPRECATED v41: uint32_t if slurm_conf.select_type_param & CR_CPU */
 	DATA_PARSER_HOSTLIST, /* hostlist_t* */
 	DATA_PARSER_HOSTLIST_STRING, /* char * - acts like hostlist_t* */
-	DATA_PARSER_POWER_FLAGS, /* REMOVED 24.05: uint8_t & SLURM_POWER_FLAGS_* */
+	DATA_PARSER_HOSTLIST_STRING_TO_STRING, /* char * - parse/dump string */
+	DATA_PARSER_OPENAPI_HOSTNAMES_REQ_RESP, /* openapi_resp_single_t */
+	DATA_PARSER_OPENAPI_HOSTNAMES_REQ_RESP_PTR, /* openapi_resp_single_t* */
+	DATA_PARSER_OPENAPI_HOSTLIST_REQ_RESP, /* openapi_resp_single_t */
+	DATA_PARSER_OPENAPI_HOSTLIST_REQ_RESP_PTR, /* openapi_resp_single_t* */
+	DATA_PARSER_POWER_FLAGS, /* Remove when 24.11 is no longer supported: uint8_t & SLURM_POWER_FLAGS_* */
 	DATA_PARSER_PARTITION_INFO, /* partition_info_t */
 	DATA_PARSER_PARTITION_INFO_PTR, /* partition_info_t* */
 	DATA_PARSER_PARTITION_INFO_MSG, /* partition_info_msg_t */
@@ -427,10 +464,10 @@ typedef enum {
 	DATA_PARSER_OPENAPI_PARTITION_PARAM_PTR, /* openapi_partition_param_t* */
 	DATA_PARSER_OPENAPI_PARTITIONS_QUERY, /* openapi_partitions_query_t */
 	DATA_PARSER_OPENAPI_PARTITIONS_QUERY_PTR, /* openapi_partitions_query_t* */
-	DATA_PARSER_EXT_SENSORS_DATA, /* REMOVED 24.05: ext_sensors_data_t */
-	DATA_PARSER_EXT_SENSORS_DATA_PTR, /* REMOVED 24.05: ext_sensors_data_t* */
-	DATA_PARSER_POWER_MGMT_DATA, /* REMOVED 24.05: power_mgmt_data_t */
-	DATA_PARSER_POWER_MGMT_DATA_PTR, /* REMOVED 24.05: power_mgmt_data_t* */
+	DATA_PARSER_EXT_SENSORS_DATA, /* Remove when 24.11 is no longer supported: ext_sensors_data_t */
+	DATA_PARSER_EXT_SENSORS_DATA_PTR, /* Remove when 24.11 is no longer supported: ext_sensors_data_t* */
+	DATA_PARSER_POWER_MGMT_DATA, /* Remove when 24.11 is no longer supported: power_mgmt_data_t */
+	DATA_PARSER_POWER_MGMT_DATA_PTR, /* Remove when 24.11 is no longer supported: power_mgmt_data_t* */
 	DATA_PARSER_RESERVATION_INFO, /* reserve_info_t */
 	DATA_PARSER_RESERVATION_INFO_PTR, /* reserve_info_t* */
 	DATA_PARSER_RESERVATION_FLAGS, /* uint64_t & RESERVE_FLAG_* */
@@ -440,12 +477,19 @@ typedef enum {
 	DATA_PARSER_RESERVATION_CORE_SPEC_PTR, /* resv_core_spec_t* */
 	DATA_PARSER_RESERVATION_INFO_CORE_SPEC, /* reserve_info_t->core_spec+core_spec_cnt */
 	DATA_PARSER_RESERVATION_INFO_ARRAY, /* reserve_info_t** */
+	DATA_PARSER_RESERVATION_DESC_MSG, /* resv_desc_msg_t */
+	DATA_PARSER_RESERVATION_DESC_MSG_PTR, /* resv_desc_msg_t* */
+	DATA_PARSER_RESERVATION_DESC_MSG_LIST, /* list_t of resv_desc_msg_t * */
 	DATA_PARSER_OPENAPI_RESERVATION_RESP, /* openapi_resp_reserve_info_msg_t */
 	DATA_PARSER_OPENAPI_RESERVATION_RESP_PTR, /* openapi_resp_reserve_info_msg_t* */
 	DATA_PARSER_OPENAPI_RESERVATION_PARAM, /* openapi_reservation_param_t */
 	DATA_PARSER_OPENAPI_RESERVATION_PARAM_PTR, /* openapi_reservation_param_t* */
 	DATA_PARSER_OPENAPI_RESERVATION_QUERY, /* openapi_reservation_query_t */
 	DATA_PARSER_OPENAPI_RESERVATION_QUERY_PTR, /* openapi_reservation_query_t* */
+	DATA_PARSER_RESERVATION_MOD_REQ, /* openapi_reservation_mod_request_t */
+	DATA_PARSER_RESERVATION_MOD_REQ_PTR, /* openapi_reservation_mod_request_t* */
+	DATA_PARSER_OPENAPI_RESERVATION_MOD_RESP, /* openapi_openapi_resp_single_t */
+	DATA_PARSER_OPENAPI_RESERVATION_MOD_RESP_PTR, /* openapi_openapi_resp_single_t* */
 	DATA_PARSER_JOB_ARRAY_RESPONSE_MSG, /* job_array_resp_msg_t */
 	DATA_PARSER_JOB_ARRAY_RESPONSE_MSG_PTR, /* job_array_resp_msg_t * */
 	DATA_PARSER_JOB_ARRAY_RESPONSE_MSG_ENTRY, /* JOB_ARRAY_RESPONSE_MSG_entry_t */
@@ -499,7 +543,6 @@ typedef enum {
 	DATA_PARSER_HOLD, /* uint32_t (priority) --hold */
 	DATA_PARSER_OPENAPI_META, /* openapi_resp_meta_t */
 	DATA_PARSER_OPENAPI_META_PTR, /* openapi_resp_meta_t* */
-	DATA_PARSER_OPENAPI_META_COMMAND, /* openapi_resp_meta_t->command */
 	DATA_PARSER_OPENAPI_ERROR, /* openapi_resp_error_t */
 	DATA_PARSER_OPENAPI_ERROR_PTR, /* openapi_resp_error_t* */
 	DATA_PARSER_OPENAPI_ERRORS, /* list_t of openapi_resp_error_t* */
@@ -566,6 +609,57 @@ typedef enum {
 	DATA_PARSER_KILL_JOBS_RESP_JOB_PTR, /* kill_jobs_resp_job_t* */
 	DATA_PARSER_OPENAPI_KILL_JOBS_RESP, /* openapi_kill_jobs_resp_t */
 	DATA_PARSER_OPENAPI_KILL_JOBS_RESP_PTR, /* openapi_kill_jobs_resp_t* */
+	DATA_PARSER_OPENAPI_KILL_JOB_RESP, /* openapi_kill_jobs_resp_t */
+	DATA_PARSER_OPENAPI_KILL_JOB_RESP_PTR, /* openapi_kill_jobs_resp_t* */
+	DATA_PARSER_PRIORITY_BY_PARTITION, /* slurm_job_info_t */
+	DATA_PARSER_PART_PRIO, /* part_prio_t */
+	DATA_PARSER_PART_PRIO_PTR,
+	DATA_PARSER_NODE_CERT_FLAGS,
+	DATA_PARSER_TOPOLOGY_CONF, /* topology_ctx_t */
+	DATA_PARSER_TOPOLOGY_CONF_PTR, /* topology_ctx_t* */
+	DATA_PARSER_TOPOLOGY_CONF_ARRAY, /* topology_ctx_array_t */
+	DATA_PARSER_TOPOLOGY_TREE, /* topology_ctx_t topology/tree plugin */
+	DATA_PARSER_TOPOLOGY_BLOCK, /* topology_ctx_t topology/block plugin */
+	DATA_PARSER_TOPOLOGY_FLAT, /* topology_ctx_t topology/flat plugin */
+	DATA_PARSER_TOPOLOGY_TREE_CONFIG, /* topology_tree_config_t */
+	DATA_PARSER_TOPOLOGY_TREE_CONFIG_PTR, /* topology_tree_config_t* */
+	DATA_PARSER_TOPOLOGY_TREE_CONFIG_ARRAY, /* topology_tree_config_t->switch_configs,config_cnt */
+	DATA_PARSER_TOPOLOGY_BLOCK_CONFIG, /* topology_block_config_t */
+	DATA_PARSER_TOPOLOGY_BLOCK_CONFIG_PTR, /* topology_block_config_t* */
+	DATA_PARSER_TOPOLOGY_BLOCK_CONFIG_ARRAY, /* topology_block_config_t->block_configs,config_cnt */
+	DATA_PARSER_SWITCH_CONFIG, /* slurm_conf_switches_t */
+	DATA_PARSER_SWITCH_CONFIG_PTR, /* slurm_conf_switches_t* */
+	DATA_PARSER_BLOCK_CONFIG, /* slurm_conf_block_t */
+	DATA_PARSER_BLOCK_CONFIG_PTR, /* slurm_conf_block_t* */
+	DATA_PARSER_H_RESOURCE, /* hierarchical_resource_t */
+	DATA_PARSER_H_RESOURCE_PTR, /* hierarchical_resource_t* */
+	DATA_PARSER_H_RESOURCE_LIST, /* list_t* hierarchical_resource_t* */
+	DATA_PARSER_H_RESOURCE_MODE_FLAG, /* HRES_MODE_* */
+	DATA_PARSER_H_LAYER, /* hierarchy_layer_t */
+	DATA_PARSER_H_LAYER_PTR, /* hierarchy_layer_t* */
+	DATA_PARSER_H_LAYER_LIST, /* list_t* hierarchy_layer_t* */
+	DATA_PARSER_H_RESOURCES_AS_LICENSE_LIST, /* parse H_RESOURCE_LIST to list_t* of licenses_t*  */
+	DATA_PARSER_H_VARIABLE, /* hierarchy_layer_t */
+	DATA_PARSER_H_VARIABLE_PTR, /* hierarchy_layer_t* */
+	DATA_PARSER_H_VARIABLE_LIST, /* list_t* hierarchy_layer_t* */
+	DATA_PARSER_SLUID, /* sluid_t */
+	DATA_PARSER_SLUID_PTR, /* sluid_t* */
+	DATA_PARSER_OPENAPI_RESOURCE_LAYOUT_RESP, /* openapi_resp_resource_layout_t */
+	DATA_PARSER_OPENAPI_RESOURCE_LAYOUT_RESP_PTR, /* openapi_resp_resource_layout_t* */
+	DATA_PARSER_NODE_RESOURCE_LAYOUT, /* node_resource_layout_t */
+	DATA_PARSER_NODE_RESOURCE_LAYOUT_PTR, /* node_resource_layout_t* */
+	DATA_PARSER_NODE_RESOURCE_LAYOUT_LIST, /* list_t* node_resource_layout_t* */
+	DATA_PARSER_NODE_GRES_LAYOUT, /* node_gres_layout_t */
+	DATA_PARSER_NODE_GRES_LAYOUT_PTR, /* node_gres_layout_t* */
+	DATA_PARSER_NODE_GRES_LAYOUT_LIST, /* list_t* node_gres_layout_t* */
+	DATA_PARSER_NAMESPACE_FULL_CONF, /* ns_full_conf_t */
+	DATA_PARSER_NAMESPACE_FULL_CONF_PTR, /* ns_full_conf_t* */
+	DATA_PARSER_NAMESPACE_NODE_CONF, /* ns_node_conf_t */
+	DATA_PARSER_NAMESPACE_NODE_CONF_PTR, /* ns_node_conf_t* */
+	DATA_PARSER_NAMESPACE_NODE_CONF_LIST, /* list_t * of ns_node_conf_t* */
+	DATA_PARSER_NAMESPACE_NODE_CONF_COMPLEX, /* ns_node_conf_t* */
+	DATA_PARSER_NAMESPACE_CONF, /* ns_conf_t */
+	DATA_PARSER_NAMESPACE_CONF_PTR, /* ns_conf_t* */
 	DATA_PARSER_TYPE_MAX
 } data_parser_type_t;
 
@@ -777,8 +871,7 @@ extern int data_parser_g_dump(data_parser_t *parser, data_parser_type_t type,
  * Generate meta instance for a CLI command
  */
 extern openapi_resp_meta_t *data_parser_cli_meta(int argc, char **argv,
-						 const char *mime_type,
-						 const char *data_parser);
+						 const char *mime_type);
 
 #define DATA_PARSER_DUMP_CLI_CTXT_MAGIC 0x1BA211B3
 typedef struct {
@@ -821,8 +914,7 @@ extern int data_parser_dump_cli_stdout(data_parser_type_t type, void *obj,
 		__typeof__(src) *src_ptr = &src;                              \
 		if (!src.OPENAPI_RESP_STRUCT_META_FIELD_NAME)                 \
 			src.OPENAPI_RESP_STRUCT_META_FIELD_NAME =             \
-				data_parser_cli_meta(argc, argv, mime_type,   \
-						     data_parser_str);        \
+				data_parser_cli_meta(argc, argv, mime_type);  \
 		if (!src.OPENAPI_RESP_STRUCT_ERRORS_FIELD_NAME)               \
 			src.OPENAPI_RESP_STRUCT_ERRORS_FIELD_NAME =           \
 				dump_ctxt.errors =                            \
@@ -857,13 +949,94 @@ extern int data_parser_dump_cli_stdout(data_parser_type_t type, void *obj,
 			      mime_type, data_parser, rc);              \
 	} while (false)
 
-/*
- * Populate OpenAPI schema for each parser
- * IN parser - parser to add schemas from
- * IN/OUT dst - OpenAPI specification to populate
- * RET SLURM_SUCCESS or ESLURM_NOT_SUPPORTED (to skip) or error
- */
-extern int data_parser_g_specify(data_parser_t *parser, data_t *dst);
+/* Dump a struct into a json or yaml string. All errors and warnings logged */
+#define DATA_DUMP_TO_STR(type, src, ret_str, db_conn, mime_type, sflags, rc)   \
+	do {                                                                   \
+		data_parser_t *parser = NULL;                                  \
+		data_parser_dump_cli_ctxt_t ctxt = { 0 };                      \
+		data_t *dst = NULL;                                            \
+                                                                               \
+		ctxt.magic = DATA_PARSER_DUMP_CLI_CTXT_MAGIC;                  \
+		ctxt.data_parser = SLURM_DATA_PARSER_VERSION;                  \
+		ctxt.errors = list_create(free_openapi_resp_error);            \
+		ctxt.warnings = list_create(free_openapi_resp_warning);        \
+		parser = data_parser_cli_parser(ctxt.data_parser, &ctxt);      \
+		if (!parser) {                                                 \
+			rc = ESLURM_DATA_INVALID_PARSER;                       \
+			error("%s parsing of %s not supported by %s",          \
+			      mime_type, XSTRINGIFY(DATA_PARSER_##type),       \
+			      ctxt.data_parser);                               \
+		} else {                                                       \
+			if (db_conn)                                           \
+				data_parser_g_assign(                          \
+					parser, DATA_PARSER_ATTR_DBCONN_PTR,   \
+					db_conn);                              \
+			dst = data_new();                                      \
+			DATA_DUMP(parser, type, src, dst);                     \
+			list_for_each(ctxt.warnings, openapi_warn_log_foreach, \
+				      NULL);                                   \
+			list_for_each(ctxt.errors, openapi_error_log_foreach,  \
+				      NULL);                                   \
+		}                                                              \
+                                                                               \
+		if (data_get_type(dst) != DATA_TYPE_NULL) {                    \
+			serializer_flags_t tmp_sflags = sflags;                \
+                                                                               \
+			if (data_parser_g_is_complex(parser))                  \
+				tmp_sflags |= SER_FLAGS_COMPLEX;               \
+			serialize_g_data_to_string(&ret_str, NULL, dst,        \
+						   mime_type, tmp_sflags);     \
+		}                                                              \
+		FREE_NULL_DATA(dst);                                           \
+		FREE_NULL_LIST(ctxt.errors);                                   \
+		FREE_NULL_LIST(ctxt.warnings);                                 \
+		FREE_NULL_DATA_PARSER(parser);                                 \
+	} while (false)
+
+/* Parse a json or yaml string into a struct. All errors and warnings logged */
+#define DATA_PARSE_FROM_STR(type, str, str_len, dst, db_conn, mime_type, rc)   \
+	do {                                                                   \
+		data_t *src = NULL;                                            \
+		data_parser_dump_cli_ctxt_t ctxt = { 0 };                      \
+		data_t *parent_path = NULL;                                    \
+		data_parser_t *parser = NULL;                                  \
+                                                                               \
+		rc = serialize_g_string_to_data(&src, str, str_len,            \
+						mime_type);                    \
+		if (rc) {                                                      \
+			FREE_NULL_DATA(src);                                   \
+			break;                                                 \
+		}                                                              \
+                                                                               \
+		ctxt.magic = DATA_PARSER_DUMP_CLI_CTXT_MAGIC;                  \
+		ctxt.data_parser = SLURM_DATA_PARSER_VERSION;                  \
+		ctxt.errors = list_create(free_openapi_resp_error);            \
+		ctxt.warnings = list_create(free_openapi_resp_warning);        \
+		parser = data_parser_cli_parser(ctxt.data_parser, &ctxt);      \
+		if (!parser) {                                                 \
+			rc = ESLURM_DATA_INVALID_PARSER;                       \
+			error("%s parsing of %s not supported by %s",          \
+			      mime_type, XSTRINGIFY(DATA_PARSER_##type),       \
+			      ctxt.data_parser);                               \
+		} else {                                                       \
+			if (db_conn)                                           \
+				data_parser_g_assign(                          \
+					parser, DATA_PARSER_ATTR_DBCONN_PTR,   \
+					db_conn);                              \
+			parent_path = data_set_list(data_new());               \
+			(void) data_convert_tree(src, DATA_TYPE_NONE);         \
+			rc = DATA_PARSE(parser, type, dst, src, parent_path);  \
+			list_for_each(ctxt.warnings, openapi_warn_log_foreach, \
+				      NULL);                                   \
+			list_for_each(ctxt.errors, openapi_error_log_foreach,  \
+				      NULL);                                   \
+		}                                                              \
+		FREE_NULL_DATA(src);                                           \
+		FREE_NULL_LIST(ctxt.errors);                                   \
+		FREE_NULL_LIST(ctxt.warnings);                                 \
+		FREE_NULL_DATA(parent_path);                                   \
+		FREE_NULL_DATA_PARSER(parser);                                 \
+	} while (false)
 
 /*
  * Create data_parser instance for CLI
@@ -945,5 +1118,27 @@ extern int data_parser_g_populate_parameters(data_parser_t *parser,
  */
 extern void data_parser_g_release_references(data_parser_t *parser,
 					     void **references_ptr);
+
+/*
+ * Check if parser is configured with +complex flag active
+ * IN parser - parser to query
+ * RET True if parser is configure with +complex
+ */
+extern bool data_parser_g_is_complex(data_parser_t *parser);
+
+/*
+ * Dump the data flags the parser is configure with (i.e. +complex) into dst
+ * IN parser - parser to query
+ * IN/OUT dst - populate dst
+ * RET - SLURM_SUCCESS on success else error
+ */
+extern int data_parser_g_dump_flags(data_parser_t *parser, data_t *dst);
+
+/*
+ * Check if parser is deprecated
+ * IN parser - parser to query
+ * RET True if parser is deprecated
+ */
+extern bool data_parser_g_is_deprecated(data_parser_t *parser);
 
 #endif

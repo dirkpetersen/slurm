@@ -51,6 +51,7 @@
 #include "pmixp_dconn.h"
 
 #include "src/interfaces/auth.h"
+#include "src/interfaces/conn.h"
 
 #define PMIXP_DEBUG_SERVER 1
 
@@ -557,9 +558,9 @@ static int _auth_cred_verify(buf_t *buf, uid_t *uid)
  */
 
 static bool _serv_readable(eio_obj_t *obj);
-static int _serv_read(eio_obj_t *obj, List objs);
+static int _serv_read(eio_obj_t *obj, list_t *objs);
 static bool _serv_writable(eio_obj_t *obj);
-static int _serv_write(eio_obj_t *obj, List objs);
+static int _serv_write(eio_obj_t *obj, list_t *objs);
 static void _process_server_request(pmixp_base_hdr_t *hdr, buf_t *buf);
 
 
@@ -588,7 +589,7 @@ static bool _serv_readable(eio_obj_t *obj)
 	return true;
 }
 
-static int _serv_read(eio_obj_t *obj, List objs)
+static int _serv_read(eio_obj_t *obj, list_t *objs)
 {
 	/* sanity check */
 	xassert(NULL != obj );
@@ -648,7 +649,7 @@ static bool _serv_writable(eio_obj_t *obj)
 	return false;
 }
 
-static int _serv_write(eio_obj_t *obj, List objs)
+static int _serv_write(eio_obj_t *obj, list_t *objs)
 {
 	/* sanity check */
 	xassert(NULL != obj );
@@ -832,8 +833,7 @@ static void _process_server_request(pmixp_base_hdr_t *hdr, buf_t *buf)
 			PMIXP_ERROR("Bad collective seq. #%d from %s:%u, current is %d",
 				    hdr->seq, nodename, hdr->nodeid, coll->seq);
 			pmixp_debug_hang(0); /* enable hang to debug this! */
-			slurm_kill_job_step(pmixp_info_jobid(),
-					    pmixp_info_stepid(), SIGKILL, 0);
+			slurm_kill_job_step(pmixp_info_step_id(), SIGKILL, 0);
 			xfree(nodename);
 			break;
 		} else if (PMIXP_COLL_REQ_SKIP == rc) {
@@ -1033,15 +1033,15 @@ send_direct:
 
 static int _abort_status = SLURM_SUCCESS;
 
-void pmixp_abort_handle(int fd)
+void pmixp_abort_handle(void *conn)
 {
 	uint32_t status;
 	int len;
 
 	/* Receive the status from stepd */
-	len = slurm_read_stream(fd, (char*)&status, sizeof(status));
+	len = slurm_read_stream(conn, (char *) &status, sizeof(status));
 	if (len != sizeof(status)) {
-		PMIXP_ERROR("slurm_read_stream() failed: fd=%d; %m", fd);
+		PMIXP_ERROR("slurm_read_stream() failed: %m");
 		return;
 	}
 	/* Apply the received status */
@@ -1050,18 +1050,18 @@ void pmixp_abort_handle(int fd)
 	}
 
 	/* Reply back to confirm that the status was processed */
-	len = slurm_write_stream(fd, (char*)&status, sizeof(status));
+	len = slurm_write_stream(conn, (char *) &status, sizeof(status));
 	if (len != sizeof(status)) {
-		PMIXP_ERROR("slurm_write_stream() failed: fd=%d; %m", fd);
+		PMIXP_ERROR("slurm_write_stream() failed: %m");
 		return;
 	}
 }
 
 void pmixp_abort_propagate(int status)
 {
+	void *conn = NULL;
 	uint32_t status_net = htonl((uint32_t)status);
 	int len;
-	int fd;
 	slurm_addr_t abort_server;
 
 	if (!(pmixp_info_srun_ip()) || (pmixp_info_abort_agent_port() <= 0)) {
@@ -1078,27 +1078,28 @@ void pmixp_abort_propagate(int status)
 	slurm_set_addr(&abort_server, pmixp_info_abort_agent_port(),
 		       pmixp_info_srun_ip());
 
-	fd = slurm_open_msg_conn(&abort_server);
-	if (fd < 0) {
-		PMIXP_ERROR("slurm_open_msg_conn() failed: %m");
+	/* WARNING - this cannot use encryption currently */
+	if (!(conn = slurm_open_msg_conn(&abort_server, NULL))) {
+		PMIXP_ERROR("slurm_open_stream() failed: %m");
 		PMIXP_ERROR("Connecting to abort agent failed: %s:%d",
 			    pmixp_info_srun_ip(),
 			    pmixp_info_abort_agent_port());
 		return;
 	}
 
-	len = slurm_write_stream(fd, (char*)&status_net, sizeof(status_net));
+	len = slurm_write_stream(conn, (char *) &status_net,
+				 sizeof(status_net));
 	if (len != sizeof(status_net)) {
-		PMIXP_ERROR("slurm_open_msg_conn() failed: %m");
+		PMIXP_ERROR("slurm_write_stream() failed: %m");
 		PMIXP_ERROR("Communicating with abort agent failed: %s:%d",
 			    pmixp_info_srun_ip(),
 			    pmixp_info_abort_agent_port());
 		goto close_fd;
 	}
 
-	len = slurm_read_stream(fd, (char*)&status_net, sizeof(status_net));
+	len = slurm_read_stream(conn, (char *) &status_net, sizeof(status_net));
 	if (len != sizeof(status_net)) {
-		PMIXP_ERROR("slurm_open_msg_conn() failed: %m");
+		PMIXP_ERROR("slurm_read_stream() failed: %m");
 		PMIXP_ERROR("Communicating with abort agent failed: %s:%d",
 			    pmixp_info_srun_ip(),
 			    pmixp_info_abort_agent_port());
@@ -1106,7 +1107,7 @@ void pmixp_abort_propagate(int status)
 	}
 	xassert(status_net == htonl((uint32_t)status));
 close_fd:
-	close(fd);
+	conn_g_destroy(conn, true);
 }
 
 int pmixp_abort_code_get(void)
@@ -1172,7 +1173,7 @@ static size_t _direct_hdr_pack_samearch(pmixp_base_hdr_t *hdr, void *net)
 	return _base_hdr_pack_full_samearch(hdr, net);
 }
 
-/* Get te pointer to the message bufer */
+/* Get the pointer to the message buffer */
 static void *_direct_msg_ptr(void *msg)
 {
 	_direct_proto_message_t *_msg = (_direct_proto_message_t*)msg;
@@ -1387,7 +1388,7 @@ int pmixp_server_direct_conn_early(void)
 		}
 		coll[count++] = pmixp_state_coll_get(types[i], &proc, 1);
 	}
-	/* use Tree algo by defaut */
+	/* use Tree algo by default */
 	if (!count) {
 		coll[count++] = pmixp_state_coll_get(PMIXP_COLL_TYPE_FENCE_TREE, &proc, 1);
 	}
@@ -1939,7 +1940,7 @@ inline static void _pmixp_cperf_cbfunc(pmixp_coll_t *coll,
 	 */
 	slurm_mutex_unlock(&coll->lock);
 
-	/* invoke the callbak */
+	/* invoke the callback */
 	pmixp_lib_release_invoke(r_fn, r_cbdata);
 
 	/* lock it back before proceed */

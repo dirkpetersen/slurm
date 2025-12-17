@@ -43,7 +43,7 @@
  *  DEPENDENCY		Original list of jobids dependencies
  *  DERIVED_EC		Derived exit code and after : the signal number (if any)
  *  END			Time of job termination, UTS
- *  ELIGIBLE		Eligble time of job, UTS
+ *  ELIGIBLE		Eligible time of job, UTS
  *  EXITCODE		Job's exit code and after : the signal number (if any)
  *  GID			Group ID of job owner
  *  GROUPNAME		Group name of job owner
@@ -94,49 +94,29 @@
 #include "slurm/slurm_errno.h"
 
 #include "src/common/slurm_xlator.h"
+
 #include "src/common/fd.h"
 #include "src/common/id_util.h"
 #include "src/common/list.h"
 #include "src/common/macros.h"
 #include "src/common/parse_time.h"
-#include "src/interfaces/select.h"
-#include "src/interfaces/jobcomp.h"
 #include "src/common/slurm_protocol_defs.h"
+#include "src/common/threadpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
+
+#include "src/interfaces/jobcomp.h"
+#include "src/interfaces/select.h"
+
 #include "src/slurmctld/slurmctld.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobcomp" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobcomp/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-const char plugin_name[]       	= "Job completion logging script plugin";
-const char plugin_type[]       	= "jobcomp/script";
-const uint32_t plugin_version	= SLURM_VERSION_NUMBER;
+/* Required Slurm plugin symbols: */
+const char plugin_name[] = "Job completion logging script plugin";
+const char plugin_type[] = "jobcomp/script";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
 static char *jobcomp_script = NULL;
-static List comp_list = NULL;
+static list_t *comp_list = NULL;
 
 static pthread_t script_thread = 0;
 static pthread_mutex_t thread_flag_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -188,8 +168,11 @@ struct jobcomp_info {
 
 static struct jobcomp_info *_jobcomp_info_create(job_record_t *job)
 {
+	char *partition = NULL;
 	enum job_states state;
 	struct jobcomp_info *j = xmalloc(sizeof(struct jobcomp_info));
+
+	partition = job->part_ptr ? job->part_ptr->name : job->partition;
 
 	j->jobid = job->job_id;
 	j->exit_code = job->exit_code;
@@ -247,7 +230,7 @@ static struct jobcomp_info *_jobcomp_info_create(job_record_t *job)
 		j->end = job->end_time;
 	}
 
-	j->partition = xstrdup (job->partition);
+	j->partition = xstrdup(partition);
 	if ((job->time_limit == NO_VAL) && job->part_ptr)
 		j->limit = job->part_ptr->max_time;
 	else
@@ -573,7 +556,7 @@ static void * _script_agent (void *args)
 			slurm_cond_wait(&comp_list_cond, &comp_list_mutex);
 
 		/*
-		 * It is safe to unlock list mutex here. List has its
+		 * It is safe to unlock list mutex here. list has its
 		 *  own internal mutex that protects the comp_list itself
 		 */
 		slurm_mutex_unlock(&comp_list_mutex);
@@ -593,10 +576,6 @@ static void * _script_agent (void *args)
 	return NULL;
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	verbose("jobcomp/script plugin loaded init");
@@ -634,7 +613,7 @@ extern int jobcomp_p_set_location(void)
 	return SLURM_SUCCESS;
 }
 
-extern int jobcomp_p_log_record(job_record_t *record)
+extern int jobcomp_p_record_job_end(job_record_t *record, uint32_t event)
 {
 	struct jobcomp_info * job;
 
@@ -651,8 +630,7 @@ extern int jobcomp_p_log_record(job_record_t *record)
 	return SLURM_SUCCESS;
 }
 
-/* Called when script unloads */
-extern int fini ( void )
+extern void fini(void)
 {
 	slurm_mutex_lock(&thread_flag_mutex);
 	if (script_thread) {
@@ -669,18 +647,21 @@ extern int fini ( void )
 	slurm_mutex_lock(&comp_list_mutex);
 	FREE_NULL_LIST(comp_list);
 	slurm_mutex_unlock(&comp_list_mutex);
-
-	return SLURM_SUCCESS;
 }
 
 /*
  * get info from the storage
- * in/out job_list List of job_rec_t *
- * note List needs to be freed when called
+ * in/out job_list list of job_rec_t *
+ * note list needs to be freed when called
  */
-extern List jobcomp_p_get_jobs(slurmdb_job_cond_t *job_cond)
+extern list_t *jobcomp_p_get_jobs(slurmdb_job_cond_t *job_cond)
 {
 
 	info("This function is not implemented.");
 	return NULL;
+}
+
+extern int jobcomp_p_record_job_start(job_record_t *job_ptr, uint32_t event)
+{
+	return SLURM_SUCCESS;
 }

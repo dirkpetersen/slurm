@@ -138,6 +138,8 @@ extern int op_handler_jobs(openapi_ctxt_t *ctxt)
 			  "No job changes since update_time[%ld]=%s",
 			  query.update_time, ts);
 	} else if (rc) {
+		if ((rc == SLURM_ERROR) && errno)
+			rc = errno;
 		resp_error(ctxt, rc, "slurm_load_jobs()",
 			   "Unable to query jobs");
 	} else if (job_info_ptr) {
@@ -202,33 +204,66 @@ static void _handle_job_get(ctxt_t *ctxt, slurm_selected_step_t *job_id)
 	slurm_free_job_info_msg(job_info_ptr);
 }
 
-static void _handle_job_delete(ctxt_t *ctxt, slurm_selected_step_t *job_id)
+static int _parse_job_delete(ctxt_t *ctxt, slurm_selected_step_t *job_id,
+			     kill_jobs_msg_t *req)
 {
 	openapi_job_info_delete_query_t query = {0};
+	int rc;
 
-	if (DATA_PARSE(ctxt->parser, OPENAPI_JOB_INFO_DELETE_QUERY, query,
-		       ctxt->query, ctxt->parent_path))
-		return;
+	if ((rc = DATA_PARSE(ctxt->parser, OPENAPI_JOB_INFO_DELETE_QUERY, query,
+			     ctxt->query, ctxt->parent_path)))
+		return rc;
 
-	if (!query.signal)
-		query.signal = SIGKILL;
+	if (!(req->flags = query.flags))
+		req->flags = KILL_FULL_JOB;
 
-	if (!query.flags)
-		query.flags = KILL_FULL_JOB;
+	if (!(req->signal = query.signal))
+		req->signal = SIGKILL;
 
-	if (slurm_kill_job(job_id->step_id.job_id, query.signal, query.flags)) {
-		/* Already signaled jobs are considered a success here */
-		if (errno == ESLURM_ALREADY_DONE) {
-			resp_warn(ctxt, __func__,
-				  "Job was already sent signal %s",
-				  strsignal(query.signal));
-			return;
-		}
+	req->jobs_array = xcalloc(2, sizeof(*req->jobs_array));
+	req->jobs_cnt = 1;
 
-		resp_error(ctxt, errno, "slurm_kill_job2()",
-			   "unable to send signal %s to JobId=%u",
-			   strsignal(query.signal), job_id->step_id.job_id);
+	return fmt_job_id_string(job_id, &req->jobs_array[0]);
+}
+
+static int _signal_job(ctxt_t *ctxt, kill_jobs_msg_t *req,
+		       kill_jobs_resp_msg_t **resp_ptr)
+{
+	int rc;
+
+	if (!(rc = slurm_kill_jobs(req, resp_ptr))) {
+		if ((req->flags & KILL_JOBS_VERBOSE) && !(*resp_ptr)->jobs_cnt)
+			resp_warn(ctxt, __func__, "Zero jobs sent signal %s",
+				  strsignal(req->signal));
+		return rc;
 	}
+
+	/* Already signaled jobs are considered a success */
+	if (rc == ESLURM_ALREADY_DONE) {
+		resp_warn(ctxt, __func__, "Job was already sent signal %s",
+			  strsignal(req->signal));
+		return SLURM_SUCCESS;
+	}
+
+	resp_error(ctxt, rc, "slurm_kill_jobs()", "Signal request failed");
+	return rc;
+}
+
+static void _handle_job_delete(ctxt_t *ctxt, slurm_selected_step_t *job_id)
+{
+	int rc;
+	kill_jobs_resp_msg_t *resp = NULL;
+	kill_jobs_msg_t *req = xmalloc(sizeof(*req));
+
+	*req = (kill_jobs_msg_t) KILL_JOB_MSG_INITIALIZER;
+
+	if (!(rc = _parse_job_delete(ctxt, job_id, req)))
+		rc = _signal_job(ctxt, req, &resp);
+
+	DUMP_OPENAPI_RESP_SINGLE(OPENAPI_KILL_JOB_RESP, resp, ctxt);
+
+	slurm_free_kill_jobs_msg(req);
+	slurm_free_kill_jobs_response_msg(resp);
 }
 
 static void _job_post_update(ctxt_t *ctxt, slurm_selected_step_t *job_id)
@@ -245,7 +280,7 @@ static void _job_post_update(ctxt_t *ctxt, slurm_selected_step_t *job_id)
 	}
 
 	if (job_id->step_id.job_id != NO_VAL)
-		job->job_id = job_id->step_id.job_id;
+		job->step_id.job_id = job_id->step_id.job_id;
 
 	if (job_id->het_job_offset != NO_VAL)
 		job->het_job_offset = job_id->het_job_offset;
@@ -321,7 +356,8 @@ static void _job_post_submit(ctxt_t *ctxt, job_desc_msg_t *job, char *script)
 		job->script = xstrdup(script);
 	}
 
-	if (!job->script || !job->script[0]) {
+	if ((!job->script || !job->script[0]) &&
+	    !(job->bitflags & EXTERNAL_JOB)) {
 		resp_error(ctxt, ESLURM_JOB_SCRIPT_MISSING, "script",
 			   "Batch job script empty or missing");
 	} else if (slurm_submit_batch_job(job, &resp) || !resp) {
@@ -333,8 +369,9 @@ static void _job_post_submit(ctxt_t *ctxt, job_desc_msg_t *job, char *script)
 		};
 
 		debug3("%s:[%s] job submitted -> job_id:%d step_id:%d rc:%d message:%s",
-		       __func__, ctxt->id, resp->job_id, resp->step_id,
-		       resp->error_code, resp->job_submit_user_msg);
+		       __func__, ctxt->id, resp->step_id.job_id,
+		       resp->step_id.step_id, resp->error_code,
+		       resp->job_submit_user_msg);
 
 		if (resp->error_code)
 			resp_warn(ctxt, "slurm_submit_batch_job()",
@@ -393,8 +430,9 @@ static void _job_post_het_submit(ctxt_t *ctxt, list_t *jobs, char *script)
 		};
 
 		debug3("%s:[%s] HetJob submitted -> job_id:%d step_id:%d rc:%d message:%s",
-		       __func__, ctxt->id, resp->job_id, resp->step_id,
-		       resp->error_code, resp->job_submit_user_msg);
+		       __func__, ctxt->id, resp->step_id.job_id,
+		       resp->step_id.step_id, resp->error_code,
+		       resp->job_submit_user_msg);
 
 		if (resp->error_code)
 			resp_warn(ctxt, "slurm_submit_batch_het_job()",
@@ -438,7 +476,8 @@ static void _job_post(ctxt_t *ctxt)
 		goto cleanup;
 
 	if (!req.jobs && (!req.script || !req.script[0]) &&
-	    (!req.job || !req.job->script)) {
+	    (!req.job ||
+	     (!req.job->script && !(req.job->bitflags & EXTERNAL_JOB)))) {
 		resp_error(ctxt, ESLURM_REST_INVALID_QUERY, __func__,
 			   "Populated \"script\" field is required for job submission");
 		goto cleanup;
@@ -450,7 +489,7 @@ static void _job_post(ctxt_t *ctxt)
 	}
 	if (!req.job && !req.jobs) {
 		resp_error(ctxt, ESLURM_REST_INVALID_QUERY, __func__,
-			   "Specifing either \"job\" or \"jobs\" fields are required to submit job");
+			   "Specifying either \"job\" or \"jobs\" fields are required to submit job");
 		goto cleanup;
 	}
 
@@ -548,7 +587,7 @@ static int _foreach_alloc_job(void *x, void *arg)
 	/* Force disable status updates */
 	job->other_port = 0;
 
-	/* force atleast 1 node for job */
+	/* force at least 1 node for job */
 	if (!job->min_nodes || (job->min_nodes >= NO_VAL))
 		job->min_nodes = 1;
 
@@ -564,20 +603,21 @@ static int _foreach_alloc_job_resp(void *x, void *arg)
 
 	xassert(args->magic == FOREACH_ALLOC_JOB_ARGS_MAGIC);
 
-	xassert(!oas_resp->job_id || (oas_resp->job_id == resp->job_id) ||
-		(oas_resp->job_id == (resp->job_id - args->component)));
-	oas_resp->job_id = resp->job_id;
+	xassert(!oas_resp->job_id ||
+		(oas_resp->job_id == resp->step_id.job_id) ||
+		(oas_resp->job_id == (resp->step_id.job_id - args->component)));
+	oas_resp->job_id = resp->step_id.job_id;
 
 	if (!oas_resp->job_submit_user_msg)
 		oas_resp->job_submit_user_msg = resp->job_submit_user_msg;
 
 	if (args->component == NO_VAL) {
 		debug3("%s:[%s] Job submitted -> JobId=%d rc:%d message:%s",
-		       __func__, ctxt->id, resp->job_id,
+		       __func__, ctxt->id, resp->step_id.job_id,
 		       resp->error_code, resp->job_submit_user_msg);
 	} else {
 		debug3("%s:[%s] HetJob submitted -> JobId=%d+%d rc:%d message:%s",
-		       __func__, ctxt->id, resp->job_id, args->component,
+		       __func__, ctxt->id, resp->step_id.job_id, args->component,
 		       resp->error_code, resp->job_submit_user_msg);
 		args->component++;
 	}
@@ -694,7 +734,7 @@ extern int op_handler_alloc_job(openapi_ctxt_t *ctxt)
 	}
 	if (!req.job && !req.hetjob) {
 		rc = resp_error(ctxt, ESLURM_REST_INVALID_QUERY, __func__,
-				"Specifing either \"job\" or \"hetjob\" fields are required to allocate job");
+				"Specifying either \"job\" or \"hetjob\" fields are required to allocate job");
 		goto cleanup;
 	}
 

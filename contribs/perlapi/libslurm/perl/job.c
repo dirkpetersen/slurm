@@ -225,7 +225,7 @@ job_info_to_hv(job_info_t *job_info, HV *hv)
 	if (job_info->tres_per_node)
 		STORE_FIELD(hv, job_info, tres_per_node, charp);
 	STORE_FIELD(hv, job_info, group_id, uint32_t);
-	STORE_FIELD(hv, job_info, job_id, uint32_t);
+	STORE_FIELD_NAME(hv, job_info, step_id.job_id, job_id, uint32_t);
 	STORE_FIELD(hv, job_info, job_state, uint32_t);
 	if(job_info->licenses)
 		STORE_FIELD(hv, job_info, licenses, charp);
@@ -286,7 +286,6 @@ job_info_to_hv(job_info_t *job_info, HV *hv)
 		STORE_FIELD(hv, job_info, resv_name, charp);
 	STORE_PTR_FIELD(hv, job_info, job_resrcs, "Slurm::job_resources_t");
 	STORE_FIELD(hv, job_info, shared, uint16_t);
-	STORE_FIELD(hv, job_info, show_flags, uint16_t);
 	STORE_FIELD(hv, job_info, start_time, time_t);
 	if(job_info->state_desc)
 		STORE_FIELD(hv, job_info, state_desc, charp);
@@ -359,7 +358,7 @@ hv_to_job_info(HV *hv, job_info_t *job_info)
 	FETCH_FIELD(hv, job_info, features, charp, FALSE);
 	FETCH_FIELD(hv, job_info, tres_per_node, charp, FALSE);
 	FETCH_FIELD(hv, job_info, group_id, uint32_t, TRUE);
-	FETCH_FIELD(hv, job_info, job_id, uint32_t, TRUE);
+	FETCH_FIELD_NAME(hv, job_info, step_id.job_id, job_id, uint32_t, TRUE);
 	FETCH_FIELD(hv, job_info, job_state, uint32_t, TRUE);
 	FETCH_FIELD(hv, job_info, licenses, charp, FALSE);
 	FETCH_FIELD(hv, job_info, max_cpus, uint32_t, TRUE);
@@ -420,7 +419,6 @@ hv_to_job_info(HV *hv, job_info_t *job_info)
 	FETCH_FIELD(hv, job_info, resv_name, charp, FALSE);
 	FETCH_PTR_FIELD(hv, job_info, job_resrcs, "Slurm::job_resources_t", FALSE);
 	FETCH_FIELD(hv, job_info, shared, uint16_t, TRUE);
-	FETCH_FIELD(hv, job_info, show_flags, uint16_t, TRUE);
 	FETCH_FIELD(hv, job_info, start_time, time_t, TRUE);
 	FETCH_FIELD(hv, job_info, state_desc, charp, FALSE);
 	FETCH_FIELD(hv, job_info, state_reason, uint32_t, TRUE);
@@ -469,7 +467,7 @@ job_info_msg_to_hv(job_info_msg_t *job_info_msg, HV *hv)
 	return 0;
 }
 
-/* 
+/*
  * convert perl HV to job_info_msg_t
  */
 int

@@ -54,10 +54,9 @@ static void _dump(ctxt_t *ctxt, openapi_resp_slurmdbd_config_t *resp)
 		.with_usage = true,
 	};
 	slurmdb_assoc_cond_t assoc_cond = {
-		.with_usage = true,
-		.with_deleted = true,
-		.with_raw_qos = true,
-		.with_sub_accts = true,
+		.flags = ASSOC_COND_FLAG_WITH_DELETED |
+		ASSOC_COND_FLAG_WITH_USAGE | ASSOC_COND_FLAG_RAW_QOS |
+		ASSOC_COND_FLAG_SUB_ACCTS,
 	};
 	slurmdb_account_cond_t acct_cond = {
 		.assoc_cond = &assoc_cond,
@@ -71,7 +70,7 @@ static void _dump(ctxt_t *ctxt, openapi_resp_slurmdbd_config_t *resp)
 		.with_coords = true,
 	};
 	slurmdb_qos_cond_t qos_cond = {
-		.with_deleted = true,
+		.flags = QOS_COND_FLAG_WITH_DELETED,
 	};
 	slurmdb_wckey_cond_t wckey_cond = {
 		.with_deleted = true,
@@ -85,8 +84,8 @@ static void _dump(ctxt_t *ctxt, openapi_resp_slurmdbd_config_t *resp)
 			   &acct_cond) &&
 	    !db_query_list(ctxt, &resp->users, slurmdb_users_get, &user_cond) &&
 	    !db_query_list(ctxt, &resp->qos, slurmdb_qos_get, &qos_cond) &&
-	    !db_query_list(ctxt, &resp->wckeys, slurmdb_wckeys_get,
-			   &wckey_cond) &&
+	    !db_query_list_xempty(ctxt, &resp->wckeys, slurmdb_wckeys_get,
+				  &wckey_cond) &&
 	    !db_query_list(ctxt, &resp->associations, slurmdb_associations_get,
 			   &assoc_cond))
 		DATA_DUMP(ctxt->parser, OPENAPI_SLURMDBD_CONFIG_RESP_PTR, resp,

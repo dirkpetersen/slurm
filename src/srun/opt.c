@@ -85,6 +85,7 @@ static void _usage(void);
 static void _autocomplete(const char *query);
 
 /*---- global variables, defined in opt.h ----*/
+int colon_cnt = 0;
 int	error_exit = 1;
 int	immediate_exit = 1;
 srun_opt_t sropt;
@@ -94,12 +95,14 @@ slurm_opt_t opt = {
 	.usage_func = _usage,
 	.autocomplete_func = _autocomplete,
 };
-List 	opt_list = NULL;
+list_t *opt_list = NULL;
 int	pass_number = 0;
 time_t	srun_begin_time = 0;
 bool local_het_step = false;
 
 /*---- forward declarations of static variables and functions  ----*/
+
+static bool is_step = false;
 
 static slurm_opt_t *_get_first_opt(int het_job_offset);
 static slurm_opt_t *_get_next_opt(int het_job_offset, slurm_opt_t *opt_last);
@@ -297,6 +300,7 @@ static slurm_opt_t *_opt_copy(void)
 	opt_dup->ifname = xstrdup(opt.ifname);
 	opt_dup->job_name = xstrdup(opt.job_name);
 	opt.licenses = NULL;		/* Moved by memcpy */
+	opt.resources = NULL; /* Moved by memcpy */
 	opt.mail_user = NULL;		/* Moved by memcpy */
 	opt_dup->mcs_label = xstrdup(opt.mcs_label);
 	opt.mem_bind = NULL;		/* Moved by memcpy */
@@ -342,6 +346,8 @@ extern int initialize_and_process_args(int argc, char **argv, int *argc_off)
 	bool opt_found = false;
 	static bool check_het_step = false;
 
+	is_step = getenv("SLURM_JOB_ID") ? true : false;
+
 	het_grp_bits = _get_het_group(argc, argv, default_het_job_offset++,
 				      &opt_found);
 	/*
@@ -371,7 +377,7 @@ extern int initialize_and_process_args(int argc, char **argv, int *argc_off)
 		_opt_default();
 
 		/* do not set adjust defaults in an active allocation */
-		if (!getenv("SLURM_JOB_ID")) {
+		if (!is_step) {
 			bool first = (pass_number == 1);
 			if (cli_filter_g_setup_defaults(&opt, first)) {
 				error("cli_filter plugin terminated with error");
@@ -381,7 +387,9 @@ extern int initialize_and_process_args(int argc, char **argv, int *argc_off)
 
 		if (opt_found || (i > 0)) {
 			xstrfmtcat(sropt.het_group, "%d", i);
-			sropt.het_grp_bits = bit_alloc(MAX_HET_JOB_COMPONENTS);
+			if (!sropt.het_grp_bits)
+				sropt.het_grp_bits =
+					bit_alloc(MAX_HET_JOB_COMPONENTS);
 			bit_set(sropt.het_grp_bits, i);
 		}
 
@@ -409,7 +417,7 @@ extern int initialize_and_process_args(int argc, char **argv, int *argc_off)
 			 * trying to use the whole allocation.
 			 */
 			if (!getenv("SLURM_HET_SIZE") &&
-			    getenv("SLURM_JOB_ID") &&
+			    is_step &&
 			    (optind >= 0) && (optind < argc)) {
 				for (int i2 = optind; i2 < argc; i2++) {
 					if (!xstrcmp(argv[i2], ":")) {
@@ -450,7 +458,7 @@ extern int initialize_and_process_args(int argc, char **argv, int *argc_off)
 		if (opt.verbose)
 			slurm_print_set_options(&opt);
 
-		if (spank_init_post_opt() < 0) {
+		if (spank_init_post_opt()) {
 			error("Plugin stack post-option processing failed.");
 			exit(error_exit);
 		}
@@ -542,6 +550,7 @@ env_vars_t env_vars[] = {
   { "SLURM_CLUSTERS", 'M' },
   { "SLURM_CLUSTER_CONSTRAINT", LONG_OPT_CLUSTER_CONSTRAINT },
   { "SLURM_COMPRESS", LONG_OPT_COMPRESS },
+  { "SLURM_CONSOLIDATE_SEGMENTS", LONG_OPT_CONSOLIDATE_SEGMENTS },
   { "SLURM_CONSTRAINT", 'C' },
   { "SLURM_CORE_SPEC", 'S' },
   { "SLURM_CPUS_PER_TASK", 'c' },
@@ -589,6 +598,7 @@ env_vars_t env_vars[] = {
   { "SLURM_NTASKS_PER_NODE", LONG_OPT_NTASKSPERNODE },
   { "SLURM_NTASKS_PER_GPU", LONG_OPT_NTASKSPERGPU },
   { "SLURM_NTASKS_PER_TRES", LONG_OPT_NTASKSPERTRES },
+  { "SLURM_OOM_KILL_STEP", LONG_OPT_OOMKILLSTEP },
   { "SLURM_OPEN_MODE", LONG_OPT_OPEN_MODE },
   { "SLURM_OVERCOMMIT", 'O' },
   { "SLURM_OVERLAP", LONG_OPT_OVERLAP },
@@ -604,6 +614,7 @@ env_vars_t env_vars[] = {
   { "SLURM_SEND_LIBS", LONG_OPT_SEND_LIBS },
   { "SLURM_SIGNAL", LONG_OPT_SIGNAL },
   { "SLURM_SPREAD_JOB", LONG_OPT_SPREAD_JOB },
+  { "SLURM_SPREAD_SEGMENTS", LONG_OPT_SPREAD_SEGMENTS },
   { "SLURM_SRUN_MULTI", LONG_OPT_MULTI },
   { "SLURM_STDERRMODE", 'e' }, /* Left for backward compatibility */
   { "SLURM_STDINMODE", 'i' }, /* Left for backward compatibility */
@@ -629,6 +640,7 @@ env_vars_t env_vars[] = {
   { "SRUN_ERROR", 'e' },
   { "SRUN_INPUT", 'i' },
   { "SRUN_OUTPUT", 'o' },
+  { "SRUN_SEGMENT_SIZE", LONG_OPT_SEGMENT_SIZE },
   { NULL }
 };
 
@@ -814,10 +826,6 @@ static void _opt_args(int argc, char **argv, int het_job_offset)
 	if (!rest && !sropt.test_only)
 		fatal("No command given to execute.");
 
-	if (launch_init() != SLURM_SUCCESS) {
-		fatal("Unable to load launch plugin, check LaunchType "
-		      "configuration");
-	}
 	command_pos = launch_g_setup_srun_opt(rest, &opt);
 
 	/* make sure we have allocated things correctly */
@@ -917,13 +925,21 @@ static bool _opt_verify(void)
 			opt.nodes_set = false;
 	}
 
+	/*
+	 * Specifying --gpus should override SLURM_GPUS_PER_NODE env if present
+	 * in step request.
+	 */
+	if (slurm_option_set_by_env(&opt, LONG_OPT_GPUS_PER_NODE) &&
+	    slurm_option_set_by_cli(&opt, 'G') && is_step)
+		slurm_option_reset(&opt, "gpus-per-node");
+
 	validate_options_salloc_sbatch_srun(&opt);
 
 	/*
 	 * If they are requesting block without 'nopack' and the system
 	 * is setup to pack nodes set it here.
 	 */
-	if ((slurm_conf.select_type_param & CR_PACK_NODES) &&
+	if ((slurm_conf.select_type_param & SELECT_PACK_NODES) &&
 	    !(opt.distribution & SLURM_DIST_NO_PACK_NODES) &&
 	    ((opt.distribution & SLURM_DIST_BLOCK) ||
 	     (opt.distribution == SLURM_DIST_UNKNOWN)))
@@ -931,14 +947,14 @@ static bool _opt_verify(void)
 
 	/*
 	 * If we are packing the nodes in an allocation set min_nodes to
-	 * 1. The slurmctld will adjust the max_nodes to the approriate
+	 * 1. The slurmctld will adjust the max_nodes to the appropriate
 	 * number if the allocation is homogeneous.
 	 */
 	if ((opt.distribution & SLURM_DIST_PACK_NODES) &&
 	    slurm_option_set_by_env(&opt, 'N')) {
 		opt.min_nodes = 1;
 		if (opt.verbose)
-			info("Reseting -N set by environment variable because of -mpack");
+			info("Resetting -N set by environment variable because of -mpack");
 		mpack_reset_nodes = true;
 	}
 
@@ -1051,7 +1067,8 @@ static bool _opt_verify(void)
 
 	/* set proc and node counts based on the arbitrary list of nodes */
 	if (((opt.distribution & SLURM_DIST_STATE_BASE) == SLURM_DIST_ARBITRARY)
-	   && (!opt.nodes_set || !opt.ntasks_set)) {
+	   && (!opt.nodes_set || !opt.ntasks_set)
+	   && !xstrchr(opt.nodelist, '{')) {
 		hostlist_t *hl = hostlist_create(opt.nodelist);
 
 		if (!hl)
@@ -1143,7 +1160,7 @@ static bool _opt_verify(void)
 	}
 
 	/* massage the numbers */
-	if (opt.nodelist && !opt.nodes_set) {
+	if (opt.nodelist && !opt.nodes_set && !xstrchr(opt.nodelist, '{')) {
 		hl = hostlist_create(opt.nodelist);
 		if (!hl)
 			fatal("Invalid node list specified");
@@ -1217,11 +1234,9 @@ static bool _opt_verify(void)
 			xfree(tmp);
 			if (hl_cnt > opt.min_nodes) {
 				int del_cnt, i;
-				char *host;
 				del_cnt = hl_cnt - opt.min_nodes;
 				for (i=0; i<del_cnt; i++) {
-					host = hostlist_pop(hl);
-					free(host);
+					hostlist_drop(hl);
 				}
 				xfree(opt.nodelist);
 				opt.nodelist =
@@ -1248,7 +1263,7 @@ static bool _opt_verify(void)
 			if (opt.max_nodes &&
 			    (opt.ntasks > max_ntasks) &&
 			    !mpack_reset_nodes &&
-			    getenv("SLURM_JOB_ID")) {
+			    is_step) {
 				warning("can't honor --ntasks-per-node set to %u which doesn't match the requested tasks %u with the maximum number of requested nodes %u. Ignoring --ntasks-per-node.",
 					opt.ntasks_per_node, opt.ntasks,
 					opt.max_nodes);
@@ -1361,7 +1376,7 @@ extern char *spank_get_job_env(const char *name)
 
 	if ((name == NULL) || (name[0] == '\0') ||
 	    (strchr(name, (int)'=') != NULL)) {
-		slurm_seterrno(EINVAL);
+		errno = EINVAL;
 		return NULL;
 	}
 
@@ -1387,7 +1402,7 @@ extern int   spank_set_job_env(const char *name, const char *value,
 
 	if ((name == NULL) || (name[0] == '\0') ||
 	    (strchr(name, (int)'=') != NULL)) {
-		slurm_seterrno(EINVAL);
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -1421,7 +1436,7 @@ extern int   spank_unset_job_env(const char *name)
 
 	if ((name == NULL) || (name[0] == '\0') ||
 	    (strchr(name, (int)'=') != NULL)) {
-		slurm_seterrno(EINVAL);
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -1484,6 +1499,7 @@ static void _usage(void)
 "            [--task-prolog=fname] [--task-epilog=fname]\n"
 "            [--ctrl-comm-ifhn=addr] [--multi-prog] [--mcs-label=mcs]\n"
 "            [--cpu-freq=min[-max[:gov]]] [--power=flags] [--spread-job]\n"
+"            [--spread-segments]\n"
 "            [--switches=max-switches{@max-time-to-wait}] [--reboot]\n"
 "            [--core-spec=cores] [--thread-spec=threads]\n"
 "            [--bb=burst_buffer_spec] [--bbf=burst_buffer_file]\n"
@@ -1495,6 +1511,7 @@ static void _usage(void)
 "            [--cpus-per-gpu=n] [--gpus=n] [--gpu-bind=...] [--gpu-freq=...]\n"
 "            [--gpus-per-node=n] [--gpus-per-socket=n] [--gpus-per-task=n]\n"
 "            [--mem-per-gpu=MB] [--tres-bind=...] [--tres-per-task=list]\n"
+"            [--oom-kill-step[=0|1]]\n"
 "            executable [args...]\n");
 
 }
@@ -1534,7 +1551,7 @@ static void _help(void)
 "      --epilog=program        run \"program\" after launching job step\n"
 "  -E, --preserve-env          env vars for node and task counts override\n"
 "                              command-line flags\n"
-"      --gres=list             required generic resources\n"
+"      --gres=list             required generic resources per node\n"
 "      --gres-flags=opts       flags related to GRES management\n"
 "  -H, --hold                  submit job in held state\n"
 "  -i, --input=in              location of stdin redirection\n"
@@ -1563,6 +1580,7 @@ static void _help(void)
 "      --nice[=value]          decrease scheduling priority by value\n"
 "      --ntasks-per-node=n     number of tasks to invoke on each node\n"
 "  -N, --nodes=N               number of nodes on which to run (N = min[-max])\n"
+"      --oom-kill-step[=0|1]   set the OOMKillStep behaviour\n"
 "  -o, --output=out            location of stdout redirection\n"
 "  -O, --overcommit            overcommit resources\n"
 "      --overlap               Allow other steps to overlap this step\n"
@@ -1590,6 +1608,7 @@ static void _help(void)
 "      --signal=[R:]num[@time] send signal when time limit within time seconds\n"
 "      --slurmd-debug=level    slurmd debug level\n"
 "      --spread-job            spread job across as many nodes as possible\n"
+"      --spread-segments       spread job segments across separate base blocks\n"
 "      --switches=max-switches{@max-time-to-wait}\n"
 "                              Optimum switches and max time to wait for optimum\n"
 "      --task-epilog=program   run \"program\" after launching task\n"
@@ -1604,6 +1623,8 @@ static void _help(void)
 "      --use-min-nodes         if a range of node counts is given, prefer the\n"
 "                              smaller count\n"
 "  -v, --verbose               verbose mode (multiple -v's increase verbosity)\n"
+"      --wait-for-children     wait for all children processes in a task to\n"
+"                              close before considering the task ended.\n"
 "  -W, --wait=sec              seconds to wait after first task exits\n"
 "                              before killing job\n"
 "      --wckey=wckey           wckey to run job under\n"
@@ -1645,7 +1666,7 @@ static void _help(void)
 "      --sockets-per-node=S    number of sockets per node to allocate\n"
 "      --cores-per-socket=C    number of cores per socket to allocate\n"
 "      --threads-per-core=T    number of threads per core to allocate\n"
-"  -B  --extra-node-info=S[:C[:T]]  combine request of sockets per node,\n"
+"  -B, --extra-node-info=S[:C[:T]]  combine request of sockets per node,\n"
 "                              cores per socket and threads per core.\n"
 "                              Specify an asterisk (*) as a placeholder,\n"
 "                              a minimum value, or a min-max range.\n"

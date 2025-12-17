@@ -269,7 +269,7 @@ extern int job_res_add_job(job_record_t *job_ptr, job_res_job_action_t action)
 	struct job_resources *job = job_ptr->job_resrcs;
 	node_record_t *node_ptr;
 	part_res_record_t *p_ptr;
-	List node_gres_list;
+	list_t *node_gres_list;
 	int i, n;
 	bitstr_t *core_bitmap;
 	bool new_alloc = true;
@@ -462,7 +462,7 @@ extern int job_res_rm_job(part_res_record_t *part_record_ptr,
 	}
 
 	if (license_list)
-		license_job_return_to_list(job_ptr, license_list);
+		license_job_return_to_list(job_ptr, license_list, false, true);
 
 	if (job_ptr->start_time < slurmctld_config.boot_time)
 		old_job = true;
@@ -476,7 +476,7 @@ extern int job_res_rm_job(part_res_record_t *part_record_ptr,
 			continue;  /* node lost by job resize */
 
 		if (action != JOB_RES_ACTION_RESUME) {
-			List node_gres_list;
+			list_t *node_gres_list;
 
 			if (node_usage[i].gres_list)
 				node_gres_list = node_usage[i].gres_list;
@@ -596,6 +596,26 @@ extern int job_res_rm_job(part_res_record_t *part_record_ptr,
 						slurm_find_ptr_in_list,
 						job_ptr);
 			}
+		} else if ((action == JOB_RES_ACTION_NORMAL) &&
+			   job_ptr->suspend_time && IS_JOB_FINISHED(job_ptr)) {
+			/*
+			 * For a previously suspended job, if it has been
+			 * finished now:
+			 *
+			 * 1. At suspend time "node_usage" hadn't got the job
+			 *    removed from the job's nodes. This was intended.
+			 * 2. If we now want to finish the job, we force-clean
+			 *    "node_usage" here, as the other point were we do
+			 *    that in this function is unreachable for this
+			 *    specific case.
+			 */
+			for (int i = 0;
+			     next_node_bitmap(job_ptr->node_bitmap, &i); i++)
+				if (node_usage[i].jobs)
+					list_delete_first(
+						node_usage[i].jobs,
+						slurm_find_ptr_in_list,
+						job_ptr);
 		}
 	}
 	if (slurm_conf.debug_flags & DEBUG_FLAG_SELECT_TYPE) {

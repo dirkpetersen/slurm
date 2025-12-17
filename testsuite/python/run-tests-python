@@ -21,8 +21,19 @@ group.add_argument(
     dest="auto_config",
     help="the slurm configuration will not be altered. This is the default",
 )
+group.add_argument(
+    "--pdb",
+    action="store_true",
+    dest="pdb",
+    help="Use pdb to debug failures",
+)
 parser.add_argument(
     "--no-color", action="store_true", help="the logs won't include color"
+)
+parser.add_argument(
+    "--allow-slurmdbd-modify",
+    action="store_true",
+    help="allow running in local-config even if require_accounting(modify=True)",
 )
 parser.add_argument("PYTEST_OPTION ...", nargs="?", help="additional pytest options")
 parser.add_argument("TEST_FILE_OR_DIR ...", nargs="?", help="test files or directories")
@@ -55,5 +66,9 @@ args = [
     "no:cacheprovider",
     "--disable-warnings",
 ]
+
+if "pdb" in args:
+    args.append("--pdb")
+
 args.extend(sys.argv[1:])
 os.execvp(command, args)

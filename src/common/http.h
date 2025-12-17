@@ -37,13 +37,15 @@
 #define SLURM_HTTP_H
 
 #include "slurm/slurm.h"
+#include "slurm/slurm_errno.h"
 #include "src/common/data.h"
 
 /*
  * HTTP status codes from rfc2616&rfc7231 for http1.1
  */
 typedef enum {
-	HTTP_STATUS_NONE = 0,
+	/* place holder for invalid status code */
+	HTTP_STATUS_CODE_INVALID = 0,
 	/* 1xx (Informational) */
 	HTTP_STATUS_CODE_CONTINUE = 100,
 	HTTP_STATUS_CODE_SWITCH_PROTOCOLS = 101,
@@ -93,8 +95,15 @@ typedef enum {
 	HTTP_STATUS_CODE_SRVERR_SERVICE_UNAVAILABLE = 503,
 	HTTP_STATUS_CODE_SRVERR_GATEWAY_TIMEOUT = 504,
 	HTTP_STATUS_CODE_SRVERR_HTTP_VERSION_NOT_SUPPORTED = 505,
+	HTTP_STATUS_CODE_SRVERR_VARIANT_ALSO_NEGOTIATES = 506,
+	HTTP_STATUS_CODE_SRVERR_INSUFFICENT_STORAGE = 507,
+	HTTP_STATUS_CODE_SRVERR_LOOP_DETECTED = 508,
+	HTTP_STATUS_CODE_SRVERR_NOT_EXTENDED = 510,
+	HTTP_STATUS_CODE_SRVERR_NETWORK_AUTH_REQ = 511,
+	/* place holder for invalid max status code */
+	HTTP_STATUS_CODE_INVALID_MAX,
 	/* place holder for default status code */
-	HTTP_STATUS_CODE_DEFAULT = INFINITE,
+	HTTP_STATUS_CODE_DEFAULT = INFINITE16,
 } http_status_code_t;
 /*
  * Convert status code to string of status code
@@ -105,16 +114,24 @@ extern const char *get_http_status_code_string(http_status_code_t code);
 /*
  * Convert string to status code
  * IN str - string to parse
- * RET status code or HTTP_STATUS_NONE on error
+ * RET status code or HTTP_STATUS_CODE_INVALID on error
  */
 extern http_status_code_t get_http_status_code(const char *str);
+
+/*
+ * Convert Slurm error to HTTP status
+ * IN error - Slurm error to convert http status code
+ * RET http status code or HTTP_STATUS_CODE_SRVERR_INTERNAL (catch all)
+ */
+extern http_status_code_t http_status_from_error(slurm_err_t error);
 
 /*
  * Supported HTTP request Methods.
  * All others will be rejected.
  */
 typedef enum {
-	HTTP_REQUEST_INVALID = 0,	/* should never happen */
+	/* place holder for invalid method */
+	HTTP_REQUEST_INVALID = 0,
 	HTTP_REQUEST_GET,
 	HTTP_REQUEST_POST,
 	HTTP_REQUEST_PUT,
@@ -123,7 +140,8 @@ typedef enum {
 	HTTP_REQUEST_HEAD,
 	HTTP_REQUEST_PATCH,
 	HTTP_REQUEST_TRACE,
-	HTTP_REQUEST_MAX		/* keep at end */
+	/* place holder for invalid max method */
+	HTTP_REQUEST_INVALID_MAX,
 } http_request_method_t;
 
 /*
@@ -137,6 +155,32 @@ extern const char *get_http_method_string(const http_request_method_t method);
 extern const char *get_http_method_string_lc(
 	const http_request_method_t method);
 
+/* RFC3986 section 3.1 URL Scheme */
+typedef enum {
+	URL_SCHEME_INVALID = 0,
+	URL_SCHEME_HTTP,
+	URL_SCHEME_HTTPS,
+	URL_SCHEME_UNIX, /* UNIX Socket - Not IANA registered */
+	URL_SCHEME_INVALID_MAX /* place holder */
+} url_scheme_t;
+
+/*
+ * Get URL scheme from string
+ * IN string containing method name (case insensitive)
+ * IN bytes - number of bytes in string
+ * IN scheme_ptr - pointer to populate with scheme
+ * RET SLURM_SUCCESS or error
+ */
+extern int url_get_scheme(const char *str, size_t bytes,
+			  url_scheme_t *scheme_ptr);
+
+/*
+ * Dump scheme as string into str
+ * IN scheme - pointer to scheme to dump into str
+ * RET string for scheme or NULL if unknown
+ */
+extern const char *url_get_scheme_string(const url_scheme_t scheme);
+
 /*
  * Parses url path into a data struct.
  * IN query rfc3986&rfc1866 query string
@@ -149,5 +193,58 @@ extern const char *get_http_method_string_lc(
  */
 extern data_t *parse_url_path(const char *path, bool convert_types,
 			      bool allow_templates);
+
+/*
+ * Decodes URL escape sequence (denoted via %XX)
+ * IN ptr - pointing to % character
+ * RET \0 on error or decoded character
+ */
+extern unsigned char url_decode_escape_seq(const char *ptr);
+
+typedef struct {
+	url_scheme_t scheme;
+	char *host;
+	char *port;
+	char *user;
+	char *path;
+	char *query;
+	char *fragment;
+} url_t;
+
+#define URL_INITIALIZER                       \
+	((url_t) {                            \
+		.scheme = URL_SCHEME_INVALID, \
+	})
+
+/* Free all members in URL */
+extern void url_free_members(url_t *url);
+
+/* Copy all members in URL */
+extern void url_copy_members(url_t *dst, const url_t *src);
+
+#define HTTP_HEADER_MAGIC 0x1aaffbe2
+
+/* HTTP header */
+typedef struct {
+	int magic; /* HTTP_HEADER_MAGIC */
+	char *name;
+	char *value;
+} http_header_t;
+
+/*
+ * Create new http header
+ * RET pointer to header (must free with free_http_header())
+ */
+extern http_header_t *http_header_new(const char *name, const char *value);
+
+/* Free http header and contents */
+extern void free_http_header(http_header_t *header);
+
+/* find http header from header list
+ * IN headers - list_t of http_header_t*
+ * IN name - name of header to find
+ * RET ptr to header value or NULL if not found
+ */
+extern const char *find_http_header(list_t *headers, const char *name);
 
 #endif /* SLURM_HTTP_H */

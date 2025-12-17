@@ -78,6 +78,7 @@ static void _config_defaults(void)
 	slingshot_config.limits.ptes.def = SLINGSHOT_PTE_DEF;
 	slingshot_config.limits.les.def = SLINGSHOT_LE_DEF;
 	slingshot_config.limits.acs.def = SLINGSHOT_AC_DEF;
+	slingshot_config.destroy_retries = SLINGSHOT_CXI_DESTROY_RETRIES;
 }
 
 /*
@@ -185,6 +186,28 @@ done:
 		 slingshot_state.vni_max, slingshot_state.vni_last, newsize,
 		 newbits, free_vnis);
 	return true;
+}
+
+/*
+ * Update vni table from config
+ */
+extern int slingshot_update_vni_table(void)
+{
+	uint16_t min = slingshot_state.vni_min;
+	uint16_t max = slingshot_state.vni_max;
+	char *arg = NULL;
+
+	if ((arg = conf_get_opt_str(slurm_conf.switch_param, "vnis="))) {
+		if (!_config_vnis("vnis", arg, &min, &max)) {
+			xfree(arg);
+			return SLURM_ERROR;
+		}
+	}
+	xfree(arg);
+
+	if (!_setup_vni_table(min, max))
+		return SLURM_ERROR;
+	return SLURM_SUCCESS;
 }
 
 /* Mapping between Slingshot traffic class labels and their bitmasks */
@@ -300,92 +323,6 @@ out:
 	log_flag(SWITCH, "[token=%s]: single_node_vni %d",
 		 token, slingshot_config.single_node_vni);
 	return true;
-}
-
-/*
- * Parse the "jlope_url" token, with format "jlope_url=<url>"
- */
-static bool _config_jlope_url(const char *token, char *arg)
-{
-	if (!arg)
-		goto err;
-	slingshot_config.jlope_url = xstrdup(arg);
-
-	log_flag(SWITCH, "[token=%s]: jlope_url %s",
-		 token, slingshot_config.jlope_url);
-	return true;
-err:
-	error("Invalid jlope_url token '%s' (example 'jlope_url=https://api-gw-service-nmn.local/apis/jackaloped')",
-		token);
-	return false;
-}
-
-/*
- * Parse the "jlope_auth" token, with format "jlope_auth={BASIC,OAUTH}"
- */
-static bool _config_jlope_auth(const char *token, char *arg)
-{
-	if (!arg)
-		goto err;
-	if (!xstrcasecmp(arg, SLINGSHOT_AUTH_BASIC_STR))
-		slingshot_config.jlope_auth = SLINGSHOT_AUTH_BASIC;
-	else if (!xstrcasecmp(arg, SLINGSHOT_AUTH_OAUTH_STR))
-		slingshot_config.jlope_auth = SLINGSHOT_AUTH_OAUTH;
-	else
-		goto err;
-
-	log_flag(SWITCH, "[token=%s]: jlope_auth %d",
-		 token, slingshot_config.jlope_auth);
-	return true;
-err:
-	error("Invalid jlope_auth token '%s' (example 'jlope_auth={BASIC,OAUTH}')",
-		token);
-	return false;
-}
-
-/*
- * Parse the "jlope_authdir" token, with format "jlope_authdir=<dirpath>"
- */
-static bool _config_jlope_authdir(const char *token, char *arg)
-{
-	struct stat statbuf;
-
-	if (!arg)
-		goto err;
-	if (stat(arg, &statbuf) != 0 || !S_ISDIR(statbuf.st_mode)) {
-		error("jlope_authdir directory '%s' is not a directory", arg);
-		return false;
-	}
-	slingshot_config.jlope_authdir = xstrdup(arg);
-
-	log_flag(SWITCH, "[token=%s]: jlope_authdir %s",
-		 token, slingshot_config.jlope_authdir);
-	return true;
-err:
-	error("Invalid jlope_authdir token '%s' (example 'jlope_authdir=/etc/wlm-client-auth')",
-		token);
-	return false;
-}
-
-/*
- * If jlope_url is set, set up default values for jlope_auth{dir}
- * (if not already set)
- */
-static void _config_jlope_defaults(void)
-{
-	if (!slingshot_config.jlope_url)
-		return;
-	if (slingshot_config.jlope_auth == SLINGSHOT_AUTH_NONE)
-		slingshot_config.jlope_auth = SLINGSHOT_AUTH_OAUTH;
-	if (!slingshot_config.jlope_authdir) {
-		if (slingshot_config.jlope_auth == SLINGSHOT_AUTH_OAUTH)
-			slingshot_config.jlope_authdir =
-					xstrdup(SLINGSHOT_JLOPE_AUTH_OAUTH_DIR);
-		else if (slingshot_config.jlope_auth == SLINGSHOT_AUTH_BASIC)
-			slingshot_config.jlope_authdir =
-					xstrdup(SLINGSHOT_JLOPE_AUTH_BASIC_DIR);
-	}
-	xassert(slingshot_config.jlope_authdir);
 }
 
 /*
@@ -506,6 +443,99 @@ err:
 	return false;
 }
 
+/* Verify that the path is a fully qualified and readable */
+static bool _is_valid_file(const char *token, char *path, char *option,
+			   char *example)
+{
+	struct stat statbuf;
+
+	if (!path) {
+		error("Invalid %s token '%s' (example '%s=%s')",
+		      option, token, option, example);
+	} else if (path[0] != '/') {
+		error("%s's path (%s) is required to be a fully qualified pathname",
+		      option, path);
+	} else if ((stat(path, &statbuf) != 0)) {
+		error("%s's path (%s) can not be accessed or it doesn't exist",
+		      option, path);
+	} else if (!S_ISREG(statbuf.st_mode)) {
+		error("%s's path (%s) is not a regular file", option, path);
+	} else if (access(path, R_OK)) {
+		error("%s's path (%s) does not have read permissions",
+		      option, path);
+	} else {
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * Parse the "fm_mtls_ca" token"
+ */
+static bool _config_fm_mtls_ca(const char *token, char *arg)
+{
+	if (!_is_valid_file(token, arg, "fm_mtls_ca",
+			    "/etc/wlm-client-auth/ca.crt"))
+		return false;
+
+	slingshot_config.fm_mtls_ca = xstrdup(arg);
+
+	log_flag(SWITCH, "[token=%s]: fm_mtls_ca %s", token,
+		 slingshot_config.fm_mtls_ca);
+	return true;
+}
+
+/*
+ * Parse the "fm_mtls_cert" token"
+ */
+static bool _config_fm_mtls_cert(const char *token, char *arg)
+{
+	if (!_is_valid_file(token, arg, "fm_mtls_cert",
+			    "/etc/wlm-client-auth/public.crt"))
+		return false;
+
+	slingshot_config.fm_mtls_cert = xstrdup(arg);
+
+	log_flag(SWITCH, "[token=%s]: fm_mtls_cert %s", token,
+		 slingshot_config.fm_mtls_cert);
+	return true;
+}
+
+/*
+ * Parse the "fm_mtls_key" token"
+ */
+static bool _config_fm_mtls_key(const char *token, char *arg)
+{
+	if (!_is_valid_file(token, arg, "fm_mtls_key",
+			    "/etc/wlm-client-auth/private.key"))
+		return false;
+
+	slingshot_config.fm_mtls_key = xstrdup(arg);
+
+	log_flag(SWITCH, "[token=%s]: fm_mtls_key %s", token,
+		 slingshot_config.fm_mtls_key);
+	return true;
+}
+
+/*
+ * Parse the "fm_mtls_url" token"
+ */
+static bool _config_fm_mtls_url(const char *token, char *arg)
+{
+	if (!arg)
+		goto err;
+	slingshot_config.fm_mtls_url = xstrdup(arg);
+
+	log_flag(SWITCH, "[token=%s]: fm_mtls_url %s", token,
+		 slingshot_config.fm_mtls_url);
+	return true;
+err:
+	error("Invalid fm_mtls_url token '%s' (example 'fm_mtls_url=https://api-gw-service-nmn.local/apis/fm')",
+	      token);
+	return false;
+}
+
 /*
  * If fm_url is set, set up default values for fm_auth{dir}
  * (if not already set)
@@ -525,6 +555,81 @@ static void _config_fm_defaults(void)
 					xstrdup(SLINGSHOT_FM_AUTH_BASIC_DIR);
 	}
 	xassert(slingshot_config.fm_authdir);
+}
+
+static void _try_enabling_fm_mtls(void)
+{
+	/* Only enable mTLS if the following were provided */
+	if (!(slingshot_config.fm_mtls_cert && slingshot_config.fm_mtls_key &&
+	      (slingshot_config.fm_mtls_url || slingshot_config.fm_url))) {
+		/* If only partial mTLS config given warn that it is disabled */
+		if (slingshot_config.fm_mtls_ca ||
+		    slingshot_config.fm_mtls_cert ||
+		    slingshot_config.fm_mtls_key ||
+		    slingshot_config.fm_mtls_url)
+			warning("Fabric Manager mTLS authentication is disabled due to fm_mtls_cert, fm_mtls_key, or a fabric manager url (i.e. fm_mtls_url or fm_url) not being configured.");
+		return;
+	}
+	/* If fm_mtls_url is not provided then default to fm_url */
+	if (!slingshot_config.fm_mtls_url)
+		slingshot_config.fm_mtls_url = xstrdup(slingshot_config.fm_url);
+
+	slingshot_config.flags |= SLINGSHOT_FLAGS_ENABLE_MTLS;
+
+	if (!slingshot_config.fm_mtls_ca)
+		warning("Fabric Manager mTLS authentication is enabled but a certification bundle was not provided. Server identity will not be verified.");
+}
+
+static int _config_destroy_retries(const char *token, char *arg)
+{
+	uint32_t tmp;
+	char *end_ptr = NULL;
+
+	if (!arg)
+		return SLURM_ERROR;
+
+	errno = 0;
+	tmp = strtoul(arg, &end_ptr, 10);
+	if ((errno != 0) || *end_ptr) {
+		error("Invalid value for %s", token);
+		return SLURM_ERROR;
+	}
+
+	slingshot_config.destroy_retries = tmp;
+
+	log_flag(SWITCH, "[token=%s]: destroy_retries = %u",
+		 token, slingshot_config.destroy_retries);
+
+	return SLURM_SUCCESS;
+}
+
+/*
+ * Parse SwithParameters and --network 'nic_distribution_count=<value>' token.
+ * return value, or 0 on error
+ */
+static uint16_t _parse_nic_dist_cnt(
+	const char *token,
+	const char *nic_dist_arg)
+{
+	long ret; /* cast to uint16_t */
+	char *end_ptr = NULL;
+	if (!nic_dist_arg)
+		goto err;
+
+	ret = strtol(nic_dist_arg, &end_ptr, 10);
+
+	/* Validate that the value is a valid number and between 1 and 65535 */
+	if (*end_ptr || (ret <= 0) || (ret > UINT16_MAX))
+		goto err;
+
+	log_flag(SWITCH, "[token=%s]: nic_distribution_count %ld", token, ret);
+
+	return ret;
+err:
+	error("Invalid nic_distribution_count token '%s' (valid range %d-%d)",
+	      token, 1, UINT16_MAX);
+
+	return 0;
 }
 
 /*
@@ -649,10 +754,42 @@ static void _print_limits(slingshot_limits_set_t *limits)
  */
 extern void slingshot_free_config(void)
 {
-	xfree(slingshot_config.jlope_url);
-	xfree(slingshot_config.jlope_authdir);
 	xfree(slingshot_config.fm_url);
 	xfree(slingshot_config.fm_authdir);
+	xfree(slingshot_config.fm_mtls_ca);
+	xfree(slingshot_config.fm_mtls_cert);
+	xfree(slingshot_config.fm_mtls_key);
+	xfree(slingshot_config.fm_mtls_url);
+}
+
+extern bool slingshot_stepd_init(const char *switch_params)
+{
+	char *params = NULL, *token, *arg, *save_ptr = NULL;
+	const char destroy_retries[] = "destroy_retries";
+	const size_t size_destroy_retries = sizeof(destroy_retries) - 1;
+
+	slingshot_config.destroy_retries = SLINGSHOT_CXI_DESTROY_RETRIES;
+
+	if (!switch_params)
+		return true;
+
+	params = xstrdup(switch_params);
+	for (token = strtok_r(params, ",", &save_ptr); token;
+	     token = strtok_r(NULL, ",", &save_ptr)) {
+		if ((arg = strchr(token, '=')))
+			arg++; /* points to argument after = if any */
+		if (!xstrncasecmp(token, destroy_retries,
+				  size_destroy_retries)) {
+			if (_config_destroy_retries(token, arg))
+				goto err;
+		}
+	}
+
+	xfree(params);
+	return true;
+err:
+	xfree(params);
+	return false;
 }
 
 /*
@@ -662,6 +799,8 @@ extern void slingshot_free_config(void)
 extern bool slingshot_setup_config(const char *switch_params)
 {
 	char *params = NULL, *token, *arg, *save_ptr = NULL;
+	const char destroy_retries[] = "destroy_retries";
+	const size_t size_destroy_retries = sizeof(destroy_retries) - 1;
 	const char vnis[] = "vnis";
 	const size_t size_vnis = sizeof(vnis) - 1;
 	const char tcs[] = "tcs";
@@ -674,12 +813,6 @@ extern bool slingshot_setup_config(const char *switch_params)
 	const size_t size_adjust_limits = sizeof(adjust_limits) - 1;
 	const char no_adjust_limits[] = "no_adjust_limits";
 	const size_t size_no_adjust_limits = sizeof(no_adjust_limits) - 1;
-	const char jlope_url[] = "jlope_url";
-	const size_t size_jlope_url = sizeof(jlope_url) - 1;
-	const char jlope_auth[] = "jlope_auth";
-	const size_t size_jlope_auth = sizeof(jlope_auth) - 1;
-	const char jlope_authdir[] = "jlope_authdir";
-	const size_t size_jlope_authdir = sizeof(jlope_authdir) - 1;
 	const char hwcoll_addrs_per_job[] = "hwcoll_addrs_per_job";
 	const size_t size_hwcoll_addrs_per_job =
                                         sizeof(hwcoll_addrs_per_job) - 1;
@@ -691,11 +824,21 @@ extern bool slingshot_setup_config(const char *switch_params)
 	const size_t size_fm_auth = sizeof(fm_auth) - 1;
 	const char fm_authdir[] = "fm_authdir";
 	const size_t size_fm_authdir = sizeof(fm_authdir) - 1;
-	/* Use min/max in state file if SwitchParameters not set */
+	const char fm_mtls_ca[] = "fm_mtls_ca";
+	const size_t size_fm_mtls_ca = sizeof(fm_mtls_ca) - 1;
+	const char fm_mtls_cert[] = "fm_mtls_cert";
+	const size_t size_fm_mtls_cert = sizeof(fm_mtls_cert) - 1;
+	const char fm_mtls_key[] = "fm_mtls_key";
+	const size_t size_fm_mtls_key = sizeof(fm_mtls_key) - 1;
+	const char fm_mtls_url[] = "fm_mtls_url";
+	const size_t size_fm_mtls_url = sizeof(fm_mtls_url) - 1;
+	char nic_dist_count[] = "nic_distribution_count";
+	size_t size_nic_dist_count = sizeof(nic_dist_count) - 1;
+	/* Will be default size when SwitchParameters is not set */
 	uint16_t vni_min = slingshot_state.vni_min;
 	uint16_t vni_max = slingshot_state.vni_max;
+	bool vni_range_set = false;
 
-	log_flag(SWITCH, "switch_params=%s", switch_params);
 	/*
 	 * Handle SwitchParameters values (separated by commas):
 	 *
@@ -710,9 +853,6 @@ extern bool slingshot_setup_config(const char *switch_params)
 	 *   {no_}adjust_limits: {don't} adjust resource reservations
 	 *     for each NIC by subtracting resources already
 	 *     used/reserved by system services
-	 *   jlope_url=<url>: use URL for jackaloped REST requests
-	 *   jlope_auth="BASIC|OAUTH": jackaloped REST API authentication type
-	 *   jlope_authdir=<dir>: jackaloped authentication info directory
 	 *     (i.e. /etc/jackaloped for BASIC, /etc/wlm-client-auth for OAUTH)
 	 *   hwcoll_addrs_per_job=<number>: allocate <number> of Slingshot
          *     hardware collectives multicast addresses per job
@@ -723,6 +863,10 @@ extern bool slingshot_setup_config(const char *switch_params)
 	 *   fm_auth="BASIC|OAUTH": fabric manager REST API authentication type
 	 *   fm_authdir=<dir>: fabric manager authentication info directory
 	 *     (i.e. /etc/fmsim for BASIC, /etc/wlm-client-auth for OAUTH)
+	 *   fm_mtls_ca=<path to FM certificate bundle>
+	 *   fm_mtls_cert=<path to client public certificate>
+	 *   fm_mtls_key=<path to client private key>
+	 *   fm_mtls_url=<url for mTLS authentication to FM>
 	 *
 	 *   def_<NIC_resource>: default per-thread value for resource
 	 *   res_<NIC_resource>: reserved value for resource
@@ -741,11 +885,10 @@ extern bool slingshot_setup_config(const char *switch_params)
 
 	slingshot_free_config();
 	_config_defaults();
-	if (!switch_params) {
-		if (!_setup_vni_table(vni_min, vni_max))
-			goto err;
+	if (!switch_params)
 		goto out;
-	}
+
+	log_flag(SWITCH, "switch_params=%s", switch_params);
 
 	params = xstrdup(switch_params);
 	for (token = strtok_r(params, ",", &save_ptr); token;
@@ -758,6 +901,7 @@ extern bool slingshot_setup_config(const char *switch_params)
 			/* See if any incompatible changes in VNI range */
 			if (!_setup_vni_table(vni_min, vni_max))
 				goto err;
+			vni_range_set = true;
 		} else if (!xstrncasecmp(token, tcs, size_tcs)) {
 			if (!_config_tcs(token, arg, &slingshot_config.tcs))
 				goto err;
@@ -775,20 +919,6 @@ extern bool slingshot_setup_config(const char *switch_params)
 					 size_no_adjust_limits)) {
 			slingshot_config.flags &=
 					~(SLINGSHOT_FLAGS_ADJUST_LIMITS);
-		} else if (!xstrncasecmp(token, jlope_url, size_jlope_url)) {
-			if (!_config_jlope_url(token, arg))
-				goto err;
-		/*
-		 * NOTE: jlope_authdir needs to come before jlope_auth
-		 * since jlope_auth is a prefix of jlope_authdir
-		 */
-		} else if (!xstrncasecmp(token, jlope_authdir,
-			   size_jlope_authdir)) {
-			if (!_config_jlope_authdir(token, arg))
-				goto err;
-		} else if (!xstrncasecmp(token, jlope_auth, size_jlope_auth)) {
-			if (!_config_jlope_auth(token, arg))
-				goto err;
 		} else if (!xstrncasecmp(token, hwcoll_addrs_per_job,
                                          size_hwcoll_addrs_per_job)) {
 			if (!_config_hwcoll_addrs_per_job(token, arg))
@@ -810,30 +940,51 @@ extern bool slingshot_setup_config(const char *switch_params)
 		} else if (!xstrncasecmp(token, fm_auth, size_fm_auth)) {
 			if (!_config_fm_auth(token, arg))
 				goto err;
+		} else if (!xstrncasecmp(token, fm_mtls_ca, size_fm_mtls_ca)) {
+			if (!_config_fm_mtls_ca(token, arg))
+				goto err;
+		} else if (!xstrncasecmp(token, fm_mtls_cert,
+					 size_fm_mtls_cert)) {
+			if (!_config_fm_mtls_cert(token, arg))
+				goto err;
+		} else if (!xstrncasecmp(token, fm_mtls_key,
+					 size_fm_mtls_key)) {
+			if (!_config_fm_mtls_key(token, arg))
+				goto err;
+		} else if (!xstrncasecmp(token, fm_mtls_url,
+					 size_fm_mtls_url)) {
+			if (!_config_fm_mtls_url(token, arg))
+				goto err;
+		} else if (!xstrncasecmp(token, destroy_retries,
+					 size_destroy_retries)) {
+			if (_config_destroy_retries(token, arg))
+				goto err;
+		} else if (!xstrncasecmp(token, nic_dist_count,
+					 size_nic_dist_count)) {
+			if (!(slingshot_config.nic_dist_cnt =
+				      _parse_nic_dist_cnt(token, arg)))
+				goto err;
 		} else {
 			if (!_config_limits(token, &slingshot_config.limits))
 				goto err;
 		}
 	}
-	/* If jlope_url is set, set up default values for jlope_auth{dir} */
-	_config_jlope_defaults();
 	/* If fm_url is set, set up default values for fm_auth{dir} */
 	_config_fm_defaults();
 
-	/* Set up connection to jackaloped */
-	if (!slingshot_init_instant_on())
-		goto err;
+	_try_enabling_fm_mtls();
+
 	/* Set up connection to fabric manager */
 	if (!slingshot_init_collectives())
 		goto err;
 
 out:
+	if (!vni_range_set && !_setup_vni_table(vni_min, vni_max))
+		goto err;
+
 	debug("single_node_vni=%d job_vni=%d tcs=%#x flags=%#x",
 	      slingshot_config.single_node_vni, slingshot_config.job_vni,
 	      slingshot_config.tcs, slingshot_config.flags);
-	debug("jlope_url=%s jlope_auth=%u jlope_authdir=%s",
-	      slingshot_config.jlope_url, slingshot_config.jlope_auth,
-	      slingshot_config.jlope_authdir);
 	debug("fm_url=%s fm_auth=%u fm_authdir=%s hwcoll_addrs_per_job=%d hwcoll_num_nodes=%d",
               slingshot_config.fm_url, slingshot_config.fm_auth,
 	      slingshot_config.fm_authdir,
@@ -1061,8 +1212,12 @@ static bool _parse_network_token(const char *token, bool is_job,
 	size_t no_adjust_limits_siz = sizeof(no_adjust_limits_str) - 1;
 	char rdzv_get_str[] = "disable_rdzv_get";
 	size_t rdzv_get_siz = sizeof(rdzv_get_str) - 1;
+	char hwcoll_str[] = "hwcoll";
+	size_t hwcoll_siz = sizeof(hwcoll_siz) - 1;
 	char tcs_str[] = "tcs";
 	size_t tcs_siz = sizeof(tcs_str) - 1;
+	char nic_dist_count_str[] = "nic_distribution_count";
+	size_t nic_dist_count_siz = sizeof(nic_dist_count_str) - 1;
 
 	char *arg = xstrchr(token, '=');
 	if (arg != NULL)
@@ -1106,9 +1261,14 @@ static bool _parse_network_token(const char *token, bool is_job,
 		job->flags &= ~(SLINGSHOT_FLAGS_ADJUST_LIMITS);
 	} else if (!xstrncmp(token, rdzv_get_str, rdzv_get_siz)) {
 		job->flags |= SLINGSHOT_FLAGS_DISABLE_RDZV_GET;
+	} else if (!xstrncmp(token, hwcoll_str, hwcoll_siz)) {
+		;
 	} else if (!xstrncmp(token, tcs_str, tcs_siz)) {
 		if (is_job)
 			return _config_tcs(token, arg, &job->tcs);
+	} else if (!xstrncmp(token, nic_dist_count_str, nic_dist_count_siz)) {
+		if (!(job->nic_dist_cnt = _parse_nic_dist_cnt(token, arg)))
+			return false;
 	} else if (!_config_limits(token, &job->limits)) {
 		return false;
 	}
@@ -1136,6 +1296,7 @@ static bool _setup_network_params(const char *network_params,
 	job->limits = slingshot_config.limits;
 	job->tcs = slingshot_config.tcs;
 	job->flags = slingshot_config.flags;
+	job->nic_dist_cnt = slingshot_config.nic_dist_cnt;
 
 	/* no_vni disabled by default */
 	*no_vni = false;

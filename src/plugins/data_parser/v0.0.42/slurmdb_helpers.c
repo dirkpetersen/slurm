@@ -55,13 +55,13 @@ typedef struct {
 } list_to_str_args_t;
 
 extern int db_query_list_funcname(parse_op_t op, data_parser_type_t type,
-				  args_t *args, List *list,
+				  args_t *args, list_t **list,
 				  db_list_query_func_t func, void *cond,
 				  const char *func_name,
 				  const char *func_caller_name)
 {
 	int rc;
-	List l;
+	list_t *l;
 
 	xassert(!*list);
 
@@ -220,7 +220,7 @@ extern int resolve_qos(parse_op_t op, const parser_t *const parser,
 			on_error(op, parser->type, args, rc,
 				 set_source_path(&path, args, parent_path),
 				 caller,
-				 "QOS resolution failed with unexpected QOS name/id formated as data type:%s",
+				 "QOS resolution failed with unexpected QOS name/id formatted as data type:%s",
 				 data_get_type_string(src));
 		goto done;
 	}
@@ -353,7 +353,7 @@ extern int load_prereqs_funcname(parse_op_t op, const parser_t *const parser,
 
 	if ((parser->needs & NEED_QOS) && !args->qos_list) {
 		slurmdb_qos_cond_t cond = {
-			.with_deleted = 1,
+			.flags = QOS_COND_FLAG_WITH_DELETED,
 		};
 
 		if ((rc = _db_query_list(QUERYING, parser->type, args,
@@ -370,7 +370,7 @@ extern int load_prereqs_funcname(parse_op_t op, const parser_t *const parser,
 
 	if ((parser->needs & NEED_ASSOC) && !args->assoc_list) {
 		slurmdb_assoc_cond_t cond = {
-			.with_deleted = 1,
+			.flags = ASSOC_COND_FLAG_WITH_DELETED,
 		};
 
 		if ((rc = _db_query_list(QUERYING, parser->type, args,

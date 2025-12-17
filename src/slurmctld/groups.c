@@ -206,7 +206,7 @@ static uid_t *_get_group_members(char *group_name, int *uid_cnt)
 #endif
 	grp_buffer = xmalloc(buflen);
 	while (1) {
-		slurm_seterrno(0);
+		errno = 0;
 		res = getgrnam_r(group_name, &grp, grp_buffer, buflen,
 				 &grp_result);
 
@@ -232,9 +232,8 @@ static uid_t *_get_group_members(char *group_name, int *uid_cnt)
 	/* Get the members from the getgrnam_r() call.
 	 */
 	for (i = 0; grp_result->gr_mem[i]; i++) {
-
-		if (uid_from_string(grp_result->gr_mem[i],
-				    &my_uid) < 0) {
+		if (uid_from_string(grp_result->gr_mem[i], &my_uid) !=
+		    SLURM_SUCCESS) {
 			continue;
 		}
 		if (my_uid == 0)
@@ -262,7 +261,7 @@ static uid_t *_get_group_members(char *group_name, int *uid_cnt)
 		/* MH-CEA workaround to handle different group entries with
 		 * the same gid
 		 */
-		slurm_seterrno(0);
+		errno = 0;
 		res = getgrent_r(&grp, grp_buffer, buflen, &grp_result);
 		if (res != 0 || grp_result == NULL) {
 			/* FreeBSD returns 0 and sets the grp_result to NULL
@@ -285,7 +284,7 @@ static uid_t *_get_group_members(char *group_name, int *uid_cnt)
 
 		        for (i=0; grp_result->gr_mem[i]; i++) {
 				if (uid_from_string(grp_result->gr_mem[i],
-						    &my_uid) < 0) {
+						    &my_uid) != SLURM_SUCCESS) {
 					/* Group member without valid login */
 					continue;
 				}

@@ -153,7 +153,7 @@ static int  _check_params(void);
 static void _free_options(void);
 static void _remove_empty_output(void);
 static int _list_items(void);
-static int _fields_intersection(hid_t fid_job, List tables, List fields);
+static int _fields_intersection(hid_t fid_job, list_t *tables, list_t *fields);
 
 static void _help_msg(void)
 {
@@ -339,7 +339,6 @@ static int _set_options(const int argc, char **argv)
 	int option_index = 0;
 	int cc;
 	log_options_t logopt = LOG_OPTS_STDERR_ONLY;
-	char *next_str = NULL;
 	uid_t u;
 
 	static struct option long_options[] = {
@@ -379,6 +378,7 @@ static int _set_options(const int argc, char **argv)
 	                         long_options, &option_index)) != EOF) {
 		switch (cc) {
 		case 'd':
+			xfree(params.data_item);
 			params.data_item = xstrdup(optarg);
 			/* params.data_item =
 			   xstrtolower(params.data_item); */
@@ -397,27 +397,52 @@ static int _set_options(const int argc, char **argv)
 			return -1;
 			break;
 		case 'i':
+			xfree(params.input);
 			params.input = xstrdup(optarg);
 			break;
 		case 'j':
-			params.job_id = strtol(optarg, &next_str, 10);
-			if (next_str[0] == '.')
-				params.step_id =
-					strtol(next_str + 1, NULL, 10);
+		{
+			slurm_selected_step_t selected_step;
+			int rc = unfmt_job_id_string(optarg, &selected_step, 0);
+
+			switch (rc) {
+			case SLURM_SUCCESS:
+				if (selected_step.array_task_id != NO_VAL) {
+					error("Job array IDs not supported, use regular job ID instead");
+					return -1;
+				}
+				if (selected_step.het_job_offset != NO_VAL) {
+					error("Het job IDs not supported, use regular job ID instead");
+					return -1;
+				}
+				break;
+			default:
+				error("Failed to parse job ID \"%s\": %s",
+				      optarg, slurm_strerror(rc));
+				return -1;
+			}
+			params.job_id = selected_step.step_id.job_id;
+			params.step_id = selected_step.step_id.step_id;
 			break;
+		}
 		case 'l':
+			xfree(params.level);
 			params.level = xstrdup(optarg);
 			break;
 		case 'N':
+			xfree(params.node);
 			params.node = xstrdup(optarg);
 			break;
 		case 'o':
+			xfree(params.output);
 			params.output = xstrdup(optarg);
 			break;
 		case 'p':
+			xfree(params.dir);
 			params.dir = xstrdup(optarg);
 			break;
 		case 's':
+			xfree(params.series);
 			if (xstrcmp(optarg, GRP_ENERGY)
 			    && xstrcmp(optarg, GRP_FILESYSTEM)
 			    && xstrcmp(optarg, GRP_NETWORK)
@@ -433,7 +458,8 @@ static int _set_options(const int argc, char **argv)
 			params.keepfiles = 1;
 			break;
 		case 'u':
-			if (uid_from_string(optarg, &u) < 0) {
+			xfree(params.user);
+			if (uid_from_string(optarg, &u) != SLURM_SUCCESS) {
 				error("No such user --uid=\"%s\"",
 				      optarg);
 				return -1;
@@ -593,7 +619,7 @@ static int _merge_step_files(void)
 	int job_id;
 	int rc = SLURM_SUCCESS;
 	list_itr_t *itr;
-	List file_list = NULL;
+	list_t *file_list = NULL;
 	sh5util_file_t *sh5util_file = NULL;
 
 	step_dir = xstrdup_printf("%s/%s", params.dir, params.user);
@@ -783,7 +809,7 @@ static void _table_path(table_t *t, char *path)
 static herr_t _collect_tables_group(hid_t g_id, const char *name,
                                     const H5L_info_t *link_info, void *op_data)
 {
-	List tables = (List)op_data;
+	list_t *tables = op_data;
 	hid_t table_id = -1;
 
 	/* open the dataset. */
@@ -809,7 +835,7 @@ static herr_t _collect_tables_node(hid_t g_id, const char *name,
                                    const H5L_info_t *link_info, void *op_data)
 {
 	char object_path[PATH_MAX];
-	List tables = (List)op_data;
+	list_t *tables = op_data;
 	hid_t object_id = -1;
 	herr_t err;
 
@@ -879,7 +905,7 @@ static herr_t _collect_tables_step(hid_t g_id, const char *name,
 	return 0;
 }
 
-static int _tables_list(hid_t fid_job, List tables)
+static int _tables_list(hid_t fid_job, list_t *tables)
 {
 	herr_t err;
 	list_itr_t *it;
@@ -1005,7 +1031,7 @@ static void _extract_totals(size_t nb_fields, size_t *offsets, hid_t *types,
  * Extract the content of a table within a node. This function first discovers
  * the content of the table and then handles both timeseries and totals levels.
  */
-static int _extract_series_table(hid_t fid_job, table_t *table, List fields,
+static int _extract_series_table(hid_t fid_job, table_t *table, list_t *fields,
 				 FILE *output, bool level_total)
 {
 	char path[PATH_MAX];
@@ -1136,8 +1162,8 @@ static int _extract_series(void)
 	hid_t fid_job = -1;
 	bool level_total;
 	const char *field;
-	List tables = NULL;
-	List fields = NULL;
+	list_t *tables = NULL;
+	list_t *fields = NULL;
 	list_itr_t *it;
 	FILE *output = NULL;
 	int rc = SLURM_ERROR;
@@ -1448,7 +1474,7 @@ static herr_t _extract_item_step(hid_t g_id, const char *step_name,
 	hid_t item_type = -1;
 	herr_t err;
 
-	List tables = NULL;
+	list_t *tables = NULL;
 	list_itr_t *it = NULL;
 	table_t *t;
 
@@ -1647,7 +1673,7 @@ static int _extract_item(void)
 	return SLURM_SUCCESS;
 }
 
-static int _fields_intersection(hid_t fid_job, List tables, List fields)
+static int _fields_intersection(hid_t fid_job, list_t *tables, list_t *fields)
 {
 	hid_t jgid_table = -1;
 	hid_t tid = -1;
@@ -1722,11 +1748,11 @@ static int _fields_intersection(hid_t fid_job, List tables, List fields)
 static int _list_items(void)
 {
 	hid_t fid_job = -1;
-	List fields;
+	list_t *fields;
 	list_itr_t *it;
 	const char *field;
 	int rc = SLURM_ERROR;
-	List tables;
+	list_t *tables;
 
 	/* get series names */
 	fid_job = H5Fopen(params.input, H5F_ACC_RDONLY, H5P_DEFAULT);

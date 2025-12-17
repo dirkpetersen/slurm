@@ -44,24 +44,30 @@
   #include <sys/prctl.h>
 #endif
 
-#include "src/interfaces/auth.h"
-#include "src/interfaces/gres.h"
 #include "src/common/macros.h"
 #include "src/common/pack.h"
-#include "src/common/slurmdbd_defs.h"
-#include "src/common/slurmdbd_pack.h"
-#include "src/interfaces/accounting_storage.h"
-#include "src/interfaces/jobacct_gather.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
+#include "src/common/slurmdbd_defs.h"
+#include "src/common/slurmdbd_pack.h"
 #include "src/common/timers.h"
 #include "src/common/uid.h"
 #include "src/common/xstring.h"
+
+#include "src/conmgr/conmgr.h"
+
+#include "src/interfaces/accounting_storage.h"
+#include "src/interfaces/auth.h"
+#include "src/interfaces/conn.h"
+#include "src/interfaces/gres.h"
+#include "src/interfaces/jobacct_gather.h"
+
+#include "src/slurmctld/slurmctld.h"
+
+#include "src/slurmdbd/proc_req.h"
 #include "src/slurmdbd/read_config.h"
 #include "src/slurmdbd/rpc_mgr.h"
-#include "src/slurmdbd/proc_req.h"
 #include "src/slurmdbd/slurmdbd.h"
-#include "src/slurmctld/slurmctld.h"
 
 /* Local functions */
 static bool _validate_slurm_user(slurmdbd_conn_t *dbd_conn);
@@ -72,17 +78,67 @@ static void _process_job_start(slurmdbd_conn_t *slurmdbd_conn,
 			       dbd_job_start_msg_t *job_start_msg,
 			       dbd_id_rc_msg_t *id_rc_msg);
 
+static char *_internal_rc_to_str(uint32_t rc, slurmdbd_conn_t *dbd_conn,
+				 bool new_line)
+{
+	int fd = conn_g_get_fd(dbd_conn->pcon->conn);
+	char *comment = NULL;
+
+	if (rc == SLURM_NO_CHANGE_IN_DATA) {
+		if (new_line)
+			comment = "Request didn't affect anything\n";
+		else
+			comment = "Request didn't affect anything";
+		debug2("CONN:%d %s", fd, comment);
+		return comment;
+	}
+
+	/*
+	 * Clients of _add_accounts_cond() and _add_users_cond() expect the
+	 * comment to have '\n' at the end of the strings. Since these are
+	 * string literals, we have the new_line condition to handle these in
+	 * one location.
+	 */
+	if (new_line) {
+		if (rc == ESLURM_ACCESS_DENIED) {
+			comment = "Your user doesn't have privilege to perform this action\n";
+		} else if (rc == SLURM_ERROR) {
+			comment = "Something was wrong with your query\n";
+		} else if (rc == ESLURM_DB_CONNECTION) {
+			comment = slurm_strerror(rc);
+		} else if (rc == ESLURM_QOS_PREEMPTION_LOOP) {
+			comment = "QOS Preemption loop detected\n";
+		} else {
+			if (!(comment = slurm_strerror(rc)))
+				comment = "Unknown issue\n";
+		}
+	} else {
+		if (rc == ESLURM_ACCESS_DENIED) {
+			comment = "Your user doesn't have privilege to perform this action";
+		} else if (rc == SLURM_ERROR) {
+			comment = "Something was wrong with your query";
+		} else if (rc == ESLURM_DB_CONNECTION) {
+			comment = slurm_strerror(rc);
+		} else if (rc == ESLURM_QOS_PREEMPTION_LOOP) {
+			comment = "QOS Preemption loop detected";
+		} else {
+			if (!(comment = slurm_strerror(rc)))
+				comment = "Unknown issue";
+		}
+	}
+	error("CONN:%d %s", fd, comment);
+
+	return comment;
+}
+
 /*
  * _validate_slurm_user - validate that the uid is authorized to see
  *      privileged data (either user root or SlurmUser)
  */
 static bool _validate_slurm_user(slurmdbd_conn_t *dbd_conn)
 {
-	uint32_t uid = dbd_conn->conn->auth_uid;
-#ifndef NDEBUG
-	if (drop_priv)
-		return false;
-#endif
+	uint32_t uid = dbd_conn->pcon->auth_uid;
+
 	if ((uid == 0) || (uid == slurm_conf.slurm_user_id))
 		return true;
 
@@ -95,11 +151,8 @@ static bool _validate_slurm_user(slurmdbd_conn_t *dbd_conn)
  */
 static bool _validate_super_user(slurmdbd_conn_t *dbd_conn)
 {
-	uint32_t uid = dbd_conn->conn->auth_uid;
-#ifndef NDEBUG
-	if (drop_priv)
-		return false;
-#endif
+	uint32_t uid = dbd_conn->pcon->auth_uid;
+
 	if ((uid == 0) || (uid == slurm_conf.slurm_user_id) ||
 	    assoc_mgr_get_admin_level(dbd_conn, uid) >= SLURMDB_ADMIN_SUPER_USER)
 		return true;
@@ -113,11 +166,8 @@ static bool _validate_super_user(slurmdbd_conn_t *dbd_conn)
  */
 static bool _validate_operator(slurmdbd_conn_t *dbd_conn)
 {
-	uint32_t uid = dbd_conn->conn->auth_uid;
-#ifndef NDEBUG
-	if (drop_priv)
-		return false;
-#endif
+	uint32_t uid = dbd_conn->pcon->auth_uid;
+
 	if ((uid == 0) || (uid == slurm_conf.slurm_user_id) ||
 	    assoc_mgr_get_admin_level(dbd_conn, uid) >= SLURMDB_ADMIN_OPERATOR)
 		return true;
@@ -125,65 +175,73 @@ static bool _validate_operator(slurmdbd_conn_t *dbd_conn)
 	return false;
 }
 
-static void _add_registered_cluster(slurmdbd_conn_t *db_conn)
+static void _add_registered_cluster(slurmdbd_conn_t *dbd_conn)
 {
 	list_itr_t *itr;
 	slurmdbd_conn_t *slurmdbd_conn;
 
-	if (!db_conn->conn->rem_port) {
+	if (!dbd_conn->pcon->rem_port) {
 		error("%s: trying to register a cluster (%s) with no remote port",
-		      __func__, db_conn->conn->cluster_name);
+		      __func__, dbd_conn->pcon->cluster_name);
 		return;
 	}
 
 	slurm_mutex_lock(&registered_lock);
 	itr = list_iterator_create(registered_clusters);
 	while ((slurmdbd_conn = list_next(itr))) {
-		if (db_conn == slurmdbd_conn)
+		int new_fd = -1, existing_fd = -1;
+
+		if (dbd_conn == slurmdbd_conn)
 			break;
 
-		if (!xstrcmp(db_conn->conn->cluster_name,
-			     slurmdbd_conn->conn->cluster_name) &&
-		    (db_conn->conn->fd != slurmdbd_conn->conn->fd)) {
+		if (dbd_conn->pcon->conn) {
+			new_fd = conn_g_get_fd(dbd_conn->pcon->conn);
+		}
+
+		if (slurmdbd_conn->pcon->conn) {
+			existing_fd = conn_g_get_fd(slurmdbd_conn->pcon->conn);
+		}
+
+		if (!xstrcmp(dbd_conn->pcon->cluster_name,
+			     slurmdbd_conn->pcon->cluster_name) &&
+		    (new_fd != existing_fd)) {
 			error("A new registration for cluster %s CONN:%d just came in, but I am already talking to that cluster (CONN:%d), closing other connection.",
-			      db_conn->conn->cluster_name, db_conn->conn->fd,
-			      slurmdbd_conn->conn->fd);
-			slurmdbd_conn->conn->rem_port = 0;
+			      dbd_conn->pcon->cluster_name, new_fd, existing_fd);
+			slurmdbd_conn->pcon->rem_port = 0;
 			list_delete_item(itr);
 		}
 	}
 	list_iterator_destroy(itr);
 	if (!slurmdbd_conn) {
-		slurm_mutex_init(&db_conn->conn_send_lock);
-		slurm_mutex_lock(&db_conn->conn_send_lock);
-		db_conn->conn_send = xmalloc(sizeof(persist_conn_t));
-		db_conn->conn_send->cluster_name =
-			xstrdup(db_conn->conn->cluster_name);
-		db_conn->conn_send->fd = PERSIST_CONN_NOT_INITED;
-		db_conn->conn_send->persist_type = PERSIST_TYPE_ACCT_UPDATE;
-		db_conn->conn_send->my_port = slurmdbd_conf->dbd_port;
-		db_conn->conn_send->rem_host = xstrdup(db_conn->conn->rem_host);
-		db_conn->conn_send->rem_port = db_conn->conn->rem_port;
-		db_conn->conn_send->version = db_conn->conn->version;
-		db_conn->conn_send->shutdown = &shutdown_time;
+		slurm_mutex_init(&dbd_conn->pcon_send_lock);
+		slurm_mutex_lock(&dbd_conn->pcon_send_lock);
+		dbd_conn->pcon_send = xmalloc(sizeof(persist_conn_t));
+		dbd_conn->pcon_send->cluster_name =
+			xstrdup(dbd_conn->pcon->cluster_name);
+		dbd_conn->pcon_send->persist_type = PERSIST_TYPE_ACCT_UPDATE;
+		dbd_conn->pcon_send->my_port = slurmdbd_conf->dbd_port;
+		dbd_conn->pcon_send->rem_host = xstrdup(dbd_conn->pcon->rem_host);
+		dbd_conn->pcon_send->rem_port = dbd_conn->pcon->rem_port;
+		dbd_conn->pcon_send->version = dbd_conn->pcon->version;
+		dbd_conn->pcon_send->shutdown = &shutdown_time;
 		/* we want timeout to be zero */
-		db_conn->conn_send->timeout = 0;
-		db_conn->conn_send->r_uid = SLURM_AUTH_UID_ANY;
-		db_conn->conn_send->flags |= PERSIST_FLAG_RECONNECT;
-		slurm_mutex_unlock(&db_conn->conn_send_lock);
+		dbd_conn->pcon_send->timeout = 0;
+		dbd_conn->pcon_send->r_uid = SLURM_AUTH_UID_ANY;
+		dbd_conn->pcon_send->flags |= PERSIST_FLAG_RECONNECT;
+		slurm_mutex_unlock(&dbd_conn->pcon_send_lock);
 		/*
 		 * We can't open a pipe back to the slurmctld right
 		 * now, the slurmctld might just be starting up and the
 		 * rpc_mgr might not be listening yet, so we will handle
 		 * this in the mysql plugin on the first commit.
 		 */
-		/* if (slurm_persist_conn_open(db_conn->conn_send) != */
+		/* if (slurm_persist_conn_open(dbd_conn->pcon_send) != */
 		/*     SLURM_SUCCESS) { */
 		/* 	error("persist_conn_send: Unable to open connection to cluster %s who is actively talking to us.", */
-		/* 	      db_conn->conn->cluster_name); */
+		/* 	      dbd_conn->pcon->cluster_name); */
 		/* } */
 
-		list_append(registered_clusters, db_conn);
+		list_append(registered_clusters, dbd_conn);
 	}
 	slurm_mutex_unlock(&registered_lock);
 }
@@ -209,6 +267,7 @@ static int _handle_init_msg(slurmdbd_conn_t *slurmdbd_conn,
 			    persist_init_req_msg_t *init_msg)
 {
 	int rc = SLURM_SUCCESS;
+	int fd = conn_g_get_fd(slurmdbd_conn->pcon->conn);
 
 #if HAVE_SYS_PRCTL_H
 	{
@@ -221,10 +280,9 @@ static int _handle_init_msg(slurmdbd_conn_t *slurmdbd_conn,
 
 	debug("REQUEST_PERSIST_INIT: CLUSTER:%s VERSION:%u UID:%u IP:%s CONN:%d",
 	      init_msg->cluster_name, init_msg->version,
-	      slurmdbd_conn->conn->auth_uid, slurmdbd_conn->conn->rem_host,
-	      slurmdbd_conn->conn->fd);
+	      slurmdbd_conn->pcon->auth_uid, slurmdbd_conn->pcon->rem_host, fd);
 
-	slurmdbd_conn->conn->cluster_name = xstrdup(init_msg->cluster_name);
+	slurmdbd_conn->pcon->cluster_name = xstrdup(init_msg->cluster_name);
 
 	/* When dealing with rollbacks it turns out it is much faster
 	   to do the commit once or once in a while instead of
@@ -232,9 +290,8 @@ static int _handle_init_msg(slurmdbd_conn_t *slurmdbd_conn,
 	   avoid such a slow down.
 	*/
 	slurmdbd_conn->db_conn = acct_storage_g_get_connection(
-		slurmdbd_conn->conn->fd, NULL, true,
-		slurmdbd_conn->conn->cluster_name);
-	slurmdbd_conn->conn->version = init_msg->version;
+		fd, NULL, true, slurmdbd_conn->pcon->cluster_name);
+	slurmdbd_conn->pcon->version = init_msg->version;
 	if (errno)
 		rc = errno;
 
@@ -249,12 +306,7 @@ static int _unpack_persist_init(slurmdbd_conn_t *slurmdbd_conn,
 	persist_init_req_msg_t *req_msg = smsg->data;
 	char *comment = NULL;
 
-#ifndef NDEBUG
-	if ((smsg->flags & SLURM_DROP_PRIV))
-		drop_priv = true;
-#endif
-
-	req_msg->uid = auth_g_get_uid(slurmdbd_conn->conn->auth_cred);
+	req_msg->uid = auth_g_get_uid(slurmdbd_conn->pcon->auth_cred);
 
 	rc = _handle_init_msg(slurmdbd_conn, req_msg);
 
@@ -262,7 +314,7 @@ static int _unpack_persist_init(slurmdbd_conn_t *slurmdbd_conn,
 		comment = slurm_strerror(rc);
 
 	*out_buffer = slurm_persist_make_rc_msg_flags(
-		slurmdbd_conn->conn, rc, comment,
+		slurmdbd_conn->pcon, rc, comment,
 		slurmdbd_conf->persist_conn_rc_flags,
 		req_msg->version);
 
@@ -276,14 +328,12 @@ static int _add_accounts(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_ADD_ACCOUNTS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	rc = acct_storage_g_add_accounts(slurmdbd_conn->db_conn,
-					 slurmdbd_conn->conn->auth_uid,
+					 slurmdbd_conn->pcon->auth_uid,
 					 get_msg->my_list);
 	if (rc == ESLURM_ACCESS_DENIED)
-		comment = "Your user doesn't have privilege to perform this action";
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ADD_ACCOUNTS);
 	return rc;
 }
@@ -297,9 +347,6 @@ static int _add_accounts_cond(slurmdbd_conn_t *slurmdbd_conn,
 	char *comment = NULL;
 	bool free_comment = true;
 
-	debug2("DBD_ADD_ACCOUNTS_COND: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	/*
 	 * All authentication needs to be done inside the plugin since we are
 	 * unable to know what accounts this request is talking about
@@ -308,32 +355,16 @@ static int _add_accounts_cond(slurmdbd_conn_t *slurmdbd_conn,
 
 	if (!(comment = acct_storage_g_add_accounts_cond(
 		      slurmdbd_conn->db_conn,
-		      slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->pcon->auth_uid,
 		      modify_msg->cond,
 		      modify_msg->rec))) {
 		free_comment = false;
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action\n";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query\n";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything\n";
-			rc = errno;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue\n";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, true);
 	} else
 		rc = errno;
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment,
 						DBD_ADD_ACCOUNTS_COND);
 	if (free_comment)
@@ -352,15 +383,17 @@ static int _fix_runaway_jobs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 		rc = ESLURM_ACCESS_DENIED;
 	else
 		rc = acct_storage_g_fix_runaway_jobs(
-			slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+			slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 			get_msg->my_list);
 
 	if (rc == ESLURM_ACCESS_DENIED) {
 		comment = "You must have an AdminLevel>=Operator to fix runaway jobs";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		error("CONN:%d %s",
+		      conn_g_get_fd(slurmdbd_conn->pcon->conn),
+		      comment);
 	}
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment,
 						DBD_FIX_RUNAWAY_JOB);
 
@@ -374,19 +407,14 @@ static int _add_account_coords(slurmdbd_conn_t *slurmdbd_conn,
 	dbd_acct_coord_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_ADD_ACCOUNT_COORDS: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	rc = acct_storage_g_add_coord(slurmdbd_conn->db_conn,
-				      slurmdbd_conn->conn->auth_uid,
+				      slurmdbd_conn->pcon->auth_uid,
 				      get_msg->acct_list, get_msg->cond);
 
-	if (rc == ESLURM_ACCESS_DENIED) {
-		comment = "Your user doesn't have privilege to perform this action";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-	}
+	if (rc == ESLURM_ACCESS_DENIED)
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment,
 						DBD_ADD_ACCOUNT_COORDS);
 	return rc;
@@ -399,13 +427,11 @@ static int _add_tres(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_ADD_TRES: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	rc = acct_storage_g_add_tres(slurmdbd_conn->db_conn,
-				     slurmdbd_conn->conn->auth_uid,
+				     slurmdbd_conn->pcon->auth_uid,
 				     get_msg->my_list);
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ADD_TRES);
 
 	/* This happens before the slurmctld registers and only when
@@ -424,8 +450,6 @@ static int _add_assocs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_ADD_ASSOCS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (!_validate_operator(slurmdbd_conn)) {
 		list_itr_t *itr = NULL;
 		list_itr_t *itr2 = NULL;
@@ -434,19 +458,20 @@ static int _add_assocs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 		slurmdb_assoc_rec_t *object = NULL;
 
 		memset(&user, 0, sizeof(slurmdb_user_rec_t));
-		user.uid = slurmdbd_conn->conn->auth_uid;
+		user.uid = slurmdbd_conn->pcon->auth_uid;
 		if (assoc_mgr_fill_in_user(
 			    slurmdbd_conn->db_conn, &user, 1, NULL, false)
 		    != SLURM_SUCCESS) {
 			comment = "Your user has not been added to the accounting system yet.";
-			error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+			error("CONN:%d %s",
+			      conn_g_get_fd(slurmdbd_conn->pcon->conn),
+			      comment);
 			rc = SLURM_ERROR;
 			goto end_it;
 		}
 		if (!user.coord_accts || !list_count(user.coord_accts)) {
-			comment = "Your user doesn't have privilege to perform this action";
-			error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
 			rc = ESLURM_ACCESS_DENIED;
+			comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 			goto end_it;
 		}
 		itr = list_iterator_create(get_msg->my_list);
@@ -467,19 +492,18 @@ static int _add_assocs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 		}
 		list_iterator_destroy(itr2);
 		list_iterator_destroy(itr);
-		if (!coord)  {
-			comment = "Your user doesn't have privilege to perform this action";
-			error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		if (!coord) {
 			rc = ESLURM_ACCESS_DENIED;
+			comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 			goto end_it;
 		}
 	}
 
 	rc = acct_storage_g_add_assocs(slurmdbd_conn->db_conn,
-				       slurmdbd_conn->conn->auth_uid,
+				       slurmdbd_conn->pcon->auth_uid,
 				       get_msg->my_list);
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ADD_ASSOCS);
 	return rc;
 }
@@ -491,17 +515,15 @@ static int _add_clusters(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_ADD_CLUSTERS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	rc = acct_storage_g_add_clusters(slurmdbd_conn->db_conn,
-					 slurmdbd_conn->conn->auth_uid,
+					 slurmdbd_conn->pcon->auth_uid,
 					 get_msg->my_list);
 	if (rc == ESLURM_ACCESS_DENIED)
-		comment = "Your user doesn't have privilege to perform this action";
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 	else if (rc != SLURM_SUCCESS)
 		comment = "Failed to add cluster.";
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ADD_CLUSTERS);
 	return rc;
 }
@@ -513,19 +535,15 @@ static int _add_federations(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_ADD_FEDERATIONS: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	rc = acct_storage_g_add_federations(slurmdbd_conn->db_conn,
-					    slurmdbd_conn->conn->auth_uid,
+					    slurmdbd_conn->pcon->auth_uid,
 					    get_msg->my_list);
 	if (rc == ESLURM_ACCESS_DENIED)
-		comment = "Your user doesn't have privilege to perform this "
-			"action";
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 	else if (rc != SLURM_SUCCESS)
 		comment = "Failed to add cluster.";
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment,
 						DBD_ADD_FEDERATIONS);
 	return rc;
@@ -538,17 +556,15 @@ static int _add_qos(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_ADD_QOS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	rc = acct_storage_g_add_qos(slurmdbd_conn->db_conn,
-				    slurmdbd_conn->conn->auth_uid,
+				    slurmdbd_conn->pcon->auth_uid,
 				    get_msg->my_list);
 	if (rc == ESLURM_ACCESS_DENIED)
-		comment = "Your user doesn't have privilege to perform this action";
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 	else if (rc != SLURM_SUCCESS)
 		comment = "Failed to add qos.";
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ADD_QOS);
 	return rc;
 }
@@ -560,18 +576,16 @@ static int _add_res(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_ADD_RES: called in CONN %d", slurmdbd_conn->conn->fd);
-
 
 	rc = acct_storage_g_add_res(slurmdbd_conn->db_conn,
-				    slurmdbd_conn->conn->auth_uid,
+				    slurmdbd_conn->pcon->auth_uid,
 				    get_msg->my_list);
 	if (rc == ESLURM_ACCESS_DENIED)
-		comment = "Your user doesn't have privilege to perform this action";
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 	else if (rc != SLURM_SUCCESS)
 		comment = "Failed to add system resource.";
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ADD_RES);
 	return rc;
 }
@@ -582,16 +596,15 @@ static int _add_users(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	int rc = SLURM_SUCCESS;
 	dbd_list_msg_t *get_msg = msg->data;
 	char *comment = NULL;
-	debug2("DBD_ADD_USERS: called in CONN %d", slurmdbd_conn->conn->fd);
 
 	rc = acct_storage_g_add_users(slurmdbd_conn->db_conn,
-				      slurmdbd_conn->conn->auth_uid,
+				      slurmdbd_conn->pcon->auth_uid,
 				      get_msg->my_list);
 
 	if (rc == ESLURM_ACCESS_DENIED)
-		comment = "Your user doesn't have privilege to perform this action";
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ADD_USERS);
 	return rc;
 }
@@ -605,9 +618,6 @@ static int _add_users_cond(slurmdbd_conn_t *slurmdbd_conn,
 	char *comment = NULL;
 	bool free_comment = true;
 
-	debug2("DBD_ADD_USERS_COND: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	/*
 	 * All authentication needs to be done inside the plugin since we are
 	 * unable to know what users this request is talking about
@@ -616,32 +626,16 @@ static int _add_users_cond(slurmdbd_conn_t *slurmdbd_conn,
 
 	if (!(comment = acct_storage_g_add_users_cond(
 		      slurmdbd_conn->db_conn,
-		      slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->pcon->auth_uid,
 		      modify_msg->cond,
 		      modify_msg->rec))) {
 		free_comment = false;
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action\n";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query\n";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything\n";
-			rc = errno;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue\n";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, true);
 	} else
 		rc = errno;
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment,
 						DBD_ADD_USERS_COND);
 	if (free_comment)
@@ -656,13 +650,11 @@ static int _add_wckeys(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_ADD_WCKEYS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	rc = acct_storage_g_add_wckeys(slurmdbd_conn->db_conn,
-				       slurmdbd_conn->conn->auth_uid,
+				       slurmdbd_conn->pcon->auth_uid,
 				       get_msg->my_list);
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ADD_WCKEYS);
 	return rc;
 }
@@ -677,18 +669,16 @@ static int _add_reservation(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_ADD_RESV message from invalid uid";
 		error("DBD_ADD_RESV message from invalid uid %u",
-		      slurmdbd_conn->conn->auth_uid);
+		      slurmdbd_conn->pcon->auth_uid);
 		rc = ESLURM_ACCESS_DENIED;
 		goto end_it;
 	}
-
-	debug2("DBD_ADD_RESV: called in CONN %d", slurmdbd_conn->conn->fd);
 
 	rc = acct_storage_g_add_reservation(slurmdbd_conn->db_conn,
 					    rec_msg->rec);
 
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ADD_RESV);
 	return rc;
 }
@@ -701,12 +691,16 @@ static int _archive_dump(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	char *comment = "SUCCESS";
 	slurmdb_archive_cond_t *arch_cond = NULL;
 
-	debug2("DBD_ARCHIVE_DUMP: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (!_validate_super_user(slurmdbd_conn)) {
-		comment = "Your user doesn't have privilege to perform this action";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
 		rc = ESLURM_ACCESS_DENIED;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		goto end_it;
+	}
+
+	if (slurmdbd_conf->flags & DBD_CONF_FLAG_DISABLE_ARCHIVE_COMMANDS) {
+		rc = ESLURM_DISABLED;
+		comment = "Dumping archived data is disabled";
+		error("Request to dump archived data, but DisableArchiveCommands is set");
 		goto end_it;
 	}
 
@@ -741,7 +735,7 @@ static int _archive_dump(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			comment = "Error with request.";
 	}
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ARCHIVE_DUMP);
 	return rc;
 }
@@ -753,12 +747,16 @@ static int _archive_load(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	slurmdb_archive_rec_t *arch_rec = msg->data;
 	char *comment = "SUCCESS";
 
-	debug2("DBD_ARCHIVE_LOAD: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (!_validate_super_user(slurmdbd_conn)) {
-		comment = "Your user doesn't have privilege to perform this action";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
 		rc = ESLURM_ACCESS_DENIED;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		goto end_it;
+	}
+
+	if (slurmdbd_conf->flags & DBD_CONF_FLAG_DISABLE_ARCHIVE_COMMANDS) {
+		rc = ESLURM_DISABLED;
+		comment = "Loading archived data is disabled";
+		error("Request to load archived data, but DisableArchiveCommands is set");
 		goto end_it;
 	}
 
@@ -770,7 +768,7 @@ static int _archive_load(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 		comment = "Error with request.";
 
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ARCHIVE_LOAD);
 	return rc;
 }
@@ -785,23 +783,23 @@ static int _cluster_tres(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_CLUSTER_TRES message from invalid uid";
 		error("DBD_CLUSTER_TRES message from invalid uid %u",
-		      slurmdbd_conn->conn->auth_uid);
+		      slurmdbd_conn->pcon->auth_uid);
 		rc = ESLURM_ACCESS_DENIED;
 		goto end_it;
 	}
 
 	debug2("DBD_CLUSTER_TRES: called in CONN %d for %s(%s)",
-	       slurmdbd_conn->conn->fd, slurmdbd_conn->conn->cluster_name,
-	       cluster_tres_msg->tres_str);
+	       conn_g_get_fd(slurmdbd_conn->pcon->conn),
+	       slurmdbd_conn->pcon->cluster_name, cluster_tres_msg->tres_str);
 
 	rc = clusteracct_storage_g_cluster_tres(
 		slurmdbd_conn->db_conn,
 		cluster_tres_msg->cluster_nodes,
 		cluster_tres_msg->tres_str,
 		cluster_tres_msg->event_time,
-		slurmdbd_conn->conn->version);
+		slurmdbd_conn->pcon->version);
 	if (rc == ESLURM_ACCESS_DENIED) {
-		comment = "This cluster hasn't been added to accounting yet";
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		rc = SLURM_ERROR;
 	}
 end_it:
@@ -810,17 +808,17 @@ end_it:
 		slurmdbd_conn->tres_str = cluster_tres_msg->tres_str;
 		cluster_tres_msg->tres_str = NULL;
 	}
-	if (!slurmdbd_conn->conn->rem_port) {
+	if (!slurmdbd_conn->pcon->rem_port) {
 		debug3("DBD_CLUSTER_TRES: cluster not registered");
-		slurmdbd_conn->conn->rem_port =
+		slurmdbd_conn->pcon->rem_port =
 			clusteracct_storage_g_register_disconn_ctld(
 				slurmdbd_conn->db_conn,
-				slurmdbd_conn->conn->rem_host);
+				slurmdbd_conn->pcon->rem_host);
 
 		_add_registered_cluster(slurmdbd_conn);
 	}
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_CLUSTER_TRES);
 	return rc;
 }
@@ -832,10 +830,8 @@ static int _get_accounts(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_ACCOUNTS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_accounts(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		get_msg->cond);
 
 	if (!errno) {
@@ -843,11 +839,11 @@ static int _get_accounts(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_ACCOUNTS, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_ACCOUNTS,
 				       *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_ACCOUNTS);
@@ -866,10 +862,8 @@ static int _get_tres(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_TRES: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_tres(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		get_msg->cond);
 
 	if (!errno) {
@@ -877,10 +871,10 @@ static int _get_tres(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_TRES, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_TRES, *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_TRES);
@@ -899,10 +893,8 @@ static int _get_assocs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_ASSOCS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_assocs(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		get_msg->cond);
 
 	if (!errno) {
@@ -910,10 +902,10 @@ static int _get_assocs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_ASSOCS, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_ASSOCS, *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_ASSOCS);
@@ -932,10 +924,8 @@ static int _get_clusters(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_CLUSTERS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_clusters(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		get_msg->cond);
 
 	if (!errno) {
@@ -943,11 +933,11 @@ static int _get_clusters(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_CLUSTERS, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_CLUSTERS,
 				       *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_CLUSTERS);
@@ -966,11 +956,8 @@ static int _get_federations(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_FEDERATIONS: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_federations(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		get_msg->cond);
 
 	if (!errno) {
@@ -978,11 +965,11 @@ static int _get_federations(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_FEDERATIONS, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_FEDERATIONS,
 				       *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_FEDERATIONS);
@@ -1000,14 +987,12 @@ static int _get_config(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	char *config_name = msg->data;
 	dbd_list_msg_t list_msg = { NULL };
 
-	debug2("DBD_GET_CONFIG: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (config_name == NULL ||
 	    xstrcmp(config_name, "slurmdbd.conf") == 0)
 		list_msg.my_list = dump_config();
 	else if ((list_msg.my_list = acct_storage_g_get_config(
 			  slurmdbd_conn->db_conn, config_name)) == NULL) {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_CONFIG);
@@ -1017,7 +1002,7 @@ static int _get_config(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_CONFIG, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_CONFIG, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 	xfree(config_name);
@@ -1032,10 +1017,8 @@ static int _get_events(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_EVENTS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_events(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		get_msg->cond);
 
 	if (!errno) {
@@ -1043,11 +1026,11 @@ static int _get_events(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_EVENTS, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_EVENTS,
 				       *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_EVENTS);
@@ -1066,10 +1049,8 @@ static int _get_instances(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_INSTANCES: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_instances(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		get_msg->cond);
 
 	if (!errno) {
@@ -1077,11 +1058,11 @@ static int _get_instances(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_INSTANCES, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_INSTANCES,
 				       *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_INSTANCES);
@@ -1101,15 +1082,13 @@ static int _get_jobs_cond(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	slurmdb_job_cond_t *job_cond = cond_msg->cond;
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_JOBS_COND: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	/* fail early if requesting runaways and not super user */
 	if ((job_cond->flags & JOBCOND_FLAG_RUNAWAY) &&
 	    !_validate_operator(slurmdbd_conn)) {
 		debug("Rejecting query of runaways from uid %u",
-		      slurmdbd_conn->conn->auth_uid);
+		      slurmdbd_conn->pcon->auth_uid);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn,
+			slurmdbd_conn->pcon,
 			ESLURM_ACCESS_DENIED,
 			"You must have an AdminLevel>=Operator to fix runaway jobs",
 			DBD_GET_JOBS_COND);
@@ -1129,8 +1108,8 @@ static int _get_jobs_cond(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 		if ((end - start) > slurmdbd_conf->max_time_range) {
 			info("Rejecting query > MaxQueryTimeRange from uid %u",
-			     slurmdbd_conn->conn->auth_uid);
-			*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+			     slurmdbd_conn->pcon->auth_uid);
+			*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 								ESLURM_DB_QUERY_TOO_WIDE,
 								slurm_strerror(ESLURM_DB_QUERY_TOO_WIDE),
 								DBD_GET_JOBS_COND);
@@ -1139,7 +1118,7 @@ static int _get_jobs_cond(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	}
 
 	list_msg.my_list = jobacct_storage_g_get_jobs_cond(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		job_cond);
 
 	if (!errno) {
@@ -1147,10 +1126,10 @@ static int _get_jobs_cond(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_JOBS, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_JOBS, *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_JOBS_COND);
@@ -1169,10 +1148,8 @@ static int _get_probs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_PROBS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_problems(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		get_msg->cond);
 
 	if (!errno) {
@@ -1180,10 +1157,10 @@ static int _get_probs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_PROBS, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_PROBS, *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_PROBS);
@@ -1202,10 +1179,8 @@ static int _get_qos(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_QOS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_qos(slurmdbd_conn->db_conn,
-						  slurmdbd_conn->conn->auth_uid,
+						  slurmdbd_conn->pcon->auth_uid,
 						  cond_msg->cond);
 
 	if (errno == ESLURM_ACCESS_DENIED && !list_msg.my_list)
@@ -1216,10 +1191,10 @@ static int _get_qos(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_QOS, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_QOS, *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_QOS);
@@ -1238,10 +1213,8 @@ static int _get_res(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_RES: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_res(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		get_msg->cond);
 
 	if (!errno) {
@@ -1249,11 +1222,11 @@ static int _get_res(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_RES, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_RES,
 				       *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_RES);
@@ -1271,10 +1244,8 @@ static int _get_txn(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_TXN: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_txn(slurmdbd_conn->db_conn,
-						  slurmdbd_conn->conn->auth_uid,
+						  slurmdbd_conn->pcon->auth_uid,
 						  cond_msg->cond);
 
 	if (!errno) {
@@ -1282,10 +1253,10 @@ static int _get_txn(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_TXN, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_TXN, *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_TXN);
@@ -1305,14 +1276,17 @@ static int _get_usage(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	uint16_t ret_type = 0;
 	int rc = SLURM_SUCCESS;
 	char *comment = NULL;
+	int fd = conn_g_get_fd(slurmdbd_conn->pcon->conn);
 
 	info("DBD_GET_USAGE: called in CONN %d. Type is %s",
-	     slurmdbd_conn->conn->fd,
-	     slurmdbd_msg_type_2_str(msg->msg_type, 1));
+	     fd, slurmdbd_msg_type_2_str(msg->msg_type, 1));
 
 	switch(msg->msg_type) {
 	case DBD_GET_ASSOC_USAGE:
 		ret_type = DBD_GOT_ASSOC_USAGE;
+		break;
+	case DBD_GET_QOS_USAGE:
+		ret_type = DBD_GOT_QOS_USAGE;
 		break;
 	case DBD_GET_WCKEY_USAGE:
 		ret_type = DBD_GOT_WCKEY_USAGE;
@@ -1323,21 +1297,21 @@ static int _get_usage(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	default:
 		comment = "Unknown type of usage to get";
 		error("%s %u", comment, msg->msg_type);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							SLURM_ERROR, comment,
 							msg->msg_type);
 		return SLURM_ERROR;
 	}
 
 	rc = acct_storage_g_get_usage(slurmdbd_conn->db_conn,
-				      slurmdbd_conn->conn->auth_uid,
+				      slurmdbd_conn->pcon->auth_uid,
 				      get_msg->rec, msg->msg_type,
 				      get_msg->start, get_msg->end);
 
 	if (rc != SLURM_SUCCESS) {
 		comment = "Problem getting usage info";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		error("CONN:%d %s", fd, comment);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							rc, comment,
 							msg->msg_type);
 		return rc;
@@ -1348,7 +1322,7 @@ static int _get_usage(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	get_msg->rec = NULL;
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) ret_type, *out_buffer);
-	slurmdbd_pack_usage_msg(&got_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_usage_msg(&got_msg, slurmdbd_conn->pcon->version,
 				ret_type, *out_buffer);
 
 	return SLURM_SUCCESS;
@@ -1362,26 +1336,25 @@ static int _get_users(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	int rc = SLURM_SUCCESS;
 	slurmdb_user_cond_t * user_cond = NULL;
 
-	debug2("DBD_GET_USERS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	user_cond = get_msg->cond;
 	if ((!user_cond->with_assocs && !user_cond->with_wckeys)
-	    && ((slurmdbd_conn->conn->version < 8)
-		|| (user_cond->assoc_cond->only_defs))) {
-		List cluster_list = user_cond->assoc_cond->cluster_list;
+	    && ((slurmdbd_conn->pcon->version < 8) ||
+		(user_cond->assoc_cond->flags &
+		 ASSOC_COND_FLAG_ONLY_DEFS))) {
+		list_t *cluster_list = user_cond->assoc_cond->cluster_list;
 		/* load up with just this cluster to query against
-		 * since befor 2.2 we had only 1 default account so
+		 * since before 2.2 we had only 1 default account so
 		 * send the default for this cluster. */
 		if (!cluster_list) {
 			cluster_list = list_create(NULL);
 			list_append(cluster_list,
-				    slurmdbd_conn->conn->cluster_name);
+				    slurmdbd_conn->pcon->cluster_name);
 			user_cond->assoc_cond->cluster_list = cluster_list;
 		}
 	}
 
 	list_msg.my_list = acct_storage_g_get_users(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		user_cond);
 
 	if (!errno) {
@@ -1389,10 +1362,10 @@ static int _get_users(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_USERS, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_USERS, *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_USERS);
@@ -1412,23 +1385,20 @@ static int _get_wckeys(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	char *comment = NULL;
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_WCKEYS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	/* We have to check this here, and not in the plugin.  There
 	 * are places in the plugin that a non-admin can call this and
 	 * it be ok. */
 	if (!_validate_operator(slurmdbd_conn)) {
-		comment = "Your user doesn't have privilege to perform this action";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
-							ESLURM_ACCESS_DENIED,
+		int rc = ESLURM_ACCESS_DENIED;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon, rc,
 							comment,
 							DBD_GET_WCKEYS);
-		return ESLURM_ACCESS_DENIED;
+		return rc;
 	}
 
 	list_msg.my_list = acct_storage_g_get_wckeys(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		get_msg->cond);
 
 	if (!errno) {
@@ -1436,10 +1406,10 @@ static int _get_wckeys(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_WCKEYS, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_WCKEYS, *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_WCKEYS);
@@ -1458,10 +1428,8 @@ static int _get_reservations(slurmdbd_conn_t *slurmdbd_conn,
 	dbd_list_msg_t list_msg = { NULL };
 	int rc = SLURM_SUCCESS;
 
-	debug2("DBD_GET_RESVS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	list_msg.my_list = acct_storage_g_get_reservations(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		get_msg->cond);
 
 	if (!errno) {
@@ -1469,10 +1437,10 @@ static int _get_reservations(slurmdbd_conn_t *slurmdbd_conn,
 			list_msg.my_list = list_create(NULL);
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_RESVS, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_RESVS, *out_buffer);
 	} else {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							errno,
 							slurm_strerror(errno),
 							DBD_GET_RESVS);
@@ -1503,19 +1471,20 @@ static int _flush_jobs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_FLUSH_JOBS message from invalid uid";
 		error("DBD_FLUSH_JOBS message from invalid uid %u",
-		      slurmdbd_conn->conn->auth_uid);
+		      slurmdbd_conn->pcon->auth_uid);
 		rc = ESLURM_ACCESS_DENIED;
 		goto end_it;
 	}
 
 	debug2("DBD_FLUSH_JOBS: called in CONN %d for %s",
-	       slurmdbd_conn->conn->fd, slurmdbd_conn->conn->cluster_name);
+	       conn_g_get_fd(slurmdbd_conn->pcon->conn),
+	       slurmdbd_conn->pcon->cluster_name);
 
 	rc = acct_storage_g_flush_jobs_on_cluster(
 		slurmdbd_conn->db_conn,
 		cluster_tres_msg->event_time);
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_FLUSH_JOBS);
 	return rc;
 }
@@ -1532,7 +1501,7 @@ static int _fini_conn(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	debug2("DBD_FINI: CLOSE:%u COMMIT:%u",
 	       fini_msg->close_conn, fini_msg->commit);
 
-	if (slurmdbd_conn->conn->rem_port && slurmdbd_conf->commit_delay) {
+	if (slurmdbd_conn->pcon->rem_port && slurmdbd_conf->commit_delay) {
 		slurm_mutex_lock(&registered_lock);
 		locked = true;
 	}
@@ -1545,7 +1514,7 @@ static int _fini_conn(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	if (locked)
 		slurm_mutex_unlock(&registered_lock);
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_FINI);
 	return rc;
 
@@ -1563,8 +1532,8 @@ static int _job_complete(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_JOB_COMPLETE message from invalid uid";
 		error("CONN:%d %s %u",
-		      slurmdbd_conn->conn->fd, comment,
-		      slurmdbd_conn->conn->auth_uid);
+		      conn_g_get_fd(slurmdbd_conn->pcon->conn), comment,
+		      slurmdbd_conn->pcon->auth_uid);
 		rc = ESLURM_ACCESS_DENIED;
 		goto end_it;
 	}
@@ -1588,7 +1557,7 @@ static int _job_complete(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	job.nodes = job_comp_msg->nodes;
 	job.start_time = job_comp_msg->start_time;
 	details.submit_time = job_comp_msg->submit_time;
-	job.start_protocol_ver = slurmdbd_conn->conn->version;
+	job.start_protocol_ver = slurmdbd_conn->pcon->version;
 	job.system_comment = job_comp_msg->system_comment;
 	job.tres_alloc_str = job_comp_msg->tres_alloc_str;
 
@@ -1608,18 +1577,18 @@ static int _job_complete(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	/* just in case this gets set we need to clear it */
 	xfree(job.wckey);
 
-	if (!slurmdbd_conn->conn->rem_port) {
+	if (!slurmdbd_conn->pcon->rem_port) {
 		debug3("DBD_JOB_COMPLETE: cluster not registered");
-		slurmdbd_conn->conn->rem_port =
+		slurmdbd_conn->pcon->rem_port =
 			clusteracct_storage_g_register_disconn_ctld(
 				slurmdbd_conn->db_conn,
-				slurmdbd_conn->conn->rem_host);
+				slurmdbd_conn->pcon->rem_host);
 
 		_add_registered_cluster(slurmdbd_conn);
 	}
 
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_JOB_COMPLETE);
 	return SLURM_SUCCESS;
 }
@@ -1634,9 +1603,9 @@ static int _job_start(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_JOB_START message from invalid uid";
 		error("CONN:%d %s %u",
-		      slurmdbd_conn->conn->fd, comment,
-		      slurmdbd_conn->conn->auth_uid);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		      conn_g_get_fd(slurmdbd_conn->pcon->conn), comment,
+		      slurmdbd_conn->pcon->auth_uid);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							ESLURM_ACCESS_DENIED,
 							comment,
 							DBD_JOB_START);
@@ -1648,7 +1617,7 @@ static int _job_start(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_ID_RC, *out_buffer);
 	slurmdbd_pack_id_rc_msg(&id_rc_msg,
-				slurmdbd_conn->conn->version, *out_buffer);
+				slurmdbd_conn->pcon->version, *out_buffer);
 	return SLURM_SUCCESS;
 }
 
@@ -1664,9 +1633,9 @@ static int _job_heavy(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_JOB_HEAVY message from invalid uid";
 		error("CONN:%d %s %u",
-		      slurmdbd_conn->conn->fd, comment,
-		      slurmdbd_conn->conn->auth_uid);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		      conn_g_get_fd(slurmdbd_conn->pcon->conn), comment,
+		      slurmdbd_conn->pcon->auth_uid);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							ESLURM_ACCESS_DENIED,
 							comment,
 							DBD_JOB_HEAVY);
@@ -1694,7 +1663,7 @@ static int _job_heavy(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 	xfree(details.env_sup);
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment,
 						DBD_JOB_HEAVY);
 	return SLURM_SUCCESS;
@@ -1712,8 +1681,8 @@ static int _job_suspend(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_JOB_SUSPEND message from invalid uid";
 		error("CONN:%d %s %u",
-		      slurmdbd_conn->conn->fd, comment,
-		      slurmdbd_conn->conn->auth_uid);
+		      conn_g_get_fd(slurmdbd_conn->pcon->conn), comment,
+		      slurmdbd_conn->pcon->auth_uid);
 		rc = ESLURM_ACCESS_DENIED;
 		goto end_it;
 	}
@@ -1731,7 +1700,7 @@ static int _job_suspend(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	job.job_id = job_suspend_msg->job_id;
 	job.job_state = job_suspend_msg->job_state;
 	details.submit_time = job_suspend_msg->submit_time;
-	job.start_protocol_ver = slurmdbd_conn->conn->version;
+	job.start_protocol_ver = slurmdbd_conn->pcon->version;
 	job.suspend_time = job_suspend_msg->suspend_time;
 
 	job.details = &details;
@@ -1743,7 +1712,7 @@ static int _job_suspend(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	/* just in case this gets set we need to clear it */
 	xfree(job.wckey);
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment,
 						DBD_JOB_SUSPEND);
 	return SLURM_SUCCESS;
@@ -1757,31 +1726,12 @@ static int _modify_accounts(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_modify_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_MODIFY_ACCOUNTS: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_modify_accounts(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond, get_msg->rec))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							rc, comment,
 							DBD_MODIFY_ACCOUNTS);
 		return rc;
@@ -1789,7 +1739,7 @@ static int _modify_accounts(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -1804,42 +1754,24 @@ static int _modify_assocs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_modify_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_MODIFY_ASSOCS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	/* All authentication needs to be done inside the plugin since we are
 	 * unable to know what accounts this request is talking about
 	 * until we process it through the database.
 	 */
 
 	if (!(list_msg.my_list = acct_storage_g_modify_assocs(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond, get_msg->rec)) ||
 	    (errno != SLURM_SUCCESS)) {
-		error("CONN:%d %s", slurmdbd_conn->conn->fd,
-		      slurm_strerror(errno));
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else if (list_msg.my_list && list_count(list_msg.my_list) &&
-			   (errno == ESLURM_NO_REMOVE_DEFAULT_QOS)) {
-			rc = errno;
+		rc = errno;
+		if (list_msg.my_list && list_count(list_msg.my_list) &&
+		    (errno == ESLURM_NO_REMOVE_DEFAULT_QOS)) {
 			comment = list_peek(list_msg.my_list);
 		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
+			comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		}
 
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							rc, comment,
 							DBD_MODIFY_ASSOCS);
 		FREE_NULL_LIST(list_msg.my_list);
@@ -1848,7 +1780,7 @@ static int _modify_assocs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -1863,31 +1795,12 @@ static int _modify_clusters(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_modify_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_MODIFY_CLUSTERS: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_modify_clusters(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond, get_msg->rec))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							rc, comment,
 							DBD_MODIFY_CLUSTERS);
 		return rc;
@@ -1895,7 +1808,7 @@ static int _modify_clusters(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -1910,32 +1823,12 @@ static int _modify_federations(slurmdbd_conn_t *slurmdbd_conn,
 	dbd_modify_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_MODIFY_FEDERATIONS: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_modify_federations(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond, get_msg->rec))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform "
-				"this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							rc, comment,
 							DBD_MODIFY_FEDERATIONS);
 		return rc;
@@ -1943,7 +1836,7 @@ static int _modify_federations(slurmdbd_conn_t *slurmdbd_conn,
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -1958,30 +1851,12 @@ static int _modify_job(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_modify_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_MODIFY_JOB: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_modify_job(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond, get_msg->rec))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							rc, comment,
 							DBD_MODIFY_JOB);
 		return rc;
@@ -1990,13 +1865,13 @@ static int _modify_job(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	if (get_msg->cond &&
 	    (((slurmdb_job_cond_t *)get_msg->cond)->flags &
 	     JOBCOND_FLAG_NO_WAIT)) {
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							rc, comment,
 							DBD_MODIFY_JOB);
 	} else {
 		*out_buffer = init_buf(1024);
 		pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+		slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 				       DBD_GOT_LIST, *out_buffer);
 	}
 
@@ -2013,33 +1888,12 @@ static int _modify_qos(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_modify_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_MODIFY_QOS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_modify_qos(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond, get_msg->rec))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_QOS_PREEMPTION_LOOP) {
-			comment = "QOS Preemption loop detected";
-			rc = ESLURM_QOS_PREEMPTION_LOOP;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							rc, comment,
 							DBD_MODIFY_QOS);
 		return rc;
@@ -2047,7 +1901,7 @@ static int _modify_qos(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -2062,31 +1916,12 @@ static int _modify_res(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_modify_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_MODIFY_RES: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_modify_res(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond, get_msg->rec))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform "
-				"this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							rc, comment,
 							DBD_MODIFY_RES);
 		return rc;
@@ -2094,7 +1929,7 @@ static int _modify_res(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 	return rc;
@@ -2110,33 +1945,31 @@ static int _modify_users(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	int same_user = 0;
 	slurmdb_user_cond_t *user_cond = NULL;
 	slurmdb_user_rec_t *user_rec = NULL;
-
-	debug2("DBD_MODIFY_USERS: called in CONN %d", slurmdbd_conn->conn->fd);
+	int fd = conn_g_get_fd(slurmdbd_conn->pcon->conn);
 
 	user_cond = (slurmdb_user_cond_t *)get_msg->cond;
 	user_rec = (slurmdb_user_rec_t *)get_msg->rec;
 
 	if (!_validate_operator(slurmdbd_conn)) {
+		int rc = ESLURM_ACCESS_DENIED;
 		if (user_cond && user_cond->assoc_cond
 		    && user_cond->assoc_cond->user_list
 		    && (list_count(user_cond->assoc_cond->user_list) == 1)) {
 			uid_t pw_uid;
 			char *name;
 			name = list_peek (user_cond->assoc_cond->user_list);
-		        if ((uid_from_string (name, &pw_uid) >= 0)
-			    && (pw_uid == slurmdbd_conn->conn->auth_uid)) {
+			if ((uid_from_string(name, &pw_uid) == SLURM_SUCCESS) &&
+			    (pw_uid == slurmdbd_conn->pcon->auth_uid)) {
 				same_user = 1;
 				goto is_same_user;
 			}
 		}
-		comment = "Your user doesn't have privilege to perform this action";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
-							ESLURM_ACCESS_DENIED,
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon, rc,
 							comment,
 							DBD_MODIFY_USERS);
 
-		return ESLURM_ACCESS_DENIED;
+		return rc;
 	}
 
 is_same_user:
@@ -2149,9 +1982,9 @@ is_same_user:
 		 */
 		if ((user_rec->admin_level != SLURMDB_ADMIN_NOTSET)) {
 			comment = "You can only change your own default account, default wckey nothing else";
-			error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+			error("CONN:%d %s", fd, comment);
 			*out_buffer = slurm_persist_make_rc_msg(
-				slurmdbd_conn->conn,
+				slurmdbd_conn->pcon,
 				ESLURM_ACCESS_DENIED,
 				comment,
 				DBD_MODIFY_USERS);
@@ -2163,9 +1996,9 @@ is_same_user:
 	if ((user_rec->admin_level != SLURMDB_ADMIN_NOTSET) &&
 	    !_validate_super_user(slurmdbd_conn)) {
 		comment = "You must be a super user to modify a users admin level";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		error("CONN:%d %s", fd, comment);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn,
+			slurmdbd_conn->pcon,
 			ESLURM_ACCESS_DENIED,
 			comment,
 			DBD_MODIFY_USERS);
@@ -2173,34 +2006,18 @@ is_same_user:
 	}
 
 	if (!(list_msg.my_list = acct_storage_g_modify_users(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      user_cond, user_rec))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn, rc, comment, DBD_MODIFY_USERS);
+			slurmdbd_conn->pcon, rc, comment, DBD_MODIFY_USERS);
 		return rc;
 	}
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -2215,37 +2032,19 @@ static int _modify_wckeys(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_modify_msg_t *get_msg = msg->data;
 	char *comment = NULL;
 
-	debug2("DBD_MODIFY_WCKEYS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_modify_wckeys(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond, get_msg->rec))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn, rc, comment, DBD_MODIFY_WCKEYS);
+			slurmdbd_conn->pcon, rc, comment, DBD_MODIFY_WCKEYS);
 		return rc;
 	}
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -2262,19 +2061,17 @@ static int _modify_reservation(slurmdbd_conn_t *slurmdbd_conn,
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_MODIFY_RESV message from invalid uid";
 		error("CONN:%d %s %u",
-		      slurmdbd_conn->conn->fd, comment,
-		      slurmdbd_conn->conn->auth_uid);
+		      conn_g_get_fd(slurmdbd_conn->pcon->conn), comment,
+		      slurmdbd_conn->pcon->auth_uid);
 		rc = ESLURM_ACCESS_DENIED;
 		goto end_it;
 	}
-
-	debug2("DBD_MODIFY_RESV: called in CONN %d", slurmdbd_conn->conn->fd);
 
 	rc = acct_storage_g_modify_reservation(slurmdbd_conn->db_conn,
 					       rec_msg->rec);
 
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_MODIFY_RESV);
 	return rc;
 }
@@ -2286,12 +2083,12 @@ static int _node_state(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	node_record_t node_ptr;
 	int rc = SLURM_SUCCESS;
 	char *comment = NULL;
+	int fd = conn_g_get_fd(slurmdbd_conn->pcon->conn);
 
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_NODE_STATE message from invalid uid";
 		error("CONN:%d %s %u",
-		      slurmdbd_conn->conn->fd, comment,
-		      slurmdbd_conn->conn->auth_uid);
+		      fd, comment, slurmdbd_conn->pcon->auth_uid);
 		rc = ESLURM_ACCESS_DENIED;
 		goto end_it;
 	}
@@ -2351,14 +2148,13 @@ static int _node_state(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	default:
 		comment = "DBD_NODE_STATE message has invalid new_state";
 		error("CONN:%d %s %u",
-		      slurmdbd_conn->conn->fd, comment,
-		      slurmdbd_conn->conn->auth_uid);
+		      fd, comment, slurmdbd_conn->pcon->auth_uid);
 		rc = SLURM_ERROR;
 		break;
 	}
 
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_NODE_STATE);
 	return SLURM_SUCCESS;
 }
@@ -2384,6 +2180,10 @@ static void _process_job_start(slurmdbd_conn_t *slurmdbd_conn,
 	array_recs.max_run_tasks = job_start_msg->array_max_tasks;
 	array_recs.task_cnt = job_start_msg->array_task_pending;
 	job.assoc_id = job_start_msg->assoc_id;
+	/*
+	 * When 24.11 is no longer supported this check will go away, the
+	 * db_index will not be NO_VAL64 then.
+	 */
 	if (job_start_msg->db_index != NO_VAL64)
 		job.db_index = job_start_msg->db_index;
 	details.begin_time = job_start_msg->eligible_time;
@@ -2404,11 +2204,15 @@ static void _process_job_start(slurmdbd_conn_t *slurmdbd_conn,
 	details.min_cpus = job_start_msg->req_cpus;
 	details.pn_min_memory = job_start_msg->req_mem;
 	job.qos_id = job_start_msg->qos_id;
+	details.qos_req = job_start_msg->qos_req;
+	details.resv_req = job_start_msg->resv_req;
+	job.restart_cnt = job_start_msg->restart_cnt;
 	job.resv_id = job_start_msg->resv_id;
 	job.priority = job_start_msg->priority;
 	details.script_hash = job_start_msg->script_hash;
-	job.start_protocol_ver = slurmdbd_conn->conn->version;
+	job.start_protocol_ver = slurmdbd_conn->pcon->version;
 	job.start_time = job_start_msg->start_time;
+	details.segment_size = job_start_msg->segment_size;
 	details.std_err = job_start_msg->std_err;
 	details.std_in = job_start_msg->std_in;
 	details.std_out = job_start_msg->std_out;
@@ -2438,8 +2242,9 @@ static void _process_job_start(slurmdbd_conn_t *slurmdbd_conn,
 		       job_start_msg->job_id, job_start_msg->name,
 		       job.db_index);
 	} else {
-		debug2("DBD_JOB_START: ELIGIBLE CALL ID:%u NAME:%s",
-		       job_start_msg->job_id, job_start_msg->name);
+		debug2("DBD_JOB_START: ELIGIBLE CALL ID:%u NAME:%s INX:%"PRIu64,
+		       job_start_msg->job_id, job_start_msg->name,
+		       job.db_index);
 	}
 	id_rc_msg->return_code = jobacct_storage_g_job_start(
 		slurmdbd_conn->db_conn, &job);
@@ -2453,12 +2258,12 @@ static void _process_job_start(slurmdbd_conn_t *slurmdbd_conn,
 
 	xfree(details.env_sup);
 
-	if (!slurmdbd_conn->conn->rem_port) {
+	if (!slurmdbd_conn->pcon->rem_port) {
 		debug3("DBD_JOB_START: cluster not registered");
-		slurmdbd_conn->conn->rem_port =
+		slurmdbd_conn->pcon->rem_port =
 			clusteracct_storage_g_register_disconn_ctld(
 				slurmdbd_conn->db_conn,
-				slurmdbd_conn->conn->rem_host);
+				slurmdbd_conn->pcon->rem_host);
 
 		_add_registered_cluster(slurmdbd_conn);
 	}
@@ -2471,20 +2276,19 @@ static int _reconfig(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	char *comment = NULL;
 
 	if (!_validate_super_user(slurmdbd_conn)) {
-		comment = "Your user doesn't have privilege to perform this action";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
-							ESLURM_ACCESS_DENIED,
+		int rc = ESLURM_ACCESS_DENIED;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon, rc,
 							comment,
 							DBD_MODIFY_WCKEYS);
 
-		return ESLURM_ACCESS_DENIED;
+		return rc;
 	}
 
 	info("Reconfigure request received");
-	reconfig();
+	reconfig(NULL);
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_RECONFIG);
 	return rc;
 
@@ -2495,76 +2299,79 @@ static int _register_ctld(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 {
 	dbd_register_ctld_msg_t *register_ctld_msg = msg->data;
 	int rc = SLURM_SUCCESS;
+	uint32_t id_rc = 0;
 	char *comment = NULL;
 	slurmdb_cluster_cond_t cluster_q;
 	slurmdb_cluster_rec_t cluster;
 	dbd_list_msg_t list_msg = { NULL };
-	List cluster_list;
+	list_t *cluster_list;
+	int fd = conn_g_get_fd(slurmdbd_conn->pcon->conn);
 
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_REGISTER_CTLD message from invalid uid";
 		error("CONN:%d %s %u",
-		      slurmdbd_conn->conn->fd, comment,
-		      slurmdbd_conn->conn->auth_uid);
+		      fd, comment, slurmdbd_conn->pcon->auth_uid);
 		rc = ESLURM_ACCESS_DENIED;
 		goto end_it;
 	}
 
-	debug2("DBD_REGISTER_CTLD: called in CONN %d for %s(%u)",
-	       slurmdbd_conn->conn->fd, slurmdbd_conn->conn->cluster_name,
-	       register_ctld_msg->port);
+	debug2("DBD_REGISTER_CTLD: called in CONN %d for %s(%u), cluster_id=%u",
+	       fd, slurmdbd_conn->pcon->cluster_name, register_ctld_msg->port, register_ctld_msg->cluster_id);
 
 	/* Just to make sure we don't allow a NULL cluster name to attempt
 	   to connect.  This should never happen, but here just for
 	   sanity check.
 	*/
-	if (!slurmdbd_conn->conn->cluster_name) {
+	if (!slurmdbd_conn->pcon->cluster_name) {
 		comment = "Must have a cluster name to register it";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		error("CONN:%d %s", fd, comment);
 		rc = ESLURM_BAD_NAME;
 		goto end_it;
 	}
 
 	debug2("slurmctld at ip:%s, port:%d",
-	       slurmdbd_conn->conn->rem_host, register_ctld_msg->port);
+	       slurmdbd_conn->pcon->rem_host, register_ctld_msg->port);
 
 	slurmdb_init_cluster_cond(&cluster_q, 0);
 	slurmdb_init_cluster_rec(&cluster, 0);
 
 	cluster_q.cluster_list = list_create(NULL);
-	list_append(cluster_q.cluster_list, slurmdbd_conn->conn->cluster_name);
-	cluster.control_host = slurmdbd_conn->conn->rem_host;
+	list_append(cluster_q.cluster_list, slurmdbd_conn->pcon->cluster_name);
+	cluster.control_host = slurmdbd_conn->pcon->rem_host;
 	cluster.control_port = register_ctld_msg->port;
 	cluster.dimensions = register_ctld_msg->dimensions;
 	cluster.flags = register_ctld_msg->flags;
-	cluster.rpc_version = slurmdbd_conn->conn->version;
+	cluster.rpc_version = slurmdbd_conn->pcon->version;
 
 	if ((cluster.flags != NO_VAL) &&
 	    (cluster.flags & CLUSTER_FLAG_EXT))
-		slurmdbd_conn->conn->flags |= PERSIST_FLAG_EXT_DBD;
+		slurmdbd_conn->pcon->flags |= PERSIST_FLAG_EXT_DBD;
 
 	cluster_list = acct_storage_g_get_clusters(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		&cluster_q);
 	if (!cluster_list || errno) {
 		comment = slurm_strerror(errno);
 		rc = errno;
 	} else if (!list_count(cluster_list)) {
-		List add_list = list_create(NULL);
+		list_t *add_list = list_create(NULL);
 		list_append(add_list, &cluster);
 
-		cluster.name = slurmdbd_conn->conn->cluster_name;
+		cluster.name = slurmdbd_conn->pcon->cluster_name;
 		cluster.flags |= CLUSTER_FLAG_REGISTER;
+		cluster.id = register_ctld_msg->cluster_id;
+
 		rc = acct_storage_g_add_clusters(slurmdbd_conn->db_conn,
-						 slurmdbd_conn->conn->auth_uid,
+						 slurmdbd_conn->pcon->auth_uid,
 						 add_list);
 		if (rc == ESLURM_ACCESS_DENIED)
-			comment = "Your user doesn't have privilege to perform this action";
+			comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+
 		else if (rc != SLURM_SUCCESS)
 			comment = "Failed to add/register cluster.";
 		slurmdb_destroy_assoc_rec(cluster.root_assoc);
 		FREE_NULL_LIST(add_list);
-	} else if ((slurmdbd_conn->conn->flags & PERSIST_FLAG_EXT_DBD) &&
+	} else if ((slurmdbd_conn->pcon->flags & PERSIST_FLAG_EXT_DBD) &&
 		   !(((slurmdb_cluster_rec_t *)list_peek(cluster_list))->flags &
 		     CLUSTER_FLAG_EXT)) {
 		comment = "Can't register to non-external cluster";
@@ -2575,20 +2382,22 @@ static int _register_ctld(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 		goto end_it;
 
 	list_msg.my_list = acct_storage_g_modify_clusters(
-		slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		&cluster_q, &cluster);
 	if (errno == EFAULT) {
 		comment = "Request to register was incomplete";
 		rc = SLURM_ERROR;
 	} else if (errno == ESLURM_ACCESS_DENIED) {
-		comment = "Your user doesn't have privilege to perform this action";
-		rc = ESLURM_ACCESS_DENIED;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 	} else if (errno == ESLURM_DB_CONNECTION) {
 		comment = slurm_strerror(errno);
 		rc = errno;
 	} else if (!list_msg.my_list || !list_count(list_msg.my_list)) {
 		comment = "This cluster hasn't been added to accounting yet";
 		rc = SLURM_ERROR;
+	} else if (cluster.id) {
+		id_rc = cluster.id;
+		id_rc |= RC_AS_CLUSTER_ID;
 	}
 
 	FREE_NULL_LIST(list_msg.my_list);
@@ -2597,13 +2406,13 @@ static int _register_ctld(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 end_it:
 
 	if (rc == SLURM_SUCCESS) {
-		slurmdbd_conn->conn->rem_port = register_ctld_msg->port;
+		slurmdbd_conn->pcon->rem_port = register_ctld_msg->port;
 
 		_add_registered_cluster(slurmdbd_conn);
 	}
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
-						rc, comment, DBD_REGISTER_CTLD);
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon, id_rc,
+						comment, DBD_REGISTER_CTLD);
 	return rc;
 }
 
@@ -2615,39 +2424,20 @@ static int _remove_accounts(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	char *comment = NULL;
 
-	debug2("DBD_REMOVE_ACCOUNTS: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_remove_accounts(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn, rc, comment, DBD_REMOVE_ACCOUNTS);
+			slurmdbd_conn->pcon, rc, comment, DBD_REMOVE_ACCOUNTS);
 		return rc;
 	}
 	list_msg.return_code = errno;
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -2662,37 +2452,18 @@ static int _remove_account_coords(slurmdbd_conn_t *slurmdbd_conn,
 	dbd_list_msg_t list_msg = { NULL };
 	char *comment = NULL;
 
-	debug2("DBD_REMOVE_ACCOUNT_COORDS: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	/* All authentication needs to be done inside the plugin since we are
 	 * unable to know what accounts this request is talking about
 	 * until we process it through the database.
 	 */
 
 	if (!(list_msg.my_list = acct_storage_g_remove_coord(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->acct_list, get_msg->cond))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn, rc, comment,
+			slurmdbd_conn->pcon, rc, comment,
 			DBD_REMOVE_ACCOUNT_COORDS);
 		return rc;
 	}
@@ -2700,7 +2471,7 @@ static int _remove_account_coords(slurmdbd_conn_t *slurmdbd_conn,
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -2715,43 +2486,25 @@ static int _remove_assocs(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	char *comment = NULL;
 
-	debug2("DBD_REMOVE_ASSOCS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	/* All authentication needs to be done inside the plugin since we are
 	 * unable to know what accounts this request is talking about
 	 * until we process it through the database.
 	 */
 
 	if (!(list_msg.my_list = acct_storage_g_remove_assocs(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn, rc, comment, DBD_REMOVE_ASSOCS);
+			slurmdbd_conn->pcon, rc, comment, DBD_REMOVE_ASSOCS);
 		return rc;
 	}
 	list_msg.return_code = errno;
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -2767,39 +2520,20 @@ static int _remove_clusters(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	char *comment = NULL;
 
-	debug2("DBD_REMOVE_CLUSTERS: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_remove_clusters(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn, rc, comment, DBD_REMOVE_CLUSTERS);
+			slurmdbd_conn->pcon, rc, comment, DBD_REMOVE_CLUSTERS);
 		return rc;
 	}
 	list_msg.return_code = errno;
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -2814,32 +2548,12 @@ static int _remove_federations(slurmdbd_conn_t *slurmdbd_conn,
 	dbd_list_msg_t list_msg = { NULL };
 	char *comment = NULL;
 
-	debug2("DBD_REMOVE_FEDERATIONS: called in CONN %d",
-	       slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_remove_federations(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform "
-				"this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							rc, comment,
 							DBD_REMOVE_FEDERATIONS);
 		return rc;
@@ -2848,7 +2562,7 @@ static int _remove_federations(slurmdbd_conn_t *slurmdbd_conn,
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -2863,38 +2577,20 @@ static int _remove_qos(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	char *comment = NULL;
 
-	debug2("DBD_REMOVE_QOS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_remove_qos(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn, rc, comment, DBD_REMOVE_QOS);
+			slurmdbd_conn->pcon, rc, comment, DBD_REMOVE_QOS);
 		return rc;
 	}
-	list_msg.return_code = SLURM_SUCCESS;
+	list_msg.return_code = errno;
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -2909,38 +2605,19 @@ static int _remove_res(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	char *comment = NULL;
 
-	debug2("DBD_REMOVE_RES: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_remove_res(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform "
-				"this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn, rc, comment, DBD_REMOVE_RES);
+			slurmdbd_conn->pcon, rc, comment, DBD_REMOVE_RES);
 		return rc;
 	}
 	list_msg.return_code = errno;
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -2955,38 +2632,20 @@ static int _remove_users(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	char *comment = NULL;
 
-	debug2("DBD_REMOVE_USERS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_remove_users(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn, rc, comment, DBD_REMOVE_USERS);
+			slurmdbd_conn->pcon, rc, comment, DBD_REMOVE_USERS);
 		return rc;
 	}
 	list_msg.return_code = errno;
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -3001,38 +2660,20 @@ static int _remove_wckeys(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_list_msg_t list_msg = { NULL };
 	char *comment = NULL;
 
-	debug2("DBD_REMOVE_WCKEYS: called in CONN %d", slurmdbd_conn->conn->fd);
-
 	if (!(list_msg.my_list = acct_storage_g_remove_wckeys(
-		      slurmdbd_conn->db_conn, slurmdbd_conn->conn->auth_uid,
+		      slurmdbd_conn->db_conn, slurmdbd_conn->pcon->auth_uid,
 		      get_msg->cond))) {
-		if (errno == ESLURM_ACCESS_DENIED) {
-			comment = "Your user doesn't have privilege to perform this action";
-			rc = ESLURM_ACCESS_DENIED;
-		} else if (errno == SLURM_ERROR) {
-			comment = "Something was wrong with your query";
-			rc = SLURM_ERROR;
-		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			comment = "Request didn't affect anything";
-			rc = SLURM_SUCCESS;
-		} else if (errno == ESLURM_DB_CONNECTION) {
-			comment = slurm_strerror(errno);
-			rc = errno;
-		} else {
-			rc = errno;
-			if (!(comment = slurm_strerror(errno)))
-				comment = "Unknown issue";
-		}
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
+		rc = errno;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn, rc, comment, DBD_REMOVE_WCKEYS);
+			slurmdbd_conn->pcon, rc, comment, DBD_REMOVE_WCKEYS);
 		return rc;
 	}
-	list_msg.return_code = SLURM_SUCCESS;
+	list_msg.return_code = errno;
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_LIST, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_LIST, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -3049,18 +2690,16 @@ static int _remove_reservation(slurmdbd_conn_t *slurmdbd_conn,
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_REMOVE_RESV message from invalid uid";
 		error("DBD_REMOVE_RESV message from invalid uid %u",
-		      slurmdbd_conn->conn->auth_uid);
+		      slurmdbd_conn->pcon->auth_uid);
 		rc = ESLURM_ACCESS_DENIED;
 		goto end_it;
 	}
-
-	debug2("DBD_REMOVE_RESV: called in CONN %d", slurmdbd_conn->conn->fd);
 
 	rc = acct_storage_g_remove_reservation(slurmdbd_conn->db_conn,
 					       rec_msg->rec);
 
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_REMOVE_RESV);
 	return rc;
 }
@@ -3071,15 +2710,15 @@ static int _roll_usage(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	dbd_roll_usage_msg_t *get_msg = msg->data;
 	int rc = SLURM_SUCCESS;
 	char *comment = NULL;
-	List rollup_stats_list = NULL;
+	list_t *rollup_stats_list = NULL;
 	DEF_TIMERS;
 
-	info("DBD_ROLL_USAGE: called in CONN %d", slurmdbd_conn->conn->fd);
+	info("DBD_ROLL_USAGE: called in CONN %d",
+	     conn_g_get_fd(slurmdbd_conn->pcon->conn));
 
 	if (!_validate_operator(slurmdbd_conn)) {
-		comment = "Your user doesn't have privilege to perform this action";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
 		rc = ESLURM_ACCESS_DENIED;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
 		goto end_it;
 	}
 
@@ -3089,11 +2728,11 @@ static int _roll_usage(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 				       get_msg->archive_data,
 				       &rollup_stats_list);
 	END_TIMER;
-	handle_rollup_stats(rollup_stats_list, DELTA_TIMER, 1);
+	handle_rollup_stats(rollup_stats_list, TIMER_DURATION_USEC(), 1);
 	FREE_NULL_LIST(rollup_stats_list);
 
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_ROLL_USAGE);
 	return rc;
 }
@@ -3111,9 +2750,9 @@ static int _send_mult_job_start(slurmdbd_conn_t *slurmdbd_conn,
 
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_SEND_MULT_JOB_START message from invalid uid";
-		error("%s %u", comment, slurmdbd_conn->conn->auth_uid);
+		error("%s %u", comment, slurmdbd_conn->pcon->auth_uid);
 		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn,
+			slurmdbd_conn->pcon,
 			ESLURM_ACCESS_DENIED, comment,
 			DBD_SEND_MULT_JOB_START);
 		return SLURM_ERROR;
@@ -3135,7 +2774,7 @@ static int _send_mult_job_start(slurmdbd_conn_t *slurmdbd_conn,
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_MULT_JOB_START, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_MULT_JOB_START, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -3155,8 +2794,8 @@ static int _send_mult_msg(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_SEND_MULT_MSG message from invalid uid";
-		error("%s %u", comment, slurmdbd_conn->conn->auth_uid);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		error("%s %u", comment, slurmdbd_conn->pcon->auth_uid);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							ESLURM_ACCESS_DENIED,
 							comment,
 							DBD_SEND_MULT_MSG);
@@ -3172,7 +2811,7 @@ static int _send_mult_msg(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 		ret_buf = NULL;
 
 		rc = slurm_persist_conn_process_msg(
-			slurmdbd_conn->conn, &sub_msg,
+			slurmdbd_conn->pcon, &sub_msg,
 			get_buf_data(req_buf),
 			size_buf(req_buf), &ret_buf, 0);
 
@@ -3183,7 +2822,8 @@ static int _send_mult_msg(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 		if (ret_buf)
 			list_append(list_msg.my_list, ret_buf);
-		if (rc != SLURM_SUCCESS)
+		if ((rc != SLURM_SUCCESS) &&
+		    (rc != SLURM_NO_CHANGE_IN_DATA))
 			break;
 	}
 	list_iterator_destroy(itr);
@@ -3192,7 +2832,7 @@ static int _send_mult_msg(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 	*out_buffer = init_buf(1024);
 	pack16((uint16_t) DBD_GOT_MULT_MSG, *out_buffer);
-	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->conn->version,
+	slurmdbd_pack_list_msg(&list_msg, slurmdbd_conn->pcon->version,
 			       DBD_GOT_MULT_MSG, *out_buffer);
 	FREE_NULL_LIST(list_msg.my_list);
 
@@ -3211,7 +2851,7 @@ static int _step_complete(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_STEP_COMPLETE message from invalid uid";
-		error("%s %u", comment, slurmdbd_conn->conn->auth_uid);
+		error("%s %u", comment, slurmdbd_conn->pcon->auth_uid);
 		rc = ESLURM_ACCESS_DENIED;
 		goto end_it;
 	}
@@ -3232,7 +2872,7 @@ static int _step_complete(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	step.jobacct = step_comp_msg->jobacct;
 	job.job_id = step_comp_msg->step_id.job_id;
 	step.requid = step_comp_msg->req_uid;
-	job.start_protocol_ver = slurmdbd_conn->conn->version;
+	job.start_protocol_ver = slurmdbd_conn->pcon->version;
 	job.start_time = step_comp_msg->start_time;
 	job.tres_alloc_str = step_comp_msg->job_tres_alloc_str;
 	step.state = step_comp_msg->state;
@@ -3252,18 +2892,18 @@ static int _step_complete(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	/* just in case this gets set we need to clear it */
 	xfree(job.wckey);
 
-	if (!slurmdbd_conn->conn->rem_port) {
+	if (!slurmdbd_conn->pcon->rem_port) {
 		debug3("DBD_STEP_COMPLETE: cluster not registered");
-		slurmdbd_conn->conn->rem_port =
+		slurmdbd_conn->pcon->rem_port =
 			clusteracct_storage_g_register_disconn_ctld(
 				slurmdbd_conn->db_conn,
-				slurmdbd_conn->conn->rem_host);
+				slurmdbd_conn->pcon->rem_host);
 
 		_add_registered_cluster(slurmdbd_conn);
 	}
 
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_STEP_COMPLETE);
 	return rc;
 }
@@ -3281,7 +2921,7 @@ static int _step_start(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 
 	if (!_validate_slurm_user(slurmdbd_conn)) {
 		comment = "DBD_STEP_START message from invalid uid";
-		error("%s %u", comment, slurmdbd_conn->conn->auth_uid);
+		error("%s %u", comment, slurmdbd_conn->pcon->auth_uid);
 		rc = ESLURM_ACCESS_DENIED;
 		goto end_it;
 	}
@@ -3304,7 +2944,7 @@ static int _step_start(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	step.name = step_start_msg->name;
 	job.nodes = step_start_msg->nodes;
 	step.network = step_start_msg->node_inx;
-	job.start_protocol_ver = slurmdbd_conn->conn->version;
+	job.start_protocol_ver = slurmdbd_conn->pcon->version;
 	/*
 	 * Set job.start_time to be the same as step.start_time. If the
 	 * job_db_inx hasn't be created yet we need the start time or we will
@@ -3313,6 +2953,7 @@ static int _step_start(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	 */
 	job.start_time = step.start_time = step_start_msg->start_time;
 	details.submit_time = step_start_msg->job_submit_time;
+	step.time_limit = step_start_msg->time_limit;
 
 	memcpy(&step.step_id, &step_start_msg->step_id, sizeof(step.step_id));
 
@@ -3320,6 +2961,10 @@ static int _step_start(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	step.cpu_freq_min = step_start_msg->req_cpufreq_min;
 	step.cpu_freq_max = step_start_msg->req_cpufreq_max;
 	step.cpu_freq_gov = step_start_msg->req_cpufreq_gov;
+	step.cwd = step_start_msg->cwd;
+	step.std_err = step_start_msg->std_err;
+	step.std_in = step_start_msg->std_in;
+	step.std_out = step_start_msg->std_out;
 	step.submit_line = step_start_msg->submit_line;
 	step.tres_alloc_str = step_start_msg->tres_alloc_str;
 
@@ -3338,18 +2983,18 @@ static int _step_start(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	/* just in case this gets set we need to clear it */
 	xfree(job.wckey);
 
-	if (!slurmdbd_conn->conn->rem_port) {
+	if (!slurmdbd_conn->pcon->rem_port) {
 		debug3("DBD_STEP_START: cluster not registered");
-		slurmdbd_conn->conn->rem_port =
+		slurmdbd_conn->pcon->rem_port =
 			clusteracct_storage_g_register_disconn_ctld(
 				slurmdbd_conn->db_conn,
-				slurmdbd_conn->conn->rem_host);
+				slurmdbd_conn->pcon->rem_host);
 
 		_add_registered_cluster(slurmdbd_conn);
 	}
 
 end_it:
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_STEP_START);
 	return rc;
 }
@@ -3361,21 +3006,32 @@ static int _get_stats(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	char *comment = NULL;
 
 	if (!_validate_super_user(slurmdbd_conn)) {
-		comment = "Your user doesn't have privilege to perform this action";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
-							ESLURM_ACCESS_DENIED,
+		int rc = ESLURM_ACCESS_DENIED;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon, rc,
 							comment, DBD_GET_STATS);
 
-		return ESLURM_ACCESS_DENIED;
+		return rc;
 	}
 
 	debug2("Get stats request received from UID %u",
-	       slurmdbd_conn->conn->auth_uid);
+	       slurmdbd_conn->pcon->auth_uid);
+
+	/* Assume rpc_stats is present to hold lock as beifly as possible */
 	*out_buffer = init_buf(32 * 1024);
 	pack16((uint16_t) DBD_GOT_STATS, *out_buffer);
 	slurm_mutex_lock(&rpc_mutex);
-	slurmdb_pack_stats_msg(&rpc_stats, slurmdbd_conn->conn->version,
+	if (!rpc_stats) {
+		slurm_mutex_unlock(&rpc_mutex);
+		free_buf(*out_buffer);
+		rc = ESLURM_NO_RPC_STATS;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon, rc,
+							comment, DBD_GET_STATS);
+
+		return rc;
+	}
+	slurmdb_pack_stats_msg(rpc_stats, slurmdbd_conn->pcon->version,
 			       *out_buffer);
 	slurm_mutex_unlock(&rpc_mutex);
 
@@ -3389,22 +3045,21 @@ static int _clear_stats(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	char *comment = NULL;
 
 	if (!_validate_super_user(slurmdbd_conn)) {
-		comment = "Your user doesn't have privilege to perform this action";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(
-			slurmdbd_conn->conn,
-			ESLURM_ACCESS_DENIED,
-			comment, DBD_CLEAR_STATS);
+		int rc = ESLURM_ACCESS_DENIED;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon, rc,
+							comment,
+							DBD_CLEAR_STATS);
 
-		return ESLURM_ACCESS_DENIED;
+		return rc;
 	}
 
 	info("Clear stats request received from UID %u",
-	     slurmdbd_conn->conn->auth_uid);
+	     slurmdbd_conn->pcon->auth_uid);
 
 	init_dbd_stats();
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_CLEAR_STATS);
 	return rc;
 }
@@ -3416,20 +3071,19 @@ static int _shutdown(slurmdbd_conn_t *slurmdbd_conn, persist_msg_t *msg,
 	char *comment = NULL;
 
 	if (!_validate_super_user(slurmdbd_conn)) {
-		comment = "Your user doesn't have privilege to perform this action";
-		error("CONN:%d %s", slurmdbd_conn->conn->fd, comment);
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
-							ESLURM_ACCESS_DENIED,
+		int rc = ESLURM_ACCESS_DENIED;
+		comment = _internal_rc_to_str(rc, slurmdbd_conn, false);
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon, rc,
 							comment, DBD_SHUTDOWN);
 
-		return ESLURM_ACCESS_DENIED;
+		return rc;
 	}
 
 	info("Shutdown request received from UID %u",
-	     slurmdbd_conn->conn->auth_uid);
-	pthread_kill(signal_handler_thread, SIGTERM);
+	     slurmdbd_conn->pcon->auth_uid);
+	shutdown_threads();
 
-	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+	*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 						rc, comment, DBD_SHUTDOWN);
 	return rc;
 }
@@ -3449,40 +3103,40 @@ extern int proc_req(void *conn, persist_msg_t *msg, buf_t **out_buffer)
 	int rc = SLURM_SUCCESS;
 	char *comment = NULL;
 	slurmdb_rpc_obj_t *rpc_obj;
+	int fd = conn_g_get_fd(slurmdbd_conn->pcon->conn);
 
 	DEF_TIMERS;
 	START_TIMER;
 
-	if (!slurmdbd_conn->conn->auth_ids_set)
+	if (!slurmdbd_conn->pcon->auth_ids_set)
 		fatal("%s: auth_ids_set is false, this should never happen",
 		      __func__);
 
 	if (slurm_conf.debug_flags & DEBUG_FLAG_PROTOCOL) {
 		char *p = slurmdbd_msg_type_2_str(msg->msg_type, 1);
-		if (slurmdbd_conn->conn->cluster_name) {
+		if (slurmdbd_conn->pcon->cluster_name) {
 			info("%s: received opcode %s from persist conn on (%s)%s uid %u",
-			     __func__, p, slurmdbd_conn->conn->cluster_name,
-			     slurmdbd_conn->conn->rem_host,
-			     slurmdbd_conn->conn->auth_uid);
+			     __func__, p, slurmdbd_conn->pcon->cluster_name,
+			     slurmdbd_conn->pcon->rem_host,
+			     slurmdbd_conn->pcon->auth_uid);
 		} else {
 			info("%s: received opcode %s from %s uid %u",
-			     __func__, p, slurmdbd_conn->conn->rem_host,
-			     slurmdbd_conn->conn->auth_uid);
+			     __func__, p, slurmdbd_conn->pcon->rem_host,
+			     slurmdbd_conn->pcon->auth_uid);
 		}
 	}
 
 	if (slurm_conf.debug_flags & DEBUG_FLAG_AUDIT_RPCS) {
 		slurm_addr_t cli_addr;
-		(void) slurm_get_peer_addr(slurmdbd_conn->conn->fd, &cli_addr);
+		(void) slurm_get_peer_addr(fd, &cli_addr);
 		log_flag(AUDIT_RPCS, "msg_type=%s uid=%u client=[%pA] protocol=%u",
 			 slurmdbd_msg_type_2_str(msg->msg_type, 1),
-			 slurmdbd_conn->conn->auth_uid,
-			 &cli_addr, slurmdbd_conn->conn->version);
+			 slurmdbd_conn->pcon->auth_uid,
+			 &cli_addr, slurmdbd_conn->pcon->version);
 	}
 
 	switch (msg->msg_type) {
 	case REQUEST_PERSIST_INIT:
-	case REQUEST_PERSIST_INIT_TLS:
 		rc = _unpack_persist_init(slurmdbd_conn, msg, out_buffer);
 		break;
 	case DBD_ADD_ACCOUNTS:
@@ -3544,6 +3198,7 @@ extern int proc_req(void *conn, persist_msg_t *msg, buf_t **out_buffer)
 		break;
 	case DBD_GET_ASSOC_USAGE:
 	case DBD_GET_WCKEY_USAGE:
+	case DBD_GET_ASSOC_NG_USAGE:
 	case DBD_GET_CLUSTER_USAGE:
 		rc = _get_usage(slurmdbd_conn, msg, out_buffer);
 		break;
@@ -3647,7 +3302,7 @@ extern int proc_req(void *conn, persist_msg_t *msg, buf_t **out_buffer)
 		 * We don't want/need to send updates to this cluster that just
 		 * registered since it's rpc manager might not be up yet.
 		 */
-		slurmdbd_conn->conn->flags |= PERSIST_FLAG_DONT_UPDATE_CLUSTER;
+		slurmdbd_conn->pcon->flags |= PERSIST_FLAG_DONT_UPDATE_CLUSTER;
 		break;
 	case DBD_REMOVE_ACCOUNTS:
 		rc = _remove_accounts(slurmdbd_conn, msg, out_buffer);
@@ -3709,19 +3364,17 @@ extern int proc_req(void *conn, persist_msg_t *msg, buf_t **out_buffer)
 	default:
 		comment = "Invalid RPC";
 		error("CONN:%d %s msg_type=%s",
-		      slurmdbd_conn->conn->fd, comment,
-		      rpc_num2string(msg->msg_type));
+		      fd, comment, rpc_num2string(msg->msg_type));
 		rc = EINVAL;
-		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->conn,
+		*out_buffer = slurm_persist_make_rc_msg(slurmdbd_conn->pcon,
 							rc, comment, 0);
 		break;
 	}
 
 	if (rc == ESLURM_ACCESS_DENIED)
 		error("CONN:%d Security violation, %s",
-		      slurmdbd_conn->conn->fd,
-		      slurmdbd_msg_type_2_str(msg->msg_type, 1));
-	else if (slurmdbd_conn->conn->rem_port &&
+		      fd, slurmdbd_msg_type_2_str(msg->msg_type, 1));
+	else if (slurmdbd_conn->pcon->rem_port &&
 		 (!slurmdbd_conf->commit_delay ||
 		  (msg->msg_type == DBD_REGISTER_CTLD))) {
 		/* If we are dealing with the slurmctld do the
@@ -3736,31 +3389,35 @@ extern int proc_req(void *conn, persist_msg_t *msg, buf_t **out_buffer)
 	 * only. Can't clear in p_commit() because if CommitDelay is set, we may
 	 * not send needed updates later.
 	 */
-	slurmdbd_conn->conn->flags &= ~PERSIST_FLAG_DONT_UPDATE_CLUSTER;
+	slurmdbd_conn->pcon->flags &= ~PERSIST_FLAG_DONT_UPDATE_CLUSTER;
 
 	END_TIMER;
 
 	slurm_mutex_lock(&rpc_mutex);
+	if (!rpc_stats) {
+		slurm_mutex_unlock(&rpc_mutex);
+		return rc;
+	}
 
-	if (!(rpc_obj = list_find_first(rpc_stats.rpc_list,
-					_find_rpc_obj_in_list,
-					&msg->msg_type))) {
+	if (!(rpc_obj =
+		      list_find_first(rpc_stats->rpc_list,
+				      _find_rpc_obj_in_list, &msg->msg_type))) {
 		rpc_obj = xmalloc(sizeof(slurmdb_rpc_obj_t));
 		rpc_obj->id = msg->msg_type;
-		list_append(rpc_stats.rpc_list, rpc_obj);
+		list_append(rpc_stats->rpc_list, rpc_obj);
 	}
 	rpc_obj->cnt++;
-	rpc_obj->time += DELTA_TIMER;
+	rpc_obj->time += TIMER_DURATION_USEC();
 
-	if (!(rpc_obj = list_find_first(rpc_stats.user_list,
+	if (!(rpc_obj = list_find_first(rpc_stats->user_list,
 					_find_rpc_obj_in_list,
-					&slurmdbd_conn->conn->auth_uid))) {
+					&slurmdbd_conn->pcon->auth_uid))) {
 		rpc_obj = xmalloc(sizeof(slurmdb_rpc_obj_t));
-		rpc_obj->id = slurmdbd_conn->conn->auth_uid;
-		list_append(rpc_stats.user_list, rpc_obj);
+		rpc_obj->id = slurmdbd_conn->pcon->auth_uid;
+		list_append(rpc_stats->user_list, rpc_obj);
 	}
 	rpc_obj->cnt++;
-	rpc_obj->time += DELTA_TIMER;
+	rpc_obj->time += TIMER_DURATION_USEC();
 
 	slurm_mutex_unlock(&rpc_mutex);
 

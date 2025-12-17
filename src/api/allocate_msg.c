@@ -41,7 +41,6 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/un.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -51,15 +50,18 @@
 #include "src/common/fd.h"
 #include "src/common/forward.h"
 #include "src/common/half_duplex.h"
-#include "src/common/net.h"
 #include "src/common/macros.h"
+#include "src/common/net.h"
 #include "src/common/read_config.h"
-#include "src/interfaces/auth.h"
-#include "src/common/slurm_protocol_defs.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_common.h"
+#include "src/common/slurm_protocol_defs.h"
+#include "src/common/threadpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xsignal.h"
+
+#include "src/interfaces/auth.h"
+#include "src/interfaces/conn.h"
 
 struct allocation_msg_thread {
 	slurm_allocation_callbacks_t callback;
@@ -70,6 +72,7 @@ struct allocation_msg_thread {
 static void _handle_msg(void *arg, slurm_msg_t *msg);
 static pthread_mutex_t msg_thr_start_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t msg_thr_start_cond = PTHREAD_COND_INITIALIZER;
+static bool msg_thr_start_done = false;
 static struct io_operations message_socket_ops = {
 	.readable = &eio_message_socket_readable,
 	.handle_read = &eio_message_socket_accept,
@@ -85,6 +88,7 @@ static void *_msg_thr_internal(void *arg)
 	xsignal_block(signals);
 	slurm_mutex_lock(&msg_thr_start_lock);
 	slurm_cond_signal(&msg_thr_start_cond);
+	msg_thr_start_done = true;
 	slurm_mutex_unlock(&msg_thr_start_lock);
 	eio_handle_mainloop((eio_handle_t *)arg);
 	debug("Leaving _msg_thr_internal");
@@ -140,9 +144,13 @@ extern allocation_msg_thread_t *slurm_allocation_msg_thr_create(
 	eio_new_initial_obj(msg_thr->handle, obj);
 	slurm_mutex_lock(&msg_thr_start_lock);
 	slurm_thread_create(&msg_thr->id, _msg_thr_internal, msg_thr->handle);
-	/* Wait until the message thread has blocked signals
-	   before continuing. */
-	slurm_cond_wait(&msg_thr_start_cond, &msg_thr_start_lock);
+	while (!msg_thr_start_done) {
+		/*
+		 * Wait until the message thread has blocked signals
+		 * before continuing.
+		 */
+		slurm_cond_wait(&msg_thr_start_cond, &msg_thr_start_lock);
+	}
 	slurm_mutex_unlock(&msg_thr_start_lock);
 
 	return (allocation_msg_thread_t *)msg_thr;
@@ -230,36 +238,33 @@ static void _net_forward(struct allocation_msg_thread *msg_thr,
 {
 	net_forward_msg_t *msg = forward_msg->data;
 	int *local, *remote;
-	eio_obj_t *e1, *e2;
 
 	local = xmalloc(sizeof(*local));
 	remote = xmalloc(sizeof(*remote));
 
-	*remote = forward_msg->conn_fd;
+	*remote = conn_g_get_fd(forward_msg->conn);
+	net_set_nodelay(*remote, true, NULL);
 
 	if (msg->port) {
 		/* connect to host and given tcp port */
 		slurm_addr_t local_addr;
 		memset(&local_addr, 0, sizeof(local_addr));
 		slurm_set_addr(&local_addr, msg->port, msg->target);
-		*local = slurm_open_msg_conn(&local_addr);
+
+		*local = slurm_open_stream(&local_addr, false);
 		if (*local == -1) {
 			error("%s: failed to open x11 port `%s:%d`: %m",
 			      __func__, msg->target, msg->port);
 			goto error;
 		}
+		net_set_nodelay(*local, true, NULL);
 	} else if (msg->target) {
+		int rc;
+
 		/* connect to local unix socket */
-		struct sockaddr_un addr;
-		socklen_t len;
-		memset(&addr, 0, sizeof(addr));
-		addr.sun_family = AF_UNIX;
-		strlcpy(addr.sun_path, msg->target, sizeof(addr.sun_path));
-		len = strlen(addr.sun_path) + 1 + sizeof(addr.sun_family);
-		if (((*local = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) ||
-		    ((connect(*local, (struct sockaddr *) &addr, len)) < 0)) {
-			error("%s: failed to open x11 display on `%s`: %m",
-			      __func__, msg->target);
+		if ((rc = slurm_open_unix_stream(msg->target, 0, local))) {
+			error("%s: failed to open x11 display on `%s`: %s",
+			      __func__, msg->target, slurm_strerror(rc));
 			goto error;
 		}
 	}
@@ -270,15 +275,13 @@ static void _net_forward(struct allocation_msg_thread *msg_thr,
 	 */
 	slurm_send_rc_msg(forward_msg, SLURM_SUCCESS);
 
+	if (half_duplex_add_objs_to_handle(msg_thr->handle, local, remote,
+					   forward_msg->conn)) {
+		goto error;
+	}
+
 	/* prevent the upstream call path from closing the connection */
-	forward_msg->conn_fd = -1;
-
-	e1 = eio_obj_create(*local, &half_duplex_ops, remote);
-	e2 = eio_obj_create(*remote, &half_duplex_ops, local);
-
-	/* setup eio to handle both sides of the connection now */
-	eio_new_obj(msg_thr->handle, e1);
-	eio_new_obj(msg_thr->handle, e2);
+	forward_msg->conn = NULL;
 
 	return;
 

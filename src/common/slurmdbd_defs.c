@@ -199,6 +199,10 @@ extern slurmdbd_msg_type_t str_2_slurmdbd_msg_type(char *msg_type)
 		return DBD_GET_QOS;
 	} else if (!xstrcasecmp(msg_type, "Got QOS")) {
 		return DBD_GOT_QOS;
+	} else if (!xstrcasecmp(msg_type, "Get QOS Usage")) {
+		return DBD_GET_QOS_USAGE;
+	} else if (!xstrcasecmp(msg_type, "Got QOS Usage")) {
+		return DBD_GOT_QOS_USAGE;
 	} else if (!xstrcasecmp(msg_type, "Remove QOS")) {
 		return DBD_REMOVE_QOS;
 	} else if (!xstrcasecmp(msg_type, "Add WCKeys")) {
@@ -354,6 +358,12 @@ extern char *slurmdbd_msg_type_2_str(slurmdbd_msg_type_t msg_type, int get_enum)
 			return "DBD_GET_ASSOC_USAGE";
 		} else
 			return "Get Association Usage";
+		break;
+	case DBD_GET_ASSOC_NG_USAGE:
+		if (get_enum) {
+			return "DBD_GET_ASSOC_NG_USAGE";
+		} else
+			return "Get Association Non-Grouped Usage";
 		break;
 	case DBD_GET_CLUSTERS:
 		if (get_enum) {
@@ -690,6 +700,18 @@ extern char *slurmdbd_msg_type_2_str(slurmdbd_msg_type_t msg_type, int get_enum)
 			return "DBD_GOT_QOS";
 		} else
 			return "Got QOS";
+		break;
+	case DBD_GET_QOS_USAGE:
+		if (get_enum) {
+			return "DBD_GET_QOS_USAGE";
+		} else
+			return "Get QOS Usage";
+		break;
+	case DBD_GOT_QOS_USAGE:
+		if (get_enum) {
+			return "DBD_GOT_QOS_USAGE";
+		} else
+			return "Got QOS Usage";
 		break;
 	case DBD_REMOVE_QOS:
 		if (get_enum) {
@@ -1144,6 +1166,8 @@ extern void slurmdbd_free_job_start_msg(void *in)
 		xfree(msg->nodes);
 		xfree(msg->node_inx);
 		xfree(msg->partition);
+		xfree(msg->qos_req);
+		xfree(msg->resv_req);
 		xfree(msg->script_hash);
 		xfree(msg->std_err);
 		xfree(msg->std_in);
@@ -1291,6 +1315,10 @@ extern void slurmdbd_free_step_start_msg(dbd_step_start_msg_t *msg)
 		xfree(msg->name);
 		xfree(msg->nodes);
 		xfree(msg->node_inx);
+		xfree(msg->cwd);
+		xfree(msg->std_err);
+		xfree(msg->std_in);
+		xfree(msg->std_out);
 		xfree(msg->submit_line);
 		xfree(msg->tres_alloc_str);
 		xfree(msg);
@@ -1316,7 +1344,7 @@ extern void slurmdbd_free_usage_msg(dbd_usage_msg_t *msg,
 			destroy_rec = slurmdb_destroy_wckey_rec;
 			break;
 		default:
-			fatal("Unknown usuage type");
+			fatal("Unknown usage type");
 			return;
 		}
 

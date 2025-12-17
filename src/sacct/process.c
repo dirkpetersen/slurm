@@ -45,7 +45,7 @@ static void _aggregate_tres_usage_stats_internal(char **dest_tres_max,
 						 char *from_tres_max_nodeid,
 						 char *from_tres_max_taskid)
 {
-	List dest_tres_list = NULL, from_tres_list = NULL;
+	list_t *dest_tres_list = NULL, *from_tres_list = NULL;
 	list_itr_t *itr;
 	slurmdb_tres_rec_t *dest_tres_rec, *from_tres_rec;
 	uint32_t flags;
@@ -60,8 +60,10 @@ static void _aggregate_tres_usage_stats_internal(char **dest_tres_max,
 	dest_tres_list = list_create(slurmdb_destroy_tres_rec);
 	from_tres_list = list_create(slurmdb_destroy_tres_rec);
 
-	slurmdb_tres_list_from_string(&dest_tres_list, *dest_tres_max, flags);
-	slurmdb_tres_list_from_string(&from_tres_list, from_tres_max, flags);
+	slurmdb_tres_list_from_string(&dest_tres_list, *dest_tres_max, flags,
+				      NULL);
+	slurmdb_tres_list_from_string(&from_tres_list, from_tres_max, flags,
+				      NULL);
 
 	itr = list_iterator_create(from_tres_list);
 	while ((from_tres_rec = list_next(itr))) {

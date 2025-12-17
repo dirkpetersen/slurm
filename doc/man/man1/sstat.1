@@ -1,4 +1,4 @@
-.TH sstat "1" "Slurm Commands" "January 2024" "Slurm Commands"
+.TH sstat "1" "Slurm Commands" "Slurm 26.05" "Slurm Commands"
 
 .SH "NAME"
 sstat \- Display the status information of a running job/step.
@@ -119,8 +119,15 @@ Print version.
 Descriptions of each field option can be found below.
 Note that the Ave*, Max* and Min* accounting fields look at the values for
 all the tasks of each step in a job and return the average, maximum or minimum
-values for the job step.
+values of the task for that job step. For example, for MaxRSS, the returned
+value is the maximum memory consumption seen by one of the tasks of the step,
+and MaxRSSTask shows which task it is.
 .RS
+
+.TP
+\f3AllocTRES\fP
+Allocated TRES of all tasks in job.
+.IP
 
 .TP
 \f3AveCPU\fP
@@ -160,8 +167,8 @@ Average Virtual Memory size of all tasks in job.
 .TP
 \f3ConsumedEnergy\fP
 Total energy consumed by all tasks in job, in joules.
-Note: Only in case of exclusive job allocation this value 
-reflects the jobs' real energy consumption. 
+Note: Only in case of exclusive job allocation this value
+reflects the jobs' real energy consumption.
 .IP
 
 .TP

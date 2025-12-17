@@ -38,6 +38,40 @@ from optparse import OptionValueError
 from subprocess import Popen
 
 
+def wait_load_avg(
+    threshold=1.0, incr_threshold=0.1, incr_period=60, max_timeout=600, poll_interval=10
+):
+    """
+    This functions waits until the normalized load of the system is lower than threshold.
+    After each incr_period of seconds the threshold will be incremented by incr_threshold.
+    After max_timeout secionds, function will return False.
+    Otherwise once the load is below the thresdhold, it will return True.
+    """
+    cpu_count = os.cpu_count()
+    start_timeout = time.time()
+    start_incr = time.time()
+    while True:
+        load1, load5, load15 = tuple(x / cpu_count for x in os.getloadavg())
+        if load1 < threshold:
+            break
+
+        print(
+            f"System too busy: {(load1*100):.0f}% / {(load5*100):.0f}% / {(load15*100):.0f}% (Max allowed: {(threshold*100):.0f}%)"
+        )
+        now = time.time()
+
+        if (now - start_timeout) > max_timeout:
+            return False
+
+        if (now - start_incr) > incr_period:
+            start_incr = time.time()
+            threshold += incr_threshold
+
+        time.sleep(poll_interval)
+
+    return True
+
+
 def main(argv=None):
     # "tests" is a list containing tuples of length 3 of the form
     # (test major number, test minor number, test filename)
@@ -94,6 +128,14 @@ def main(argv=None):
         type="string",
         help="write json result to specified file name",
     )
+    parser.add_option(
+        "-w",
+        "--wait-load",
+        action="store_true",
+        dest="wait_load",
+        default=True,
+        help="before starting each test, wait until the system load is low enough",
+    )
 
     (options, args) = parser.parse_args(args=argv)
 
@@ -127,7 +169,7 @@ def main(argv=None):
             "ERROR: no test files found in current working directory", file=sys.stderr
         )
         return -1
-    # sory by major, minor
+    # sort by major, minor
     tests.sort(key=lambda t: (t[0], t[1]))
 
     # Set begin value
@@ -147,6 +189,8 @@ def main(argv=None):
     for test in tests:
         if begin[0] > test[0] or (begin[0] == test[0] and begin[1] > test[1]):
             continue
+        if options.wait_load:
+            wait_load_avg()
         test_id = f"{test[0]}.{test[1]}"
         sys.stdout.write(f"Running test {test_id} ")
         sys.stdout.flush()
@@ -155,8 +199,11 @@ def main(argv=None):
         testlog_name = f"test{test_id}.log"
         try:
             os.remove(testlog_name + ".failed")
-        except:
+        except Exception:
             pass
+
+        if os.path.exists(testlog_name):
+            os.remove(testlog_name)
         testlog = open(testlog_name, "w+")
 
         if options.time_individual:
@@ -202,9 +249,9 @@ def main(argv=None):
             test_output = testlog.read()
 
             sections = [s for s in test_output.split("=" * 78 + "\n")]
-            header = sections[1]
+            # header = sections[1]
             body = sections[2]
-            footer = "".join(sections[3:])
+            # footer = "".join(sections[3:])
 
             fatals = re.findall(
                 r"(?ms)\[[^\]]+\][ \[]+Fatal[ \]:]+(.*?) \(fail[^\)]+\)$", body
@@ -345,13 +392,13 @@ def test_parser(option, opt_str, value, parser):
         setattr(parser.values, option.dest, [])
 
     # Get a pointer to the option's destination array.
-    l = getattr(parser.values, option.dest)
+    dest = getattr(parser.values, option.dest)
 
     # Split the user's option string into a series of tuples that represent
     # each test, and add each tuple to the destination array.
     splitter = re.compile(r"[,\s]+")
     val = splitter.split(value)
-    test_re = re.compile(r"(test)?((\d+)|\*)\.((\d+)|\*)$")
+    test_re = re.compile(r"(test)?((\d+)|\*)[\._]((\d+)|\*)$")
     for v in val:
         m = test_re.match(v)
         if not m:
@@ -362,7 +409,7 @@ def test_parser(option, opt_str, value, parser):
         minor = m.group(4)
         if minor != "*":
             minor = int(minor)
-        l.append((major, minor))
+        dest.append((major, minor))
 
 
 if __name__ == "__main__":

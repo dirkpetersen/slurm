@@ -47,6 +47,8 @@
 #define MAGIC_ARGS 0x2ea1bebb
 #define is_fast_mode(args) (args->flags & FLAG_FAST)
 #define is_complex_mode(args) (args->flags & FLAG_COMPLEX_VALUES)
+#define is_prefer_refs_mode(args) (~args->flags & FLAG_MINIMIZE_REFS)
+#define is_inline_enums_mode(args) (args->flags & FLAG_INLINE_ENUMS)
 
 typedef enum {
 	FLAG_NONE = 0,
@@ -56,6 +58,17 @@ typedef enum {
 	FLAG_FAST = SLURM_BIT(1),
 	/* use null/false/Infinity/NaN for *_NO_VALs */
 	FLAG_COMPLEX_VALUES = SLURM_BIT(2),
+	/*
+	 * Deprecated in v0.0.42 (as default behavior)
+	 * TODO: Remove flag in v0.0.45
+	 * Prefer $ref over expanding schema inline in OpenAPI specification
+	 * Set FLAG_MINIMIZE_REFS to deactivate this default.
+	 */
+	FLAG_PREFER_REFS = SLURM_BIT(3),
+	/* Prefer to inline $ref into schemas when possible in OpenAPI specification */
+	FLAG_MINIMIZE_REFS = SLURM_BIT(4),
+	/* Prefer to inline $ref into schema for flag arrays */
+	FLAG_INLINE_ENUMS = SLURM_BIT(5),
 } data_parser_flags_t;
 
 typedef struct {
@@ -70,9 +83,9 @@ typedef struct {
 	void *warn_arg;
 	void *db_conn;
 	bool close_db_conn;
-	List tres_list;
-	List qos_list;
-	List assoc_list;
+	list_t *tres_list;
+	list_t *qos_list;
+	list_t *assoc_list;
 	data_parser_flags_t flags;
 } args_t;
 

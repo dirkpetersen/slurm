@@ -77,46 +77,48 @@ typedef enum {
 /* These #defines are for the tres_str functions below and should be
  * sent when flags are allowed in the functions.
  */
-#define TRES_STR_FLAG_NONE        0x00000000 /* No flags, meaning by
-					      * default the string
-					      * will contain -1 and
-					      * be unique honoring
-					      * the first value found
-					      * in an incoming string */
-#define TRES_STR_FLAG_ONLY_CONCAT 0x00000001 /* Only concat the
-					      * string, this will
-					      * most likely trump the
-					      * other flags below. */
-#define TRES_STR_FLAG_REPLACE     0x00000002 /* Replace previous count
-					      * values found, if this
-					      * is not set duplicate
-					      * entries will be skipped. */
-#define TRES_STR_FLAG_REMOVE      0x00000004 /* If -1 entries are
+typedef enum {
+	TRES_STR_FLAG_NONE = 0, /* No flags, meaning by
+				 * default the string
+				 * will contain -1 and
+				 * be unique honoring
+				 * the first value found
+				 * in an incoming string */
+	TRES_STR_FLAG_ONLY_CONCAT = SLURM_BIT(1), /* Only concat the
+						   * string, this will
+						   * most likely trump the
+						   * other flags below. */
+	TRES_STR_FLAG_REPLACE = SLURM_BIT(2), /* Replace previous count
+					       * values found, if this
+					       * is not set duplicate
+					       * entries will be skipped. */
+	TRES_STR_FLAG_REMOVE = SLURM_BIT(3), /* If -1 entries are
 					      * found remove them, by
 					      * default they will be
-					      * added to the string
-					      */
-#define TRES_STR_FLAG_SORT_ID     0x00000008 /* sort string by ID */
-#define TRES_STR_FLAG_SIMPLE      0x00000010 /* make a simple string */
-#define TRES_STR_FLAG_COMMA1      0x00000020 /* make a first char a comma */
-#define TRES_STR_FLAG_NO_NULL     0x00000040 /* return blank string
-					      * instead of NULL */
-#define TRES_STR_CONVERT_UNITS    0x00000080 /* Convert number units */
-#define TRES_STR_FLAG_SUM         0x00000100 /* Sum entries of the same type
-					      * ignoring -1 */
-#define TRES_STR_FLAG_MAX         0x00000200 /* Set Max value from entries of
-					      * the same type ignoring -1 */
-#define TRES_STR_FLAG_MIN         0x00000400 /* Set Min value from entries of
-					      * the same type ignoring -1 */
-#define TRES_STR_FLAG_ALLOW_REAL  0x00000800 /* Allow all counts (even zero)
-					      * unless INFINITE64 or NO_VAL64 */
-#define TRES_STR_FLAG_BYTES       0x00000800 /* Convertable Usage in Bytes */
-
-typedef struct {
-	slurmdb_cluster_rec_t *cluster_rec;
-	int preempt_cnt;
-	time_t start_time;
-} local_cluster_rec_t;
+					      * added to the string */
+	TRES_STR_FLAG_SORT_ID = SLURM_BIT(4), /* sort string by ID */
+	TRES_STR_FLAG_SIMPLE = SLURM_BIT(5), /* make a simple string */
+	TRES_STR_FLAG_COMMA1 = SLURM_BIT(6), /* make a first char a comma */
+	TRES_STR_FLAG_NO_NULL = SLURM_BIT(7), /* return blank string
+					       * instead of NULL */
+	TRES_STR_CONVERT_UNITS = SLURM_BIT(8), /* Convert number units */
+	TRES_STR_FLAG_SUM = SLURM_BIT(9), /* Sum entries of the same type
+					   * ignoring -1 */
+	TRES_STR_FLAG_MAX = SLURM_BIT(10), /* Set Max value from entries of
+					    * the same type ignoring -1 */
+	TRES_STR_FLAG_MIN = SLURM_BIT(11), /* Set Min value from entries of
+					    * the same type ignoring -1 */
+	TRES_STR_FLAG_ALLOW_REAL = SLURM_BIT(12), /* Allow all counts (even
+						   * zero) unless INFINITE64 or
+						   * NO_VAL64 */
+	TRES_STR_FLAG_BYTES = SLURM_BIT(13), /* Convertible Usage in Bytes */
+	TRES_STR_FLAG_ALLOW_AMEND = SLURM_BIT(14), /* Allow TRES string with
+						    * +- syntax (-= and +=) */
+	TRES_STR_FLAG_COMB_AMEND = SLURM_BIT(15), /* Combine two entries of the
+						   * same type when using
+						   * amending TRES, unset
+						   * amending status after */
+} tres_str_flags_t;
 
 extern slurmdb_job_rec_t *slurmdb_create_job_rec(void);
 extern slurmdb_step_rec_t *slurmdb_create_step_rec(void);
@@ -124,19 +126,36 @@ extern slurmdb_assoc_usage_t *slurmdb_create_assoc_usage(int tres_cnt);
 extern slurmdb_qos_usage_t *slurmdb_create_qos_usage(int tres_cnt);
 
 extern char *slurmdb_acct_flags_2_str(slurmdb_acct_flags_t flags);
-extern slurmdb_acct_flags_t str_2_slurmdb_acct_flags(char *flag_str);
+
+/*
+ * Parse CSV of accounting flags
+ *
+ * IN str - CSV of accounting flags to parse
+ * OUT flags_ptr - pointer to populate based on parsed flags (SLURMDB_ACCT_FLAG_*)
+ * RET SLURM_SUCCESS or error
+ */
+extern int str_2_slurmdb_acct_flags(const char *str,
+				    slurmdb_acct_flags_t *flags_ptr);
 extern char *slurmdb_assoc_flags_2_str(slurmdb_assoc_flags_t flags);
-extern slurmdb_assoc_flags_t str_2_slurmdb_assoc_flags(char *flag_str);
+/*
+ * Parse CSV of associations flags
+ *
+ * IN str - CSV of associations flags to parse
+ * OUT flags_ptr - pointer to populate based on parsed flags (ASSOC_FLAG_*)
+ * RET SLURM_SUCCESS or error
+ */
+extern int str_2_slurmdb_assoc_flags(const char *str,
+				     slurmdb_assoc_flags_t *flags_ptr);
 extern char *slurmdb_cluster_fed_states_str(uint32_t states);
 extern uint32_t str_2_cluster_fed_states(char *states);
 extern char *slurmdb_federation_flags_str(uint32_t flags);
 extern uint32_t str_2_federation_flags(char *flags, int option);
 extern char *slurmdb_job_flags_str(uint32_t flags);
 extern uint32_t str_2_job_flags(char *flags);
-extern char *slurmdb_qos_str(List qos_list, uint32_t level);
-extern uint32_t str_2_slurmdb_qos(List qos_list, char *level);
-extern char *slurmdb_qos_flags_str(uint32_t flags);
-extern uint32_t str_2_qos_flags(char *flags, int option);
+extern char *slurmdb_qos_str(list_t *qos_list, uint32_t level);
+extern uint32_t str_2_slurmdb_qos(list_t *qos_list, char *level);
+extern char *slurmdb_qos_flags_str(slurmdb_qos_flags_t flags);
+extern slurmdb_qos_flags_t str_2_qos_flags(char *flags, int option);
 extern char *slurmdb_res_flags_str(uint32_t flags);
 extern uint32_t str_2_res_flags(char *flags, int option);
 extern char *slurmdb_res_type_str(slurmdb_resource_type_t type);
@@ -147,22 +166,22 @@ extern slurmdb_admin_level_t str_2_slurmdb_admin_level(char *level);
 /* The next three functions have pointers to assoc_list so do not
  * destroy assoc_list before using the list returned from this function.
  */
-extern List slurmdb_get_hierarchical_sorted_assoc_list(List assoc_list);
-extern List slurmdb_get_acct_hierarchical_rec_list(List assoc_list);
+extern list_t *slurmdb_get_hierarchical_sorted_assoc_list(list_t *assoc_list);
+extern list_t *slurmdb_get_acct_hierarchical_rec_list(list_t *assoc_list);
 
 /* This reorders the list into a alphabetical hierarchy.
    IN/OUT: assoc_list
  */
-extern void slurmdb_sort_hierarchical_assoc_list(List assoc_list);
+extern void slurmdb_sort_hierarchical_assoc_list(list_t *assoc_list);
 
 /* IN/OUT: tree_list a list of slurmdb_print_tree_t's */
-extern char *slurmdb_tree_name_get(char *name, char *parent, List tree_list);
+extern char *slurmdb_tree_name_get(char *name, char *parent, list_t *tree_list);
 
 extern int set_qos_bitstr_from_string(bitstr_t *valid_qos, char *names);
-extern int set_qos_bitstr_from_list(bitstr_t *valid_qos, List qos_list);
-extern char *get_qos_complete_str_bitstr(List qos_list, bitstr_t *valid_qos);
-extern List get_qos_name_list(List qos_list, List num_qos_list);
-extern char *get_qos_complete_str(List qos_list, List num_qos_list);
+extern int set_qos_bitstr_from_list(bitstr_t *valid_qos, list_t *qos_list);
+extern char *get_qos_complete_str_bitstr(list_t *qos_list, bitstr_t *valid_qos);
+extern list_t *get_qos_name_list(list_t *qos_list, list_t *num_qos_list);
+extern char *get_qos_complete_str(list_t *qos_list, list_t *num_qos_list);
 
 extern char *get_classification_str(uint16_t classification);
 extern uint16_t str_2_classification(char *classification);
@@ -172,14 +191,14 @@ extern const char *rollup_interval_to_string(int interval);
 extern char *slurmdb_problem_str_get(uint16_t problem);
 extern uint16_t str_2_slurmdb_problem(char *problem);
 
-extern void log_assoc_rec(slurmdb_assoc_rec_t *assoc_ptr, List qos_list);
+extern void log_assoc_rec(slurmdb_assoc_rec_t *assoc_ptr, list_t *qos_list);
 
 extern int slurmdb_report_set_start_end_time(time_t *start, time_t *end);
 
 extern uint32_t slurmdb_parse_purge(char *string);
 extern char *slurmdb_purge_string(uint32_t purge, char *string, int len,
 				  bool with_archive);
-extern int slurmdb_addto_qos_char_list(List char_list, List qos_list,
+extern int slurmdb_addto_qos_char_list(list_t *char_list, list_t *qos_list,
 				       char *names, int option);
 /*
  * send_accounting_update_persist
@@ -190,7 +209,7 @@ extern int slurmdb_addto_qos_char_list(List char_list, List qos_list,
  */
 extern int slurmdb_send_accounting_update_persist(list_t *update_list,
 						  persist_conn_t *persist_conn);
-extern int slurmdb_send_accounting_update(List update_list, char *cluster,
+extern int slurmdb_send_accounting_update(list_t *update_list, char *cluster,
 					  char *host, uint16_t port,
 					  uint16_t rpc_version);
 extern slurmdb_report_cluster_rec_t *slurmdb_cluster_rec_2_report(
@@ -208,11 +227,12 @@ extern void slurmdb_copy_federation_rec(slurmdb_federation_rec_t *out,
 extern void slurmdb_copy_qos_rec_limits(slurmdb_qos_rec_t *out,
 					slurmdb_qos_rec_t *in);
 extern slurmdb_tres_rec_t *slurmdb_copy_tres_rec(slurmdb_tres_rec_t *tres);
-extern List slurmdb_copy_tres_list(List tres);
-extern List slurmdb_diff_tres_list(List tres_list_old, List tres_list_new);
+extern list_t *slurmdb_copy_tres_list(list_t *tres);
+extern list_t *slurmdb_diff_tres_list(list_t *tres_list_old,
+				      list_t *tres_list_new);
 extern list_t *slurmdb_list_copy_coord(list_t *coord_accts);
 extern char *slurmdb_tres_string_combine_lists(
-	List tres_list_old, List tres_list_new);
+	list_t *tres_list_old, list_t *tres_list_new);
 /* make a tres_string from a given list
  * IN tres - list of slurmdb_tres_rec_t's
  * IN flags - see the TRES_STR_FLAGS above
@@ -220,9 +240,9 @@ extern char *slurmdb_tres_string_combine_lists(
  *                                      TRES_STR_FLAG_COMMA1
  * RET char * of tres_str
  */
-extern char *slurmdb_make_tres_string(List tres, uint32_t flags);
+extern char *slurmdb_make_tres_string(list_t *tres, uint32_t flags);
 extern char *slurmdb_format_tres_str(
-	char *tres_in, List full_tres_list, bool simple);
+	char *tres_in, list_t *full_tres_list, bool simple);
 /*
  * Comparator used for sorting tres by id
  *
@@ -240,9 +260,13 @@ extern int slurmdb_sort_tres_by_id_asc(void *v1, void *v2);
  *                 Meaningful flags are TRES_STR_FLAG_REPLACE
  *                                      TRES_STR_FLAG_REMOVE
  *                                      TRES_STR_FLAG_SORT_ID
+ * IN    : sub_tres_list - list of slurmdb_tres_rec_t * to use instead of
+ *			   assoc_mgr_tres_list. If NULL assoc_mgr_tres_list is
+ *			   used.
  */
-extern void slurmdb_tres_list_from_string(
-	List *tres_list, const char *tres, uint32_t flags);
+extern void slurmdb_tres_list_from_string(list_t **tres_list, const char *tres,
+					  uint32_t flags,
+					  list_t *sub_tres_list);
 
 /* combine a name array and count array into a string */
 extern char *slurmdb_make_tres_string_from_arrays(char **tres_names,
@@ -251,7 +275,7 @@ extern char *slurmdb_make_tres_string_from_arrays(char **tres_names,
 						  uint32_t flags);
 
 extern char *slurmdb_make_tres_string_from_simple(
-	char *tres_in, List full_tres_list, int spec_unit,
+	char *tres_in, list_t *full_tres_list, int spec_unit,
 	uint32_t convert_flags, uint32_t tres_str_flags, char *nodes);
 
 /* Used to combine 2 different TRES strings together
@@ -285,19 +309,19 @@ extern int slurmdb_find_cluster_in_list(void *x, void *key);
 extern int slurmdb_find_cluster_accting_tres_in_list(void *x, void *key);
 extern int slurmdb_add_cluster_accounting_to_tres_list(
 	slurmdb_cluster_accounting_rec_t *accting,
-	List *tres);
+	list_t **tres);
 extern int slurmdb_add_accounting_to_tres_list(
 	slurmdb_accounting_rec_t *accting,
-	List *tres);
+	list_t **tres);
 extern int slurmdb_add_time_from_count_to_tres_list(
-	slurmdb_tres_rec_t *tres_in, List *tres, time_t elapsed);
+	slurmdb_tres_rec_t *tres_in, list_t **tres, time_t elapsed);
 extern int slurmdb_sum_accounting_list(
 	slurmdb_cluster_accounting_rec_t *accting,
-	List *total_tres_acct);
+	list_t **total_tres_acct);
 extern void slurmdb_transfer_acct_list_2_tres(
-	List accounting_list, List *tres);
+	list_t *accounting_list, list_t **tres);
 extern void slurmdb_transfer_tres_time(
-	List *tres_list_out, char *tres_str, int elapsed);
+	list_t **tres_list_out, char *tres_str, int elapsed);
 
 extern int slurmdb_get_tres_base_unit(char *tres_type);
 extern char *slurmdb_ave_tres_usage(char *tres_string, int tasks);
@@ -318,5 +342,12 @@ extern void slurmdb_merge_grp_node_usage(bitstr_t **grp_node_bitmap1,
 					 uint16_t *grp_node_job_cnt2);
 
 extern char *slurmdb_get_job_id_str(slurmdb_job_rec_t *job);
+
+/*
+ * Add an account to the user->coord_accts list.
+ * RETURN - 0 if not added 1 if added.
+ */
+extern int slurmdb_add_coord_to_user(slurmdb_user_rec_t *user, char *acct_name,
+				     uint16_t direct);
 
 #endif

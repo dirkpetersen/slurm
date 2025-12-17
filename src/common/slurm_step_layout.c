@@ -78,7 +78,6 @@ slurm_step_layout_t *slurm_step_layout_create(
 	char *arbitrary_nodes = NULL;
 	slurm_step_layout_t *step_layout =
 		xmalloc(sizeof(slurm_step_layout_t));
-	uint32_t cluster_flags = slurmdb_setup_cluster_flags();
 
 	step_layout->task_dist = step_layout_req->task_dist;
 	if ((step_layout->task_dist & SLURM_DIST_STATE_BASE)
@@ -99,14 +98,7 @@ slurm_step_layout_t *slurm_step_layout_create(
 	}
 
 	step_layout->task_cnt  = step_layout_req->num_tasks;
-	if (cluster_flags & CLUSTER_FLAG_FE) {
-		/* Limited job step support on front-end systems.
-		 * Normally we would not permit execution of job steps,
-		 * but can fake it by just allocating all tasks to
-		 * one of the allocated nodes. */
-		step_layout->node_cnt  = 1;
-	} else
-		step_layout->node_cnt = step_layout_req->num_hosts;
+	step_layout->node_cnt = step_layout_req->num_hosts;
 
 	if (_init_task_layout(step_layout_req, step_layout, arbitrary_nodes)
 	    != SLURM_SUCCESS) {
@@ -175,8 +167,8 @@ extern slurm_step_layout_t *fake_slurm_step_layout_create(
 				cpu_cnt = 0;
 			}
 		} else {
-			cpn = ((task_cnt - step_layout->task_cnt) +
-			       (node_cnt - i) - 1) / (node_cnt - i);
+			cpn = ROUNDUP((task_cnt - step_layout->task_cnt),
+				      (node_cnt - i));
 			if (step_layout->task_cnt >= task_cnt) {
 				step_layout->tasks[i] = 0;
 				step_layout->tids[i] = NULL;
@@ -319,14 +311,14 @@ extern void pack_slurm_step_layout(slurm_step_layout_t *step_layout,
 {
 	uint32_t i = 0;
 
-	if (protocol_version >= SLURM_23_11_PROTOCOL_VERSION) {
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
 		if (step_layout)
 			i = 1;
 
 		pack16(i, buffer);
 		if (!i)
 			return;
-		packstr(step_layout->front_end, buffer);
+		packnull(buffer);
 		packstr(step_layout->node_list, buffer);
 		pack32(step_layout->node_cnt, buffer);
 		pack16(step_layout->start_protocol_ver, buffer);
@@ -353,25 +345,6 @@ extern void pack_slurm_step_layout(slurm_step_layout_t *step_layout,
 		} else {
 			packnull(buffer);
 		}
-	} else if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		if (step_layout)
-			i = 1;
-
-		pack16(i, buffer);
-		if (!i)
-			return;
-		packstr(step_layout->front_end, buffer);
-		packstr(step_layout->node_list, buffer);
-		pack32(step_layout->node_cnt, buffer);
-		pack16(step_layout->start_protocol_ver, buffer);
-		pack32(step_layout->task_cnt, buffer);
-		pack32(step_layout->task_dist, buffer);
-
-		for (i = 0; i < step_layout->node_cnt; i++) {
-			pack32_array(step_layout->tids[i],
-				     step_layout->tasks[i],
-				     buffer);
-		}
 	} else {
 		error("%s: protocol_version %hu not supported",
 		      __func__, protocol_version);
@@ -387,7 +360,7 @@ extern int unpack_slurm_step_layout(slurm_step_layout_t **layout, buf_t *buffer,
 	int i;
 	char *tmp_str = NULL;
 
-	if (protocol_version >= SLURM_23_11_PROTOCOL_VERSION) {
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
 		safe_unpack16(&uint16_tmp, buffer);
 		if (!uint16_tmp)
 			return SLURM_SUCCESS;
@@ -395,7 +368,7 @@ extern int unpack_slurm_step_layout(slurm_step_layout_t **layout, buf_t *buffer,
 		step_layout = xmalloc(sizeof(slurm_step_layout_t));
 		*layout = step_layout;
 
-		safe_unpackstr(&step_layout->front_end, buffer);
+		safe_skipstr(buffer);
 		safe_unpackstr(&step_layout->node_list, buffer);
 		safe_unpack32(&step_layout->node_cnt, buffer);
 		safe_unpack16(&step_layout->start_protocol_ver, buffer);
@@ -419,14 +392,7 @@ extern int unpack_slurm_step_layout(slurm_step_layout_t **layout, buf_t *buffer,
 		xassert(uint32_tmp == step_layout->cpt_compact_cnt);
 
 		safe_unpackstr(&tmp_str, buffer);
-		if (running_in_slurmctld()) {
-			/*
-			 * Ignore alias_addrs from state file.
-			 * We dump alias_addrs only in slurm 23.11.0 and 23.11.1
-			 * This can be removed two versions after 23.11.
-			 */
-			xfree(tmp_str);
-		} else if (tmp_str) {
+		if (tmp_str) {
 			step_layout->alias_addrs =
 				extract_net_cred(tmp_str, protocol_version);
 			if (!step_layout->alias_addrs) {
@@ -434,31 +400,6 @@ extern int unpack_slurm_step_layout(slurm_step_layout_t **layout, buf_t *buffer,
 				goto unpack_error;
 			}
 			step_layout->alias_addrs->net_cred = tmp_str;
-		}
-	} else if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		safe_unpack16(&uint16_tmp, buffer);
-		if (!uint16_tmp)
-			return SLURM_SUCCESS;
-
-		step_layout = xmalloc(sizeof(slurm_step_layout_t));
-		*layout = step_layout;
-
-		safe_unpackstr(&step_layout->front_end, buffer);
-		safe_unpackstr(&step_layout->node_list, buffer);
-		safe_unpack32(&step_layout->node_cnt, buffer);
-		safe_unpack16(&step_layout->start_protocol_ver, buffer);
-		safe_unpack32(&step_layout->task_cnt, buffer);
-		safe_unpack32(&step_layout->task_dist, buffer);
-
-		safe_xcalloc(step_layout->tasks, step_layout->node_cnt,
-			     sizeof(uint32_t));
-		safe_xcalloc(step_layout->tids, step_layout->node_cnt,
-			     sizeof(uint32_t *));
-		for (i = 0; i < step_layout->node_cnt; i++) {
-			safe_unpack32_array(&(step_layout->tids[i]),
-					    &num_tids,
-					    buffer);
-			step_layout->tasks[i] = num_tids;
 		}
 	} else {
 		error("unpack_slurm_step_layout: protocol_version "
@@ -479,7 +420,6 @@ extern int slurm_step_layout_destroy(slurm_step_layout_t *step_layout)
 	int i=0;
 	if (step_layout) {
 		slurm_free_node_alias_addrs(step_layout->alias_addrs);
-		xfree(step_layout->front_end);
 		xfree(step_layout->node_list);
 		xfree(step_layout->tasks);
 		xfree(step_layout->cpt_compact_array);
@@ -524,7 +464,6 @@ static int _init_task_layout(slurm_step_layout_req_t *step_layout_req,
 			     const char *arbitrary_nodes)
 {
 	int cpu_cnt = 0, cpu_inx = 0, cpu_task_cnt = 0, cpu_task_inx = 0, i;
-	uint32_t cluster_flags = slurmdb_setup_cluster_flags();
 	hostlist_t *hl;
 
 	uint16_t cpus[step_layout->node_cnt];
@@ -622,9 +561,8 @@ static int _init_task_layout(slurm_step_layout_req_t *step_layout_req,
 	if ((step_layout->task_dist & SLURM_DIST_NODEMASK)
 	    == SLURM_DIST_NODECYCLIC)
 		return _task_layout_cyclic(step_layout, cpus);
-	else if (((step_layout->task_dist & SLURM_DIST_STATE_BASE)
-		  == SLURM_DIST_ARBITRARY)
-		 && !(cluster_flags & CLUSTER_FLAG_FE))
+	else if ((step_layout->task_dist & SLURM_DIST_STATE_BASE)
+		 == SLURM_DIST_ARBITRARY)
 		return _task_layout_hostfile(step_layout, arbitrary_nodes);
 	else if ((step_layout->task_dist & SLURM_DIST_STATE_BASE)
 		 == SLURM_DIST_PLANE)
@@ -755,7 +693,7 @@ static int _task_layout_block(slurm_step_layout_t *step_layout, uint16_t *cpus)
 		pack_nodes = true;
 	else if (step_layout->task_dist & SLURM_DIST_NO_PACK_NODES)
 		pack_nodes = false;
-	else if (select_params & CR_PACK_NODES)
+	else if (select_params & SELECT_PACK_NODES)
 		pack_nodes = true;
 	else
 		pack_nodes = false;
@@ -848,8 +786,7 @@ static int _task_layout_cyclic(slurm_step_layout_t *step_layout,
 	if (total_cpus < step_layout->task_cnt) {
 		over_subscribe = true;
 		i = step_layout->task_cnt - total_cpus;
-		max_over_subscribe = (i + step_layout->node_cnt - 1) /
-				     step_layout->node_cnt;
+		max_over_subscribe = ROUNDUP(i, step_layout->node_cnt);
 	}
 
 	for (j=0; taskid<step_layout->task_cnt; j++) {   /* cycle counter */

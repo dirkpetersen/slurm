@@ -41,29 +41,30 @@
 #ifndef _SLURMSTEPD_JOB_H
 #define _SLURMSTEPD_JOB_H
 
-#ifdef __FreeBSD__
-#include <sys/cpuset.h>
-typedef cpuset_t cpu_set_t;
-#endif
-
 #define _GNU_SOURCE
 
 #include <pthread.h>
 #include <pwd.h>
 
 #include "src/common/data.h"
+#include "src/common/dynamic_plugin_data.h"
+#include "src/common/eio.h"
+#include "src/common/env.h"
+#include "src/common/list.h"
 #include "src/common/macros.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
-#include "src/common/list.h"
-#include "src/common/eio.h"
-#include "src/common/env.h"
 #include "src/common/stepd_api.h"
+#include "src/common/xsched.h"
+
+/* required for rusage */
+#include <sys/resource.h>
 
 #define STEP_CONTAINER_MAGIC 0xa0b9b2ba
 
 typedef struct {
 	char *key;                 /* srun key for IO verification         */
+	char *tls_cert;            /* srun public certificate if tls in use */
 	slurm_addr_t resp_addr;	   /* response addr for task exit msg      */
 	slurm_addr_t ioaddr;       /* Address to connect on for normal I/O.
 				      Spawn IO uses messages to the normal
@@ -106,6 +107,7 @@ typedef struct {
 	bool            esent;      /* true if exit status has been sent    */
 	bool            exited;     /* true if task has exited              */
 	int             estatus;    /* this task's exit status              */
+	struct rusage rusage;
 
 	uint32_t	argc;
 	char	      **argv;
@@ -117,7 +119,8 @@ typedef struct {
 	data_t *config; /* OCI Container config.json contents */
 	char *mount_spool_dir; /* target path to mount container spool dir */
 	char *rootfs; /* path to container rootfs */
-	char *spool_dir; /* path to container spool dir */
+	char *spool_dir; /* path to slurmd's spool dir for container */
+	char *task_spool_dir; /* path to slurmd's spool dir for container task */
 } step_container_t;
 
 typedef struct {
@@ -142,6 +145,7 @@ typedef struct {
 	uint32_t       het_job_ntasks;	/* total task count for entire hetjob */
 	uint32_t       het_job_offset;	/* Hetjob offset or NO_VAL        */
 	uint32_t       het_job_step_cnt;  /* number of steps for entire hetjob */
+	uint32_t      *het_job_step_task_cnts; /* ntasks on each comp of hetjob */
 	uint32_t       het_job_task_offset;/* Hetjob task offset or NO_VAL   */
 	uint16_t      *het_job_task_cnts; /* Number of tasks on each node in hetjob */
 	uint32_t     **het_job_tids;       /* Task IDs on each node of hetjob */
@@ -180,7 +184,6 @@ typedef struct {
 	gid_t        *gids;    /* array of gids for user specified in uid   */
 	bool           aborted;    /* true if already aborted               */
 	bool           batch;      /* true if this is a batch job           */
-	bool           run_prolog; /* true if need to run prolog            */
 	time_t         timelimit;  /* time at which job must stop           */
 	uint32_t       profile;	   /* Level of acct_gather_profile          */
 	char          *task_prolog; /* per-task prolog                      */
@@ -237,6 +240,7 @@ typedef struct {
 	char          *tres_freq;	/* TRES frequency */
 	time_t job_end_time;            /* job end time */
 	char *job_licenses;		/* Licenses allocated to job */
+	uint16_t job_restart_cnt;
 	time_t job_start_time;          /* job start time */
 	launch_tasks_request_msg_t *msg; /* When a non-batch step this
 					  * is the message sent.  DO
@@ -256,18 +260,18 @@ typedef struct {
 
 	char *selinux_context;
 	char *stepmgr;
+	bool oom_kill_step;
 } stepd_step_rec_t;
 
+extern int stepd_step_rec_create(launch_tasks_request_msg_t *msg,
+				 uint16_t protocol_version);
+extern int batch_stepd_step_rec_create(batch_job_launch_msg_t *msg);
 
-stepd_step_rec_t * stepd_step_rec_create(launch_tasks_request_msg_t *msg,
-					 uint16_t protocol_version);
-stepd_step_rec_t * batch_stepd_step_rec_create(batch_job_launch_msg_t *msg);
+extern void stepd_step_rec_destroy(void);
 
-void stepd_step_rec_destroy(stepd_step_rec_t *step);
-
-srun_info_t * srun_info_create(slurm_cred_t *cred, slurm_addr_t *respaddr,
-			       slurm_addr_t *ioaddr, uid_t uid,
-			       uint16_t protocol_version);
+srun_info_t *srun_info_create(slurm_cred_t *cred, char *alloc_tls_cert,
+			      slurm_addr_t *respaddr, slurm_addr_t *ioaddr,
+			      uid_t uid, uint16_t protocol_version);
 
 void  srun_info_destroy(srun_info_t *srun);
 

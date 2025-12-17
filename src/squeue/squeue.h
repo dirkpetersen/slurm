@@ -84,8 +84,7 @@ struct squeue_parameters {
 	int  verbose;
 
 	char* accounts;
-	List clusters;
-	uint32_t cluster_flags;
+	list_t *clusters;
 	char *cluster_names;
 	char* format;
 	char* format_long;
@@ -109,16 +108,19 @@ struct squeue_parameters {
 
 	uint32_t convert_flags;
 
-	List  account_list;
-	List  format_list;
-	List  job_list;
-	List  licenses_list;
-	List  name_list;
-	List  part_list;
-	List  qos_list;
-	List  state_list;
-	List  step_list;
-	List  user_list;
+	list_t *account_list;
+	list_t *format_list;
+	list_t *job_list;
+	list_t *licenses_list;
+	list_t *name_list;
+	list_t *part_list;
+	list_t *qos_list;
+	list_t *state_list;
+	list_t *step_list;
+	list_t *user_list;
+
+	uint32_t time_running_over;
+	uint32_t time_running_under;
 };
 
 extern struct squeue_parameters params;
@@ -144,8 +146,8 @@ typedef struct fmt_data_step {
 extern void parse_command_line( int argc, char* *argv );
 extern int  parse_format( char* format );
 extern int  parse_long_format( char* format_long);
-extern void sort_job_list( List job_list );
-extern void sort_jobs_by_start_time( List job_list );
-extern void sort_step_list( List step_list );
+extern void sort_job_list(list_t *job_list);
+extern void sort_jobs_by_start_time(list_t *job_list);
+extern void sort_step_list(list_t *step_list);
 
 #endif

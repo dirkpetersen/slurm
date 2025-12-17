@@ -39,25 +39,29 @@
 #include <string.h>
 #include <time.h>
 
+#include "src/api/step_io.h"
+#include "src/api/step_launch.h"
+
+#include "src/common/eio.h"
 #include "src/common/fd.h"
 #include "src/common/hostlist.h"
+#include "src/common/io_hdr.h"
 #include "src/common/log.h"
 #include "src/common/macros.h"
+#include "src/common/net.h"
 #include "src/common/pack.h"
 #include "src/common/read_config.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/slurm_protocol_pack.h"
-#include "src/interfaces/cred.h"
+#include "src/common/threadpool.h"
+#include "src/common/write_labelled_message.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xsignal.h"
-#include "src/common/eio.h"
-#include "src/common/io_hdr.h"
-#include "src/common/net.h"
-#include "src/common/write_labelled_message.h"
+#include "src/common/xstring.h"
 
-#include "src/api/step_io.h"
-#include "src/api/step_launch.h"
+#include "src/interfaces/conn.h"
+#include "src/interfaces/cred.h"
 
 #define STDIO_MAX_FREE_BUF 1024
 
@@ -77,7 +81,8 @@ static struct io_buf *_alloc_io_buf(void);
 static void	_init_stdio_eio_objs(slurm_step_io_fds_t fds,
 				     client_io_t *cio);
 static void	_handle_io_init_msg(int fd, client_io_t *cio);
-static int _read_io_init_msg(int fd, client_io_t *cio, slurm_addr_t *host);
+static int _read_io_init_msg(int fd, void *conn, client_io_t *cio,
+			     slurm_addr_t *host);
 static int      _wid(int n);
 static bool     _incoming_buf_free(client_io_t *cio);
 static bool     _outgoing_buf_free(client_io_t *cio);
@@ -86,7 +91,7 @@ static bool     _outgoing_buf_free(client_io_t *cio);
  * Listening socket declarations
  **********************************************************************/
 static bool _listening_socket_readable(eio_obj_t *obj);
-static int _listening_socket_read(eio_obj_t *obj, List objs);
+static int _listening_socket_read(eio_obj_t *obj, list_t *objs);
 
 struct io_operations listening_socket_ops = {
 	.readable = &_listening_socket_readable,
@@ -97,9 +102,9 @@ struct io_operations listening_socket_ops = {
  * IO server socket declarations
  **********************************************************************/
 static bool _server_readable(eio_obj_t *obj);
-static int _server_read(eio_obj_t *obj, List objs);
+static int _server_read(eio_obj_t *obj, list_t *objs);
 static bool _server_writable(eio_obj_t *obj);
-static int _server_write(eio_obj_t *obj, List objs);
+static int _server_write(eio_obj_t *obj, list_t *objs);
 
 struct io_operations server_ops = {
 	.readable = &_server_readable,
@@ -122,7 +127,7 @@ struct server_io_info {
 	int remote_stderr_objs; /* active eio_obj_t's on the remote node */
 
 	/* outgoing variables */
-	List msg_queue;
+	list_t *msg_queue;
 	struct io_buf *out_msg;
 	int32_t out_remaining;
 	bool out_eof;
@@ -132,7 +137,7 @@ struct server_io_info {
  * File write declarations
  **********************************************************************/
 static bool _file_writable(eio_obj_t *obj);
-static int _file_write(eio_obj_t *obj, List objs);
+static int _file_write(eio_obj_t *obj, list_t *objs);
 
 struct io_operations file_write_ops = {
 	.writable = &_file_writable,
@@ -143,7 +148,7 @@ struct file_write_info {
 	client_io_t *cio;
 
 	/* outgoing variables */
-	List msg_queue;
+	list_t *msg_queue;
 	struct io_buf *out_msg;
 	int32_t out_remaining;
 	/* If taskid is (uint32_t)-1, output from all tasks is accepted,
@@ -157,7 +162,7 @@ struct file_write_info {
  * File read declarations
  **********************************************************************/
 static bool _file_readable(eio_obj_t *obj);
-static int _file_read(eio_obj_t *obj, List objs);
+static int _file_read(eio_obj_t *obj, list_t *objs);
 
 struct io_operations file_read_ops = {
 	.readable = &_file_readable,
@@ -194,8 +199,7 @@ _listening_socket_readable(eio_obj_t *obj)
 	return true;
 }
 
-static int
-_listening_socket_read(eio_obj_t *obj, List objs)
+static int _listening_socket_read(eio_obj_t *obj, list_t *objs)
 {
 	client_io_t *cio = (client_io_t *)obj->arg;
 
@@ -216,9 +220,9 @@ _set_listensocks_nonblocking(client_io_t *cio)
 /**********************************************************************
  * IO server socket functions
  **********************************************************************/
-static eio_obj_t *
-_create_server_eio_obj(int fd, client_io_t *cio, int nodeid,
-		       int stdout_objs, int stderr_objs)
+static eio_obj_t *_create_server_eio_obj(int fd, void *conn, client_io_t *cio,
+					 int nodeid, int stdout_objs,
+					 int stderr_objs)
 {
 	eio_obj_t *eio = NULL;
 	struct server_io_info *info = xmalloc(sizeof(*info));
@@ -238,6 +242,7 @@ _create_server_eio_obj(int fd, client_io_t *cio, int nodeid,
 
 	net_set_keep_alive(fd);
 	eio = eio_obj_create(fd, &server_ops, (void *)info);
+	eio->conn = conn;
 
 	return eio;
 }
@@ -282,8 +287,7 @@ _server_readable(eio_obj_t *obj)
 	return false;
 }
 
-static int
-_server_read(eio_obj_t *obj, List objs)
+static int _server_read(eio_obj_t *obj, list_t *objs)
 {
 	struct server_io_info *s = (struct server_io_info *) obj->arg;
 	void *buf;
@@ -298,7 +302,7 @@ _server_read(eio_obj_t *obj, List objs)
 			return SLURM_ERROR;
 		}
 
-		n = io_hdr_read_fd(obj->fd, &s->header);
+		n = io_hdr_read_fd(obj->fd, obj->conn, &s->header);
 		if (n <= 0) { /* got eof or error on socket read */
 			if (n < 0) {	/* Error */
 				if (obj->shutdown) {
@@ -367,7 +371,12 @@ _server_read(eio_obj_t *obj, List objs)
 	if (s->header.length != 0) {
 		buf = s->in_msg->data + (s->in_msg->length - s->in_remaining);
 	again:
-		if ((n = read(obj->fd, buf, s->in_remaining)) < 0) {
+		if (obj->conn) {
+			n = conn_g_recv(obj->conn, buf, s->in_remaining);
+		} else {
+			n = read(obj->fd, buf, s->in_remaining);
+		}
+		if (n < 0) {
 			if (errno == EINTR)
 				goto again;
 			if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
@@ -461,8 +470,7 @@ _server_writable(eio_obj_t *obj)
 	return false;
 }
 
-static int
-_server_write(eio_obj_t *obj, List objs)
+static int _server_write(eio_obj_t *obj, list_t *objs)
 {
 	struct server_io_info *s = (struct server_io_info *) obj->arg;
 	void *buf;
@@ -492,7 +500,12 @@ _server_write(eio_obj_t *obj, List objs)
 	 */
 	buf = s->out_msg->data + (s->out_msg->length - s->out_remaining);
 again:
-	if ((n = write(obj->fd, buf, s->out_remaining)) < 0) {
+	if (obj->conn) {
+		n = conn_g_send(obj->conn, buf, s->out_remaining);
+	} else {
+		n = write(obj->fd, buf, s->out_remaining);
+	}
+	if (n < 0) {
 		if (errno == EINTR) {
 			goto again;
 		} else if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
@@ -567,7 +580,7 @@ static bool _file_writable(eio_obj_t *obj)
 	return false;
 }
 
-static int _file_write(eio_obj_t *obj, List objs)
+static int _file_write(eio_obj_t *obj, list_t *objs)
 {
 	struct file_write_info *info = (struct file_write_info *) obj->arg;
 	void *ptr;
@@ -688,7 +701,7 @@ static bool _file_readable(eio_obj_t *obj)
 	return false;
 }
 
-static int _file_read(eio_obj_t *obj, List objs)
+static int _file_read(eio_obj_t *obj, list_t *objs)
 {
 	struct file_read_info *info = (struct file_read_info *) obj->arg;
 	struct io_buf *msg;
@@ -788,7 +801,7 @@ again:
 
 
 /**********************************************************************
- * General fuctions
+ * General functions
  **********************************************************************/
 
 static void *
@@ -833,11 +846,12 @@ _create_listensock_eio(int fd, client_io_t *cio)
 	return eio;
 }
 
-static int _read_io_init_msg(int fd, client_io_t *cio, slurm_addr_t *host)
+static int _read_io_init_msg(int fd, void *conn, client_io_t *cio,
+			     slurm_addr_t *host)
 {
 	io_init_msg_t msg = { 0 };
 
-	if (io_init_msg_read_from_fd(fd, &msg) != SLURM_SUCCESS)
+	if (io_init_msg_read_from_fd(fd, conn, &msg) != SLURM_SUCCESS)
 		goto fail;
 
 	if (io_init_msg_validate(&msg, cio->io_key) < 0) {
@@ -859,9 +873,10 @@ static int _read_io_init_msg(int fd, client_io_t *cio, slurm_addr_t *host)
 		error("IO: Hey, you told me node %d was down!", msg.nodeid);
 	}
 
-	cio->ioserver[msg.nodeid] = _create_server_eio_obj(fd, cio, msg.nodeid,
-							   msg.stdout_objs,
-							   msg.stderr_objs);
+	cio->ioserver[msg.nodeid] =
+		_create_server_eio_obj(fd, conn, cio, msg.nodeid,
+				       msg.stdout_objs, msg.stderr_objs);
+
 	slurm_mutex_lock(&cio->ioservers_lock);
 	bit_set(cio->ioservers_ready_bits, msg.nodeid);
 	cio->ioservers_ready = bit_set_count(cio->ioservers_ready_bits);
@@ -880,6 +895,7 @@ static int _read_io_init_msg(int fd, client_io_t *cio, slurm_addr_t *host)
 	return SLURM_SUCCESS;
 
     fail:
+	conn_g_destroy(conn, false);
 	xfree(msg.io_key);
 	if (fd > STDERR_FILENO)
 		close(fd);
@@ -910,6 +926,7 @@ _handle_io_init_msg(int fd, client_io_t *cio)
 
 	for (j = 0; j < 15; j++) {
 		int sd;
+		void *conn = NULL;
 		slurm_addr_t addr;
 
 		/*
@@ -918,9 +935,7 @@ _handle_io_init_msg(int fd, client_io_t *cio)
 		if (!_is_fd_ready(fd))
 			return;
 
-		while ((sd = slurm_accept_msg_conn(fd, &addr)) < 0) {
-			if (errno == EINTR)
-				continue;
+		while (!(conn = slurm_accept_msg_conn(fd, &addr))) {
 			if (errno == EAGAIN)	/* No more connections */
 				return;
 			if ((errno == ECONNABORTED) ||
@@ -931,6 +946,7 @@ _handle_io_init_msg(int fd, client_io_t *cio)
 			return;
 		}
 
+		sd = conn_g_get_fd(conn);
 		debug3("Accepted IO connection: ip=%pA sd=%d", &addr, sd);
 
 		/*
@@ -945,7 +961,7 @@ _handle_io_init_msg(int fd, client_io_t *cio)
 		/*
 		 * Read IO header and update cio structure appropriately
 		 */
-		if (_read_io_init_msg(sd, cio, &addr) < 0)
+		if (_read_io_init_msg(sd, conn, cio, &addr) < 0)
 			continue;
 
 		fd_set_nonblocking(sd);
@@ -1071,7 +1087,7 @@ _estimate_nports(int nclients, int cli_per_port)
 }
 
 client_io_t *client_io_handler_create(slurm_step_io_fds_t fds, int num_tasks,
-				      int num_nodes, slurm_cred_t *cred,
+				      int num_nodes, char *io_key,
 				      bool label, uint32_t het_job_offset,
 				      uint32_t het_job_task_offset)
 {
@@ -1090,7 +1106,7 @@ client_io_t *client_io_handler_create(slurm_step_io_fds_t fds, int num_tasks,
 	else
 		cio->taskid_width = 0;
 
-	cio->io_key = slurm_cred_get_signature(cred);
+	cio->io_key = xstrdup(io_key);
 
 	cio->eio = eio_handle_create(slurm_conf.eio_timeout);
 

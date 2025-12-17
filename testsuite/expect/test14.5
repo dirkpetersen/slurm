@@ -34,9 +34,6 @@ set file_err    "$test_dir/error"
 set job_id      0
 
 
-if {[get_config_param "FrontendName"] ne "MISSING"} {
-	skip "This test is incompatible with front-end systems"
-}
 if {[get_config_param "SlurmdUser"] ne "root(0)"} {
 	skip "This test is incompatible with SlurmdUser != root"
 }
@@ -48,7 +45,7 @@ proc cleanup {} {
 }
 
 #
-# Build input script file that broacasts a file
+# Build input script file that broadcasts a file
 #
 set pid         [pid]
 set file1       "/tmp/test.$pid.1.$test_id"

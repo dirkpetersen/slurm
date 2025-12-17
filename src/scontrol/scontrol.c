@@ -42,6 +42,7 @@
 #include "config.h"
 
 #include <limits.h>
+#include <stdarg.h>
 
 #include "scontrol.h"
 #include "src/common/data.h"
@@ -63,7 +64,7 @@
 
 /* Global externs from scontrol.h */
 char *command_name;
-List clusters = NULL;
+list_t *clusters = NULL;
 char *cluster_names = NULL;
 int all_flag = 0;	/* display even hidden partitions */
 int detail_flag = 0;	/* display additional details */
@@ -76,12 +77,10 @@ int one_liner = 0;	/* one record per line if =1 */
 int quiet_flag = 0;	/* quiet=1, verbose=-1, normal=0 */
 int sibling_flag = 0;   /* show sibling jobs (if any fed job). */
 int verbosity = 0;	/* count of "-v" options */
-uint32_t cluster_flags; /* what type of cluster are we talking to */
 uint32_t euid = SLURM_AUTH_NOBODY; /* proxy request as user */
 const char *mime_type = NULL; /* mimetype if we are using data_parser */
 const char *data_parser = NULL; /* data_parser args */
 
-front_end_info_msg_t *old_front_end_info_ptr = NULL;
 job_info_msg_t *old_job_info_ptr = NULL;
 node_info_msg_t *old_node_info_ptr = NULL;
 partition_info_msg_t *old_part_info_ptr = NULL;
@@ -106,6 +105,21 @@ static void	_usage(void);
 static void	_write_config(char *file_name);
 
 decl_static_data(usage_txt);
+
+static void _printf_error(const char *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	exit_code = 1;
+	if (quiet_flag != 1) {
+		vfprintf(stderr, format, args);
+		if (errno)
+			fprintf(stderr, ":%s\n", slurm_strerror(errno));
+		else
+			fprintf(stderr, "\n");
+	}
+	va_end(args);
+}
 
 int main(int argc, char **argv)
 {
@@ -211,7 +225,7 @@ int main(int argc, char **argv)
 			sibling_flag = 1;
 			break;
 		case (int)'u':
-			if (uid_from_string(optarg, &euid) < 0) {
+			if (uid_from_string(optarg, &euid) != SLURM_SUCCESS) {
 				error("--uid=\"%s\" invalid", optarg);
 				exit(exit_code);
 			}
@@ -231,15 +245,13 @@ int main(int argc, char **argv)
 			mime_type = MIME_TYPE_JSON;
 			data_parser = optarg;
 			detail_flag = 1;
-			if (serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))
-				fatal("JSON plugin load failure");
+			serializer_required(MIME_TYPE_JSON);
 			break;
 		case OPT_LONG_YAML :
 			mime_type = MIME_TYPE_YAML;
 			data_parser = optarg;
 			detail_flag = 1;
-			if (serializer_g_init(MIME_TYPE_YAML_PLUGIN, NULL))
-				fatal("YAML plugin load failure");
+			serializer_required(MIME_TYPE_YAML);
 			break;
 		default:
 			exit_code = 1;
@@ -265,7 +277,6 @@ int main(int argc, char **argv)
 
 	if (clusters && (list_count(clusters) > 1))
 		fatal("Only one cluster can be used at a time with scontrol");
-	cluster_flags = slurmdb_setup_cluster_flags();
 
 	if (verbosity) {
 		opts.stderr_level += verbosity;
@@ -309,6 +320,13 @@ int main(int argc, char **argv)
 	FREE_NULL_LIST(clusters);
 	slurm_conf_destroy();
 	serializer_g_fini();
+
+	slurm_free_job_info_msg(old_job_info_ptr);
+	slurm_free_node_info_msg(old_node_info_ptr);
+	slurm_free_partition_info_msg(old_part_info_ptr);
+	slurm_free_reservation_info_msg(old_res_info_ptr);
+	slurm_free_ctl_conf(old_slurm_ctl_conf_ptr);
+
 #endif /* MEMORY_LEAK_DEBUG */
 
 	exit(exit_code);
@@ -450,7 +468,7 @@ static void _write_config(char *file_name)
 				&slurm_ctl_conf_ptr);
 		if (error_code == SLURM_SUCCESS) {
 			slurm_free_ctl_conf(old_slurm_ctl_conf_ptr);
-		} else if (slurm_get_errno () == SLURM_NO_CHANGE_IN_DATA) {
+		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
 			slurm_ctl_conf_ptr = old_slurm_ctl_conf_ptr;
 			error_code = SLURM_SUCCESS;
 			if (quiet_flag == -1) {
@@ -464,9 +482,7 @@ static void _write_config(char *file_name)
 	}
 
 	if (error_code) {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			slurm_perror ("slurm_load_ctl_conf error");
+		_printf_error("slurm_load_ctl_conf error");
 	} else
 		old_slurm_ctl_conf_ptr = slurm_ctl_conf_ptr;
 
@@ -482,9 +498,7 @@ static void _write_config(char *file_name)
 		error_code = scontrol_load_nodes(&node_info_ptr, SHOW_ALL);
 
 		if (error_code) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				slurm_perror ("slurm_load_node error");
+			_printf_error("slurm_load_node error");
 			all_flag = save_all_flag;
 			return;
 		}
@@ -494,8 +508,7 @@ static void _write_config(char *file_name)
 		all_flag = save_all_flag;
 		if (error_code) {
 			exit_code = 1;
-			if (quiet_flag != 1)
-				slurm_perror ("slurm_load_partitions error");
+			_printf_error("slurm_load_partitions error");
 			return;
 		}
 
@@ -515,13 +528,20 @@ static void _print_config(char *config_param, int argc, char **argv)
 	int error_code;
 	slurm_ctl_conf_info_msg_t  *slurm_ctl_conf_ptr = NULL;
 
+	/*
+	 * There isn't a parser for slurm.conf but there is one for ping, which
+	 * gets printed as part of this function. So to make sure the output is
+	 * not mixing output types disable json/yaml output for ping.
+	 */
+	mime_type = NULL;
+
 	if (old_slurm_ctl_conf_ptr) {
 		error_code = slurm_load_ctl_conf (
 				old_slurm_ctl_conf_ptr->last_update,
 				&slurm_ctl_conf_ptr);
 		if (error_code == SLURM_SUCCESS)
 			slurm_free_ctl_conf(old_slurm_ctl_conf_ptr);
-		else if (slurm_get_errno () == SLURM_NO_CHANGE_IN_DATA) {
+		else if (errno == SLURM_NO_CHANGE_IN_DATA) {
 			slurm_ctl_conf_ptr = old_slurm_ctl_conf_ptr;
 			error_code = SLURM_SUCCESS;
 			if (quiet_flag == -1) {
@@ -535,9 +555,7 @@ static void _print_config(char *config_param, int argc, char **argv)
 						  &slurm_ctl_conf_ptr);
 
 	if (error_code) {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			slurm_perror ("slurm_load_ctl_conf error");
+		_printf_error("slurm_load_ctl_conf error");
 	}
 	else
 		old_slurm_ctl_conf_ptr = slurm_ctl_conf_ptr;
@@ -557,11 +575,9 @@ static void _print_slurmd(char *hostlist)
 {
 	slurmd_status_t *slurmd_status;
 
-	if (slurm_load_slurmd_status(&slurmd_status)) {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			slurm_perror("slurm_load_slurmd_status");
-	} else {
+	if (slurm_load_slurmd_status(&slurmd_status))
+		_printf_error("slurm_load_slurmd_status");
+	else {
 		slurm_print_slurmd_status(stdout, slurmd_status);
 		slurm_free_slurmd_status(slurmd_status);
 	}
@@ -715,9 +731,7 @@ void _process_reboot_command(const char *tag, int argc, char **argv)
 						 strlen("Reason="))) {
 				char *tmp_ptr = strchr(argv[i], '=');
 				if (!tmp_ptr || !*(tmp_ptr + 1)) {
-					exit_code = 1;
-					if (!quiet_flag)
-						fprintf(stderr, "missing reason\n");
+					_printf_error("missing reason");
 					xfree(reason);
 					return;
 				}
@@ -731,9 +745,7 @@ void _process_reboot_command(const char *tag, int argc, char **argv)
 				char* state_str;
 				char *tmp_ptr = strchr(argv[i], '=');
 				if (!tmp_ptr || !*(tmp_ptr + 1)) {
-					exit_code = 1;
-					if (!quiet_flag)
-						fprintf(stderr, "missing state\n");
+					_printf_error("missing state");
 					xfree(reason);
 					return;
 				}
@@ -749,12 +761,8 @@ void _process_reboot_command(const char *tag, int argc, char **argv)
 						       MAX(state_str_len, 1)))
 					next_state = NODE_RESUME;
 				else {
-					exit_code = 1;
-					if (!quiet_flag) {
-						fprintf(stderr, "Invalid state: %s\n",
-							state_str);
-						fprintf(stderr, "Valid states: DOWN, RESUME\n");
-					}
+					_printf_error("Invalid state: %s\n Valid states: DOWN, RESUME",
+						      state_str);
 					xfree(reason);
 					xfree(state_str);
 					return;
@@ -770,18 +778,15 @@ void _process_reboot_command(const char *tag, int argc, char **argv)
 			 tag);
 	} else if ((argc - argc_offset) < 1) {
 		exit_code = 1;
-		fprintf(stderr, "Missing node list. Specify ALL|<NodeList>\n");
+		fprintf(stderr, "Missing node list. Specify ALL|<NodeList>");
 	} else {
 		error_code = scontrol_reboot_nodes(argv[argc_offset], asap,
 						   next_state, reason);
 	}
 
 	xfree(reason);
-	if (error_code) {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			slurm_perror ("scontrol_reboot_nodes error");
-	}
+	if (error_code)
+		_printf_error("scontrol_reboot_nodes error");
 }
 
 void _process_power_command(const char *tag, int argc, char **argv)
@@ -791,13 +796,14 @@ void _process_power_command(const char *tag, int argc, char **argv)
 	bool asap = false;
 	bool force = false;
 	int min_argv = 3;
-	int max_argv = 4;
+	int max_argv = 5;
 
 	/* at least 'power' should have been supplied */
 	xassert(argc);
 
 	if ((argc <= max_argv) && (argc >= min_argv)) {
 		int idx = 1;
+		char *reason = NULL;
 
 		/* up or down subcommand */
 		if (!xstrcasecmp(argv[idx], "UP")) {
@@ -805,9 +811,7 @@ void _process_power_command(const char *tag, int argc, char **argv)
 		} else if (!xstrcasecmp(argv[idx], "DOWN")) {
 			power_up = false;
 		} else {
-			exit_code = 1;
-			fprintf(stderr, "unexpected argument: %s\n",
-				argv[idx]);
+			_printf_error("unexpected argument: '%s'", argv[idx]);
 			goto done;
 		}
 		idx++;
@@ -816,48 +820,66 @@ void _process_power_command(const char *tag, int argc, char **argv)
 		 * Optional asap|force if powerering down. Silently ignore
 		 * asap|force if powering up as there's no such option.
 		 */
-		if (argc == max_argv) {
-			if (!xstrcasecmp(argv[idx], "ASAP")) {
-				asap = true;
-			} else if (!xstrcasecmp(argv[idx], "FORCE")) {
-				force = true;
-			} else {
-				exit_code = 1;
-				fprintf(stderr, "unrecognized optional command:%s\n",
-					argv[idx]);
-				goto done;
-			}
-
-			if ((force || asap) && power_up) {
-				exit_code = 1;
-				fprintf(stderr, "The '%s' argument is not valid for power up requests\n",
-					argv[idx]);
-				goto done;
-			}
-
+		if (!xstrcasecmp(argv[idx], "ASAP")) {
+			asap = true;
 			idx++;
+		} else if (!xstrcasecmp(argv[idx], "FORCE")) {
+			force = true;
+			idx++;
+		}
+
+		if ((force || asap) && power_up) {
+			_printf_error("The '%s' argument is not valid for power up requests",
+				      argv[idx - 1]);
+			goto done;
+		}
+
+		/* Missing list of nodes */
+		if (idx == argc) {
+			exit_code = 1;
+			_printf_error("Mandatory argument {ALL|<NodeList>|<NodeSet>} missing");
+			goto done;
+		}
+
+		/* We have one more argument - it may be Reason= */
+		if ((idx + 1) < argc) {
+			if (!xstrncasecmp(argv[idx + 1],
+					  "Reason=", strlen("Reason="))) {
+				if (!power_up) {
+					char *tmp_ptr =
+						strchr(argv[idx + 1], '=');
+
+					if (!tmp_ptr || !*(tmp_ptr + 1)) {
+						exit_code = 1;
+						_printf_error("missing reason");
+						goto done;
+					}
+					reason = xstrdup(tmp_ptr + 1);
+				} else {
+					_printf_error("Reason only allowed for scontrol power down operation");
+					goto done;
+				}
+			} else {
+				_printf_error("unexpected argument:'%s'",
+					      argv[idx + 1]);
+				goto done;
+			}
 		}
 
 		/* call with nodelist */
 		error_code = scontrol_power_nodes(argv[idx], power_up, asap,
-						  force);
+						  force, reason);
+		xfree(reason);
 
 	} else if (argc < min_argv) {
-		exit_code = 1;
-		fprintf(stderr, "too few arguments for keyword:%s\n",
-			argv[0]);
+		_printf_error("too few arguments for keyword:%s", argv[0]);
 	} else if (argc > max_argv) {
-		exit_code = 1;
-		fprintf(stderr, "too many arguments for keyword:%s\n",
-			argv[0]);
+		_printf_error("too many arguments for keyword:%s", argv[0]);
 	}
 
 done:
-	if (error_code) {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			slurm_perror("scontrol_power_nodes error");
-	}
+	if (error_code)
+		_printf_error("scontrol_power_nodes error");
 }
 
 static void _setdebug(int argc, char **argv)
@@ -870,16 +892,10 @@ static void _setdebug(int argc, char **argv)
 	};
 
 	if (argc > 3) {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			fprintf(stderr, "too many arguments for keyword:%s\n",
-				argv[0]);
+		_printf_error("too many arguments for keyword:%s", argv[0]);
 		return;
 	} else if (argc < 2) {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			fprintf(stderr, "too few arguments for keyword:%s\n",
-				argv[0]);
+		_printf_error("too few arguments for keyword:%s", argv[0]);
 		return;
 	}
 
@@ -895,20 +911,14 @@ static void _setdebug(int argc, char **argv)
 		/* effective levels: 0 - 9 */
 		level = (int) strtoul(argv[1], &endptr, 10);
 		if (*endptr != '\0' || level > 9) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr, "invalid debug level: %s\n",
-					argv[1]);
+			_printf_error("invalid debug level: %s", argv[1]);
 			return;
 		}
 	}
 
 	if (argc == 2) {
-		if (slurm_set_debug_level(level)) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				slurm_perror("slurm_set_debug_level error");
-		}
+		if (slurm_set_debug_level(level))
+			_printf_error("slurm_set_debug_level error");
 	} else if (argc == 3) {
 		/*
 		 * scontrol setdebug <level> nodes=<list of nodes>
@@ -916,10 +926,7 @@ static void _setdebug(int argc, char **argv)
 		char *nodes;
 
 		if (xstrncasecmp(argv[2], "Nodes=", 6)) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr, "Invalid option: %s\n",
-					argv[1]);
+			_printf_error("Invalid option: %s", argv[1]);
 			return;
 		}
 
@@ -927,9 +934,7 @@ static void _setdebug(int argc, char **argv)
 			nodes++;
 
 		if (slurm_set_slurmd_debug_level(nodes, level)) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr, "Failed to change debug level on one or more nodes.\n");
+			_printf_error("Failed to change debug level on one or more nodes.");
 		}
 	}
 }
@@ -942,10 +947,7 @@ static void _setdebugflags(int argc, char **argv)
 	uint64_t debug_flags_minus = 0, flags;
 
 	if (argc < 2) {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			fprintf(stderr, "too few arguments for keyword:%s\n",
-				tag);
+		_printf_error("too few arguments for keyword:%s", tag);
 		return;
 	}
 
@@ -973,25 +975,16 @@ static void _setdebugflags(int argc, char **argv)
 
 		if (slurm_set_slurmd_debug_flags(nodes, debug_flags_plus,
 						 debug_flags_minus)) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"Failed to set DebugFlags on one or more nodes.\n");
+			_printf_error("Failed to set DebugFlags on one or more nodes.");
 		}
 	} else if (i < argc) {
-		exit_code = 1;
-		if (quiet_flag != 1) {
-			fprintf(stderr, "invalid debug flag: %s\n", argv[i]);
-		}
+		_printf_error("invalid debug flag: %s", argv[i]);
 		if ((quiet_flag != 1) && (mode == 0)) {
 			fprintf(stderr, "Usage: setdebugflags {+|-}NAME [{+|-}NAME] [nodes=<NODES>]\n");
 		}
 	} else {
-		if (slurm_set_debugflags(debug_flags_plus, debug_flags_minus)) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				slurm_perror("slurm_set_debug_flags error");
-		}
+		if (slurm_set_debugflags(debug_flags_plus, debug_flags_minus))
+			_printf_error("slurm_set_debug_flags error");
 	}
 }
 
@@ -1047,13 +1040,13 @@ static int _process_command (int argc, char **argv)
 	if (argc < 1) {
 		exit_code = 1;
 		if (quiet_flag == -1)
-			fprintf(stderr, "no input");
+			fprintf(stderr, "no input\n");
 		return 0;
 	} else if (tag)
 		tag_len = strlen(tag);
 	else {
 		if (quiet_flag == -1)
-			fprintf(stderr, "input problem");
+			fprintf(stderr, "input problem\n");
 		return 0;
 	}
 
@@ -1100,9 +1093,6 @@ static int _process_command (int argc, char **argv)
 				      "with scontrol");
 			}
 		}
-		cluster_flags = slurmdb_setup_cluster_flags();
-		slurm_free_front_end_info_msg(old_front_end_info_ptr);
-		old_front_end_info_ptr = NULL;
 		slurm_free_job_info_msg(old_job_info_ptr);
 		old_job_info_ptr = NULL;
 		slurm_free_node_info_msg(old_node_info_ptr);
@@ -1304,18 +1294,11 @@ static int _process_command (int argc, char **argv)
 				 tag);
 		}
 		error_code = slurm_reconfigure();
-		if (error_code) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				slurm_perror ("slurm_reconfigure error");
-		}
+		if (error_code)
+			_printf_error("slurm_reconfigure error");
 	} else if (!xstrncasecmp(tag, "requeue", MAX(tag_len, 3))) {
 		if (argc < 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too few arguments for keyword:%s\n",
-					tag);
+			_printf_error("too few arguments for keyword:%s", tag);
 		} else {
 			uint32_t i, flags = 0, start_pos = 1;
 			for (i = 1; i < argc; i++) {
@@ -1329,11 +1312,7 @@ static int _process_command (int argc, char **argv)
 		}
 	} else if (!xstrncasecmp(tag, "requeuehold", 11)) {
 		if (argc < 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too few arguments for keyword:%s\n",
-					tag);
+			_printf_error("too few arguments for keyword:%s", tag);
 		} else {
 			uint32_t i, flags = 0, start_pos = 1;
 			for (i = 1; i < argc; i++) {
@@ -1351,30 +1330,19 @@ static int _process_command (int argc, char **argv)
 		   !xstrncasecmp(tag, "uhold", 5) ||
 	           !xstrncasecmp(tag, "release", MAX(tag_len, 3))) {
 		if (argc < 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too few arguments for keyword:%s\n",
-					tag);
+			_printf_error("too few arguments for keyword:%s", tag);
 		} else {
 			for (i = 1; i < argc; i++) {
 				error_code = scontrol_hold(argv[0], argv[i]);
-				if (error_code) {
-					exit_code = 1;
-					if (quiet_flag != 1)
-						slurm_perror("slurm_suspend error");
-				}
+				if (error_code)
+					_printf_error("slurm_suspend error");
 			}
 			(void) scontrol_hold(argv[0], NULL);   /* Clear cache */
 		}
 	} else if (!xstrncasecmp(tag, "suspend", MAX(tag_len, 2)) ||
 		   !xstrncasecmp(tag, "resume", MAX(tag_len, 3))) {
 		if (argc < 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too few arguments for keyword:%s\n",
-					tag);
+			_printf_error("too few arguments for keyword:%s", tag);
 		} else {
 			for (i = 1; i < argc; i++) {
 				scontrol_suspend(argv[0], argv[i]);
@@ -1382,17 +1350,9 @@ static int _process_command (int argc, char **argv)
 		}
 	} else if (!xstrncasecmp(tag, "top", MAX(tag_len, 3))) {
 		if (argc < 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too few arguments for keyword:%s\n",
-					tag);
+			_printf_error("too few arguments for keyword:%s", tag);
 		} else if (argc > 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too many arguments for keyword:%s\n",
-					tag);
+			_printf_error("too many arguments for keyword:%s", tag);
 		} else {
 			scontrol_top_job(argv[1]);
 		}
@@ -1400,17 +1360,9 @@ static int _process_command (int argc, char **argv)
 		_fetch_token(argc, argv);
 	} else if (!xstrncasecmp(tag, "wait_job", MAX(tag_len, 2))) {
 		if (argc > 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too many arguments for keyword:%s\n",
-					tag);
+			_printf_error("too many arguments for keyword:%s", tag);
 		} else if (argc < 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too few arguments for keyword:%s\n",
-					tag);
+			_printf_error("too few arguments for keyword:%s", tag);
 		} else {
 			error_code = scontrol_job_ready(argv[1]);
 			if (error_code)
@@ -1422,51 +1374,31 @@ static int _process_command (int argc, char **argv)
 		 !xstrncasecmp(tag, "fairsharedampeningfactor",
 			      MAX(tag_len, 3))) {
 		if (argc > 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too many arguments for keyword:%s\n",
-					tag);
+			_printf_error("too many arguments for keyword:%s", tag);
 		} else if (argc < 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too few arguments for keyword:%s\n",
-					tag);
+			_printf_error("too few arguments for keyword:%s", tag);
 		} else {
 			uint16_t factor = 0;
 			char *endptr;
 			factor = (uint16_t)strtoul(argv[1], &endptr, 10);
 			if (*endptr != '\0' || factor == 0) {
-				if (quiet_flag != 1)
-					fprintf(stderr,
-						"invalid dampening factor: %s\n",
-						argv[1]);
+				exit_code = 1;
+				_printf_error("invalid dampening factor: %s",
+					      argv[1]);
 			} else {
 				error_code = slurm_set_fs_dampeningfactor(
 						factor);
-				if (error_code) {
-					exit_code = 1;
-					if (quiet_flag != 1)
-						slurm_perror("slurm_set_fs_dampeningfactor error");
-				}
+				if (error_code)
+					_printf_error("slurm_set_fs_dampeningfactor error");
 			}
 		}
 	} else if (!xstrncasecmp(tag, "setdebug", MAX(tag_len, 2))) {
 		_setdebug(argc, argv);
 	} else if (!xstrncasecmp(tag, "schedloglevel", MAX(tag_len, 3))) {
 		if (argc > 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too many arguments for keyword:%s\n",
-					tag);
+			_printf_error("too many arguments for keyword:%s", tag);
 		} else if (argc < 2) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too few arguments for keyword:%s\n",
-					tag);
+			_printf_error("too few arguments for keyword:%s", tag);
 		} else {
 			int level = -1;
 			char *endptr;
@@ -1485,22 +1417,15 @@ static int _process_command (int argc, char **argv)
 				level = (int)strtoul (argv[1], &endptr, 10);
 				if (*endptr != '\0' || level > 1) {
 					level = -1;
-					exit_code = 1;
-					if (quiet_flag != 1)
-						fprintf(stderr, "invalid schedlog "
-							"level: %s\n", argv[1]);
+					_printf_error("invalid schedlog level: %s",
+						      argv[1]);
 				}
 			}
 			if (level != -1) {
 				error_code = slurm_set_schedlog_level(
 					level);
-				if (error_code) {
-					exit_code = 1;
-					if (quiet_flag != 1)
-						slurm_perror(
-							"slurm_set_schedlog_level"
-							" error");
-				}
+				if (error_code)
+					_printf_error("slurm_set_schedlog_level error");
 			}
 		}
 	} else if (!xstrncasecmp(tag, "show", MAX(tag_len, 3))) {
@@ -1597,11 +1522,8 @@ static int _process_command (int argc, char **argv)
 		}
 		if (error_code == 0) {
 			error_code = slurm_shutdown(options);
-			if (error_code) {
-				exit_code = 1;
-				if (quiet_flag != 1)
-					slurm_perror ("slurm_shutdown error");
-			}
+			if (error_code)
+				_printf_error("slurm_shutdown error");
 		}
 	} else if (!xstrncasecmp(tag, "update", MAX(tag_len, 1))) {
 		if (argc < 2) {
@@ -1642,8 +1564,25 @@ static int _process_command (int argc, char **argv)
 				 "too many arguments for keyword:%s\n",
 				 tag);
 		} else {
-			scontrol_list_pids (argc == 1 ? NULL : argv[1],
-					    argc <= 2 ? NULL : argv[2]);
+			scontrol_list_pids(argc, argv);
+		}
+	} else if (!xstrncasecmp(tag, "listjobs", MAX(tag_len, 1))) {
+		if (argc > 2) {
+			exit_code = 1;
+			fprintf(stderr,
+				"too many arguments for keyword:%s\n",
+				tag);
+		} else {
+			scontrol_list_jobs(argc, argv);
+		}
+	} else if (!xstrncasecmp(tag, "liststeps", MAX(tag_len, 1))) {
+		if (argc > 2) {
+			exit_code = 1;
+			fprintf(stderr,
+				"too many arguments for keyword:%s\n",
+				tag);
+		} else {
+			scontrol_list_steps(argc, argv);
 		}
 	} else if (!xstrncasecmp(tag, "getent", MAX(tag_len, 6))) {
 		scontrol_getent(argc == 1 ? NULL : argv[1]);
@@ -1808,24 +1747,18 @@ static void _show_it(int argc, char **argv)
 	bool allow_opt = false;
 
 	if (argc < 2) {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			fprintf(stderr,
-				"too few arguments for keyword:%s\n", argv[0]);
+		_printf_error("too few arguments for keyword:%s", argv[0]);
 		return;
 	}
 
 	if (!xstrncasecmp(argv[1], "assoc_mgr", MAX(tag_len, 2)) ||
-	    !xstrncasecmp(argv[1], "bbstat",    MAX(tag_len, 2)) ||
-	    !xstrncasecmp(argv[1], "dwstat",    MAX(tag_len, 2)))
+	    !xstrncasecmp(argv[1], "bbstat", MAX(tag_len, 2)) ||
+	    !xstrncasecmp(argv[1], "dwstat", MAX(tag_len, 2)) ||
+	    !xstrncasecmp(argv[1], "topology", MAX(tag_len, 4)))
 		allow_opt = true;
 
 	if ((argc > 3) && !allow_opt) {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			fprintf(stderr,
-				"too many arguments for keyword:%s\n",
-				argv[0]);
+		_printf_error("too many arguments for keyword:%s", argv[0]);
 		return;
 	}
 
@@ -1858,17 +1791,12 @@ static void _show_it(int argc, char **argv)
 		_print_config(val, argc, argv);
 	} else if (xstrncasecmp(tag, "daemons", MAX(tag_len, 1)) == 0) {
 		if (val) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				fprintf(stderr,
-					"too many arguments for keyword:%s\n",
-					argv[0]);
+			_printf_error("too many arguments for keyword:%s",
+				      argv[0]);
 		} else
 			_print_daemons();
 	} else if (xstrncasecmp(tag, "Federations",  MAX(tag_len, 1)) == 0) {
 		scontrol_print_federation();
-	} else if (xstrncasecmp(tag, "FrontendName",  MAX(tag_len, 1)) == 0) {
-		scontrol_print_front_end_list(val);
 	} else if (xstrncasecmp(tag, "hostnames", MAX(tag_len, 5)) == 0) {
 		if (val)
 			scontrol_print_hosts(val);
@@ -1901,20 +1829,19 @@ static void _show_it(int argc, char **argv)
 	} else if (xstrncasecmp(tag, "reservations", MAX(tag_len, 1)) == 0 ||
 		   xstrncasecmp(tag, "reservationname", MAX(tag_len, 1)) == 0) {
 		scontrol_print_res(val, argc, argv);
+	} else if (!xstrncasecmp(tag, "resources", MAX(tag_len, 4))) {
+		scontrol_print_resources(argc, argv);
 	} else if (xstrncasecmp(tag, "slurmd", MAX(tag_len, 2)) == 0) {
 		_print_slurmd (val);
 	} else if (xstrncasecmp(tag, "steps", MAX(tag_len, 2)) == 0) {
 		scontrol_print_step(val, argc, argv);
+	} else if (!xstrncasecmp(tag, "topoconf", MAX(tag_len, 5))) {
+		scontrol_print_topo_conf();
 	} else if (xstrncasecmp(tag, "topology", MAX(tag_len, 1)) == 0) {
-		scontrol_print_topo (val);
+		scontrol_print_topo(argc - 2, argv + 2);
 	} else {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			fprintf (stderr,
-				 "invalid entity:%s for keyword:%s \n",
-				 tag, argv[0]);
+		_printf_error("invalid entity:%s for keyword:%s", tag, argv[0]);
 	}
-
 }
 
 
@@ -1930,7 +1857,7 @@ static void _update_it(int argc, char **argv)
 	int i, error_code = SLURM_SUCCESS;
 	int node_tag = 0, part_tag = 0, job_tag = 0;
 	int res_tag = 0;
-	int debug_tag = 0, step_tag = 0, front_end_tag = 0;
+	int debug_tag = 0, step_tag = 0;
 	int suspend_exc_nodes_tag = 0, suspend_exc_parts_tag = 0,
 	    suspend_exc_states_tag = 0;
 	int jerror_code = SLURM_SUCCESS;
@@ -1966,9 +1893,6 @@ static void _update_it(int argc, char **argv)
 			job_tag = 1;
 		} else if (!xstrncasecmp(tag, "StepId", MAX(tag_len, 4))) {
 			step_tag = 1;
-		} else if (!xstrncasecmp(tag, "FrontendName",
-					 MAX(tag_len, 2))) {
-			front_end_tag = 1;
 		} else if (!xstrncasecmp(tag, "ReservationName",
 					 MAX(tag_len, 3))) {
 			res_tag = 1;
@@ -2001,8 +1925,6 @@ static void _update_it(int argc, char **argv)
 		error_code = scontrol_update_res (argc, argv);
 	else if (node_tag)
 		error_code = scontrol_update_node (argc, argv);
-	else if (front_end_tag)
-		error_code = scontrol_update_front_end (argc, argv);
 	else if (part_tag)
 		error_code = scontrol_update_part (argc, argv);
 	else if (debug_tag)
@@ -2050,10 +1972,7 @@ static int _update_slurmctld_debug(char *val)
 		level = (uint32_t)strtoul(val, &endptr, 10);
 
 	if ((val == NULL) || (*endptr != '\0') || (level > 9)) {
-		error_code = 1;
-		if (quiet_flag != 1)
-			fprintf(stderr, "invalid debug level: %s\n",
-				val);
+		_printf_error("invalid debug level: %s", val);
 	} else {
 		error_code = slurm_set_debug_level(level);
 	}

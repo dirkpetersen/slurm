@@ -85,9 +85,9 @@ The most basic request is structured like this:
 </pre>
 
 <p>
-Key and value are arbitrary, but cannot contain any characters that are part
-of operators and cannot contain parentheses. Thus, the following characters
-are not allowed in a key or value:
+Key and value are arbitrary, non-empty strings that cannot contain any
+characters that are part of operators and cannot contain parentheses. Thus,
+the following characters are not allowed in a key or value:
 </p>
 
 <pre>
@@ -163,9 +163,9 @@ be considered part of a key or value. This means that the following is invalid:
 </pre>
 
 <p>
-The space at the beginning is parsed as a key of a request. Then the opening
+The space at he beginning is parsed as a key of a request. Then the opening
 parenthesis character is recognized as an invalid character for either a key
-or a comparision operator. This request would result in the job being rejected.
+or a comparison operator. This request would result in the job being rejected.
 However, this is valid:
 </p>
 
@@ -355,7 +355,5 @@ $ squeue
              11207     debug     wrap      ben  R       0:01      1 node02
 </pre>
 </p>
-
-<p style="text-align: center;">Last modified 02 July 2024</p>
 
 <!--#include virtual="footer.txt"-->

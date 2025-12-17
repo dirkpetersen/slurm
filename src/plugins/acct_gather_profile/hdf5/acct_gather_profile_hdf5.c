@@ -74,31 +74,7 @@
 /* TODO: Make this configurable with a parameter */
 #define HDF5_COMPRESS 0
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobacct" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobacct/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "AcctGatherProfile hdf5 plugin";
 const char plugin_type[] = "acct_gather_profile/hdf5";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -222,10 +198,6 @@ static void _create_directories(void)
 	/* Do not xfree() hdf5_dir_rel (interior pointer to freed data). */
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	if (!running_in_slurmstepd())
@@ -238,12 +210,11 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	xfree(tables);
 	xfree(groups);
 	xfree(hdf5_conf.dir);
-	return SLURM_SUCCESS;
 }
 
 extern void acct_gather_profile_p_conf_options(s_p_options_t **full_options,
@@ -640,7 +611,7 @@ extern int acct_gather_profile_p_add_sample_data(int table_id, void *data,
 	return SLURM_SUCCESS;
 }
 
-extern void acct_gather_profile_p_conf_values(List *data)
+extern void acct_gather_profile_p_conf_values(list_t **data)
 {
 	add_key_pair(*data, "ProfileHDF5Dir", "%s", hdf5_conf.dir);
 	add_key_pair(*data, "ProfileHDF5Default", "%s",

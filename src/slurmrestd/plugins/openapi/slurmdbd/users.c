@@ -48,7 +48,7 @@
 
 static void _dump_users(ctxt_t *ctxt, slurmdb_user_cond_t *user_cond)
 {
-	List user_list = NULL;
+	list_t *user_list = NULL;
 
 	if (!db_query_list(ctxt, &user_list, slurmdb_users_get, user_cond))
 		DUMP_OPENAPI_RESP_SINGLE(OPENAPI_USERS_RESP, user_list, ctxt);
@@ -110,7 +110,7 @@ static int _foreach_update_user(void *x, void *arg)
 
 		if (!user_list || list_is_empty(user_list)) {
 			resp_error(ctxt, ESLURM_USER_ID_MISSING, __func__,
-			   "Unable to rename non-existant user %s to %s",
+			   "Unable to rename non-existent user %s to %s",
 			   user->old_name, user->name);
 			goto cleanup;
 		}
@@ -242,7 +242,7 @@ static void _add_users_association(ctxt_t *ctxt,
 	int rc = SLURM_SUCCESS;
 	char *ret_str = NULL;
 
-	/* Mimick sacctmgr/user_functions.c _set_add_cond() */
+	/* Mimic sacctmgr/user_functions.c _set_add_cond() */
 	if (user->default_acct) {
 		if (!add_assoc->acct_list)
 			add_assoc->acct_list = list_create(xfree_ptr);
@@ -252,7 +252,7 @@ static void _add_users_association(ctxt_t *ctxt,
 					      user->default_acct);
 	}
 
-	/* Mimick sacctmgr/user_functions.c _set_add_cond() */
+	/* Mimic sacctmgr/user_functions.c _set_add_cond() */
 	if (user->default_wckey) {
 		if (!add_assoc->wckey_list)
 			add_assoc->wckey_list = list_create(xfree_ptr);
@@ -263,7 +263,7 @@ static void _add_users_association(ctxt_t *ctxt,
 	}
 
 	/*
-	 * Mimick sacctmgr/user_functions.c sacctmgr_add_user().
+	 * Mimic sacctmgr/user_functions.c sacctmgr_add_user().
 	 *
 	 * The add_assoc.user_list is a requirement by itself, already handled
 	 * by the add_parse_req() in the USERS_ADD_COND parser array.
@@ -323,7 +323,7 @@ static void _delete_user(ctxt_t *ctxt, char *user_name)
 	slurmdb_user_cond_t user_cond = {
 		.assoc_cond = &assoc_cond,
 	};
-	List user_list = NULL;
+	list_t *user_list = NULL;
 
 	assoc_cond.user_list = list_create(NULL);
 	list_append(assoc_cond.user_list, user_name);

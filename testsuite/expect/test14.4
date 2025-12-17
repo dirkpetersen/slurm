@@ -33,9 +33,6 @@ set file_out    "$test_dir/output"
 set file_err    "$test_dir/error"
 set job_id      0
 
-if {[get_config_param "FrontendName"] ne "MISSING"} {
-	skip "This test is incompatible with front-end systems"
-}
 if {[get_config_param "SlurmdUser"] ne "root(0)"} {
 	skip "This test is incompatible with SlurmdUser != root"
 }
@@ -47,7 +44,7 @@ proc cleanup {} {
 }
 
 #
-# Build input script file that broacasts a file
+# Build input script file that broadcasts a file
 # NOTE: we broadcast the file "sbcast", just for convenience
 #
 set pid         [pid]
@@ -75,7 +72,7 @@ make_bash_script $file_in "
 # to a single node, and we mark the test as partially skipped.
 #
 set timeout $max_job_delay
-if {[get_config_param "MULTIPLE_SLURMD"] eq "Yes"} {
+if {[get_config_param "MULTIPLE_SLURMD"] eq "yes"} {
 	subskip "This test is partially compatible with multiple slurmd systems"
 	set job_id [submit_job -fail "-N1 --output=$file_out --error=$file_err -t1 $file_in"]
 } else {

@@ -36,13 +36,12 @@
 
 #include "slurm/slurm_errno.h"
 #include "slurm/slurm.h"
+#include "src/slurmd/common/set_oomadj.h"
 #include "src/slurmd/slurmstepd/slurmstepd_job.h"
 #include "src/slurmd/slurmd/slurmd.h"
 
 #include "src/common/xstring.h"
 #include "src/interfaces/cgroup.h"
-
-#include "task_cgroup.h"
 
 static bool constrain_ram_space;
 static bool constrain_swap_space;
@@ -107,19 +106,7 @@ extern int task_cgroup_memory_init(void)
 	      (uint64_t) (max_swap / (1024 * 1024)),
 	      slurm_cgroup_conf.min_ram_space);
 
-        /*
-         *  Warning: OOM Killer must be disabled for slurmstepd
-         *  or it would be destroyed if the application use
-         *  more memory than permitted
-         *
-         *  If an env value is already set for slurmstepd
-         *  OOM killer behavior, keep it, otherwise set the
-         *  -1000 value, wich means do not let OOM killer kill it
-         *
-         *  FYI, setting "export SLURMSTEPD_OOM_ADJ=-1000"
-         *  in /etc/sysconfig/slurm would be the same
-         */
-        setenv("SLURMSTEPD_OOM_ADJ", "-1000", 0);
+	set_oom_adj_env(STEPD_OOM_ADJ);
 
 	return SLURM_SUCCESS;
 }
@@ -255,7 +242,7 @@ extern int task_cgroup_memory_create(stepd_step_rec_t *step)
 	if (_memcg_initialize(step, step->step_mem, true) != SLURM_SUCCESS)
 		return SLURM_ERROR;
 
-	if (cgroup_g_step_start_oom_mgr() == SLURM_SUCCESS)
+	if (cgroup_g_step_start_oom_mgr(step) == SLURM_SUCCESS)
 		oom_mgr_started = true;
 
 	/* Attach the slurmstepd to the step memory cgroup. */
@@ -305,6 +292,14 @@ extern int task_cgroup_memory_check_oom(stepd_step_rec_t *step)
 		      results->oom_kill_cnt,
 		      (results->oom_kill_cnt == 1) ? "" : "s" ,
 		      &step->step_id);
+		/*
+		 * If OOMKillStep is set send a message to terminate this
+		 * step, this is done to ensure that if this is a multinode
+		 * step, the step gets terminated in all other nodes.
+		 */
+		if (step->oom_kill_step) {
+			slurm_terminate_job_step(&step->step_id);
+		}
 		rc = ENOMEM;
 	}
 

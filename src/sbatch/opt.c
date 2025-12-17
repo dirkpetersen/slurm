@@ -188,6 +188,7 @@ env_vars_t env_vars[] = {
   { "SBATCH_CLUSTER_CONSTRAINT", LONG_OPT_CLUSTER_CONSTRAINT },
   { "SBATCH_CLUSTERS", 'M' },
   { "SLURM_CLUSTERS", 'M' },
+  { "SBATCH_CONSOLIDATE_SEGMENTS", LONG_OPT_CONSOLIDATE_SEGMENTS },
   { "SBATCH_CONTAINER", LONG_OPT_CONTAINER },
   { "SBATCH_CONTAINER_ID", LONG_OPT_CONTAINER_ID },
   { "SBATCH_CONSTRAINT", 'C' },
@@ -226,8 +227,10 @@ env_vars_t env_vars[] = {
   { "SBATCH_REQ_SWITCH", LONG_OPT_SWITCH_REQ },
   { "SBATCH_REQUEUE", LONG_OPT_REQUEUE },
   { "SBATCH_RESERVATION", LONG_OPT_RESERVATION },
+  { "SBATCH_SEGMENT_SIZE", LONG_OPT_SEGMENT_SIZE },
   { "SBATCH_SIGNAL", LONG_OPT_SIGNAL },
   { "SBATCH_SPREAD_JOB", LONG_OPT_SPREAD_JOB },
+  { "SBATCH_SPREAD_SEGMENTS", LONG_OPT_SPREAD_SEGMENTS },
   { "SBATCH_THREAD_SPEC", LONG_OPT_THREAD_SPEC },
   { "SBATCH_THREADS_PER_CORE", LONG_OPT_THREADSPERCORE },
   { "SBATCH_TIMELIMIT", 't' },
@@ -324,6 +327,10 @@ extern char *process_options_first_pass(int argc, char **argv)
 
 	if ((local_argc > optind) && (sbopt.wrap != NULL)) {
 		error("Script arguments not permitted with --wrap option");
+		exit(error_exit);
+	}
+	if ((local_argc > optind) && (opt.job_flags & EXTERNAL_JOB)) {
+		error("Script arguments not permitted with --external option");
 		exit(error_exit);
 	}
 	if (local_argc > optind) {
@@ -706,9 +713,6 @@ static bool _opt_verify(void)
 	if (opt.container_id && !getenv("SLURM_CONTAINER_ID"))
 		setenvf(NULL, "SLURM_CONTAINER_ID", "%s", opt.container_id);
 
-	if (opt.network)
-		setenvf(NULL, "SLURM_NETWORK", "%s", opt.network);
-
 	/*
 	 * NOTE: this burst_buffer_file processing is intentionally different
 	 * than in salloc/srun, there is not a missing chunk of code here.
@@ -738,7 +742,7 @@ static bool _opt_verify(void)
 	if (opt.exclude && !_valid_node_list(&opt.exclude))
 		exit(error_exit);
 
-	if (opt.nodelist && !opt.nodes_set) {
+	if (opt.nodelist && !opt.nodes_set && !xstrchr(opt.nodelist, '{')) {
 		hl = hostlist_create(opt.nodelist);
 		if (!hl)
 			fatal("Invalid node list specified");
@@ -753,10 +757,10 @@ static bool _opt_verify(void)
 
 	if (!opt.job_name && sbopt.wrap)
 		opt.job_name = xstrdup("wrap");
+	else if (!opt.job_name && (opt.job_flags & EXTERNAL_JOB))
+		opt.job_name = xstrdup("external");
 	else if (!opt.job_name && (opt.argc > 0))
 		opt.job_name = base_name(opt.argv[0]);
-	if (opt.job_name)
-		setenv("SLURM_JOB_NAME", opt.job_name, 1);
 
 	/* check for realistic arguments */
 	if (opt.ntasks < 0) {
@@ -863,7 +867,8 @@ static bool _opt_verify(void)
 	/* set up the proc and node counts based on the arbitrary list
 	   of nodes */
 	if (((opt.distribution & SLURM_DIST_STATE_BASE) == SLURM_DIST_ARBITRARY)
-	    && (!opt.nodes_set || !opt.ntasks_set)) {
+	    && (!opt.nodes_set || !opt.ntasks_set)
+	    && !xstrchr(opt.nodelist, '{')) {
 		FREE_NULL_HOSTLIST(hl);
 		hl = hostlist_create(opt.nodelist);
 		if (!hl)
@@ -913,13 +918,6 @@ static bool _opt_verify(void)
 		exit(error_exit);
 	}
 
-	if (opt.open_mode) {
-		/* Propage mode to spawned job using environment variable */
-		if (opt.open_mode == OPEN_MODE_APPEND)
-			setenvf(NULL, "SLURM_OPEN_MODE", "a");
-		else
-			setenvf(NULL, "SLURM_OPEN_MODE", "t");
-	}
 	if (opt.dependency)
 		setenvfs("SLURM_JOB_DEPENDENCY=%s", opt.dependency);
 
@@ -927,14 +925,6 @@ static bool _opt_verify(void)
 		/* srun ignores "ALL", it is the default */
 		setenv("SLURM_EXPORT_ENV", opt.export_env, 0);
 	}
-
-	if (opt.profile)
-		setenvfs("SLURM_PROFILE=%s",
-			 acct_gather_profile_to_string(opt.profile));
-
-
-	if (opt.acctg_freq)
-		setenvf(NULL, "SLURM_ACCTG_FREQ", "%s", opt.acctg_freq);
 
 	if (opt.mem_bind_type && (getenv("SBATCH_MEM_BIND") == NULL)) {
 		char *tmp = slurm_xstr_mem_bind_type(opt.mem_bind_type);
@@ -946,10 +936,6 @@ static bool _opt_verify(void)
 		}
 		xfree(tmp);
 	}
-	if (opt.mem_bind_type && (getenv("SLURM_MEM_BIND_SORT") == NULL) &&
-	    (opt.mem_bind_type & MEM_BIND_SORT)) {
-		het_job_env.mem_bind_sort = xstrdup("sort");
-	}
 
 	if (opt.mem_bind_type && (getenv("SLURM_MEM_BIND_VERBOSE") == NULL)) {
 		if (opt.mem_bind_type & MEM_BIND_VERBOSE) {
@@ -958,9 +944,6 @@ static bool _opt_verify(void)
 			het_job_env.mem_bind_verbose = xstrdup("quiet");
 		}
 	}
-
-	cpu_freq_set_env("SLURM_CPU_FREQ_REQ",
-			 opt.cpu_freq_min, opt.cpu_freq_max, opt.cpu_freq_gov);
 
 	return verified;
 }
@@ -974,7 +957,7 @@ extern char *spank_get_job_env(const char *name)
 
 	if ((name == NULL) || (name[0] == '\0') ||
 	    (strchr(name, (int)'=') != NULL)) {
-		slurm_seterrno(EINVAL);
+		errno = EINVAL;
 		return NULL;
 	}
 
@@ -1000,7 +983,7 @@ extern int   spank_set_job_env(const char *name, const char *value,
 
 	if ((name == NULL) || (name[0] == '\0') ||
 	    (strchr(name, (int)'=') != NULL)) {
-		slurm_seterrno(EINVAL);
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -1034,7 +1017,7 @@ extern int   spank_unset_job_env(const char *name)
 
 	if ((name == NULL) || (name[0] == '\0') ||
 	    (strchr(name, (int)'=') != NULL)) {
-		slurm_seterrno(EINVAL);
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -1099,8 +1082,8 @@ static void _usage(void)
 "              [--contiguous] [--mincpus=n] [--mem=MB] [--tmp=MB] [-C list]\n"
 "              [--account=name] [--dependency=type:jobid[+time]] [--comment=name]\n"
 "              [--mail-type=type] [--mail-user=user] [--nice[=value]] [--wait]\n"
-"              [--requeue] [--no-requeue] [--ntasks-per-node=n] [--propagate]\n"
-"              [--nodefile=file] [--nodelist=hosts] [--exclude=hosts]\n"
+"              [--requeue[=expedited]] [--no-requeue] [--ntasks-per-node=n]\n"
+"              [--propagate] [--nodefile=file] [--nodelist=hosts] [--exclude=hosts]\n"
 "              [--network=type] [--mem-per-cpu=MB] [--qos=qos] [--gres=list]\n"
 "              [--mem-bind=...] [--reservation=name] [--mcs-label=mcs]\n"
 "              [--cpu-freq=min[-max[:gov]]] [--power=flags] [--gres-flags=opts]\n"
@@ -1108,11 +1091,13 @@ static void _usage(void)
 "              [--core-spec=cores] [--thread-spec=threads]\n"
 "              [--bb=burst_buffer_spec] [--bbf=burst_buffer_file]\n"
 "              [--array=index_values] [--profile=...] [--ignore-pbs] [--spread-job]\n"
+"              [--spread-segments]\n"
 "              [--export[=names]] [--export-file=file|fd] [--delay-boot=mins]\n"
 "              [--use-min-nodes]\n"
 "              [--cpus-per-gpu=n] [--gpus=n] [--gpu-bind=...] [--gpu-freq=...]\n"
 "              [--gpus-per-node=n] [--gpus-per-socket=n] [--gpus-per-task=n]\n"
 "              [--mem-per-gpu=MB] [--tres-bind=...] [--tres-per-task=list]\n"
+"              [--oom-kill-step[=0|1]]\n"
 "              executable [args...]\n");
 }
 
@@ -1144,7 +1129,7 @@ static void _help(void)
 "                              descriptor to export\n"
 "      --get-user-env          load environment from local cluster\n"
 "      --gid=group_id          group ID to run job as (user root only)\n"
-"      --gres=list             required generic resources\n"
+"      --gres=list             required generic resources per node\n"
 "      --gres-flags=opts       flags related to GRES management\n"
 "  -H, --hold                  submit job in held state\n"
 "      --ignore-pbs            Ignore #PBS and #BSUB options in the batch script\n"
@@ -1169,6 +1154,7 @@ static void _help(void)
 "      --no-requeue            if set, do not permit the job to be requeued\n"
 "      --ntasks-per-node=n     number of tasks to invoke on each node\n"
 "  -N, --nodes=N               number of nodes on which to run (N = min[-max])\n"
+"      --oom-kill-step[=0|1]   set the OOMKillStep behaviour\n"
 "  -o, --output=out            file for batch script's standard output\n"
 "  -O, --overcommit            overcommit resources\n"
 "  -p, --partition=partition   partition requested\n"
@@ -1183,11 +1169,12 @@ static void _help(void)
 "  -q, --qos=qos               quality of service\n"
 "  -Q, --quiet                 quiet mode (suppress informational messages)\n"
 "      --reboot                reboot compute nodes before starting job\n"
-"      --requeue               if set, permit the job to be requeued\n"
+"      --requeue[=expedited]   if set, permit the job to be requeued\n"
 "  -s, --oversubscribe         over subscribe resources with other jobs\n"
 "  -S, --core-spec=cores       count of reserved cores\n"
 "      --signal=[[R][B]:]num[@time] send signal when time limit within time seconds\n"
 "      --spread-job            spread job across as many nodes as possible\n"
+"      --spread-segments       spread job segments across separate base blocks\n"
 "      --switches=max-switches{@max-time-to-wait}\n"
 "                              Optimum switches and max time to wait for optimum\n"
 "      --thread-spec=threads   count of reserved threads\n"
@@ -1235,7 +1222,7 @@ static void _help(void)
 "      --sockets-per-node=S    number of sockets per node to allocate\n"
 "      --cores-per-socket=C    number of cores per socket to allocate\n"
 "      --threads-per-core=T    number of threads per core to allocate\n"
-"  -B  --extra-node-info=S[:C[:T]]  combine request of sockets per node,\n"
+"  -B, --extra-node-info=S[:C[:T]]  combine request of sockets per node,\n"
 "                              cores per socket and threads per core.\n"
 "                              Specify an asterisk (*) as a placeholder,\n"
 "                              a minimum value, or a min-max range.\n"
@@ -1282,7 +1269,6 @@ extern void init_envs(sbatch_env_t *local_env)
 	local_env->cpus_per_task	= NO_VAL;
 	local_env->dist			= NULL;
 	local_env->mem_bind		= NULL;
-	local_env->mem_bind_sort	= NULL;
 	local_env->mem_bind_verbose	= NULL;
 	local_env->ntasks		= NO_VAL;
 	local_env->ntasks_per_core	= NO_VAL;
@@ -1314,12 +1300,6 @@ extern void set_envs(char ***array_ptr, sbatch_env_t *local_env,
 					 het_job_offset, "%s",
 					 local_env->mem_bind)) {
 		error("Can't set SLURM_MEM_BIND env variable");
-	}
-	if (local_env->mem_bind_sort &&
-	    !env_array_overwrite_het_fmt(array_ptr, "SLURM_MEM_BIND_SORT",
-					 het_job_offset, "%s",
-					 local_env->mem_bind_sort)) {
-		error("Can't set SLURM_MEM_BIND_SORT env variable");
 	}
 	if (local_env->mem_bind_verbose &&
 	    !env_array_overwrite_het_fmt(array_ptr, "SLURM_MEM_BIND_VERBOSE",

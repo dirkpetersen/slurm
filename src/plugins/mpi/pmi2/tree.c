@@ -102,12 +102,12 @@ static char *tree_cmd_names[] = {
 
 static int _handle_kvs_fence(int fd, buf_t *buf)
 {
-	uint32_t from_nodeid, num_children, temp32, seq;
+	uint32_t from_nodeid, num_children, seq;
 	char *from_node = NULL;
 	int rc = SLURM_SUCCESS;
 
 	safe_unpack32(&from_nodeid, buf);
-	safe_unpackstr_xmalloc(&from_node, &temp32, buf);
+	safe_unpackstr(&from_node, buf);
 	safe_unpack32(&num_children, buf);
 	safe_unpack32(&seq, buf);
 
@@ -150,9 +150,7 @@ static int _handle_kvs_fence(int fd, buf_t *buf)
 				      " to compute nodes");
 			}
 			/* cancel the step to avoid tasks hang */
-			slurm_kill_job_step(job_info.step_id.job_id,
-					    job_info.step_id.step_id,
-					    SIGKILL, 0);
+			slurm_kill_job_step(&job_info.step_id, SIGKILL, 0);
 		} else {
 			if (in_stepd())
 				waiting_kvs_resp = 1;
@@ -201,8 +199,8 @@ static int _handle_kvs_fence_resp(int fd, buf_t *buf)
 	debug3("mpi/pmi2: buf length: %u", temp32);
 	/* put kvs into local hash */
 	while (remaining_buf(buf) > 0) {
-		safe_unpackstr_xmalloc(&key, &temp32, buf);
-		safe_unpackstr_xmalloc(&val, &temp32, buf);
+		safe_unpackstr(&key, buf);
+		safe_unpackstr(&val, buf);
 		kvs_put(key, val);
 		//temp32 = remaining_buf(buf);
 		xfree(key);
@@ -212,8 +210,7 @@ static int _handle_kvs_fence_resp(int fd, buf_t *buf)
 resp:
 	send_kvs_fence_resp_to_clients(rc, errmsg);
 	if (rc != SLURM_SUCCESS) {
-		slurm_kill_job_step(job_info.step_id.job_id,
-				    job_info.step_id.step_id, SIGKILL, 0);
+		slurm_kill_job_step(&job_info.step_id, SIGKILL, 0);
 	}
 	return rc;
 
@@ -407,14 +404,13 @@ static int _handle_spawn_resp(int fd, buf_t *buf)
 static int _handle_name_publish(int fd, buf_t *buf)
 {
 	int rc;
-	uint32_t tmp32;
 	char *name = NULL, *port = NULL;
 	buf_t *resp_buf = NULL;
 
 	debug3("mpi/pmi2: in _handle_name_publish");
 
-	safe_unpackstr_xmalloc(&name, &tmp32, buf);
-	safe_unpackstr_xmalloc(&port, &tmp32, buf);
+	safe_unpackstr(&name, buf);
+	safe_unpackstr(&port, buf);
 
 	if (tree_info.srun_addr)
 		rc = name_publish_up(name, port);
@@ -425,8 +421,8 @@ out:
 	xfree(port);
 	resp_buf = init_buf(32);
 	pack32((uint32_t) rc, resp_buf);
-	rc = slurm_msg_sendto(fd, get_buf_data(resp_buf),
-			      get_buf_offset(resp_buf));
+	rc = slurm_msg_sendto_socket(fd, get_buf_data(resp_buf),
+				     get_buf_offset(resp_buf));
 	FREE_NULL_BUFFER(resp_buf);
 
 	debug3("mpi/pmi2: out _handle_name_publish");
@@ -440,13 +436,12 @@ unpack_error:
 static int _handle_name_unpublish(int fd, buf_t *buf)
 {
 	int rc;
-	uint32_t tmp32;
 	char *name = NULL;
 	buf_t *resp_buf = NULL;
 
 	debug3("mpi/pmi2: in _handle_name_unpublish");
 
-	safe_unpackstr_xmalloc(&name, &tmp32, buf);
+	safe_unpackstr(&name, buf);
 
 	if (tree_info.srun_addr)
 		rc = name_unpublish_up(name);
@@ -456,8 +451,8 @@ out:
 	xfree(name);
 	resp_buf = init_buf(32);
 	pack32((uint32_t) rc, resp_buf);
-	rc = slurm_msg_sendto(fd, get_buf_data(resp_buf),
-			      get_buf_offset(resp_buf));
+	rc = slurm_msg_sendto_socket(fd, get_buf_data(resp_buf),
+				     get_buf_offset(resp_buf));
 	FREE_NULL_BUFFER(resp_buf);
 
 	debug3("mpi/pmi2: out _handle_name_unpublish");
@@ -471,13 +466,12 @@ unpack_error:
 static int _handle_name_lookup(int fd, buf_t *buf)
 {
 	int rc = SLURM_SUCCESS, rc2;
-	uint32_t tmp32;
 	char *name = NULL, *port = NULL;
 	buf_t *resp_buf = NULL;
 
 	debug3("mpi/pmi2: in _handle_name_lookup");
 
-	safe_unpackstr_xmalloc(&name, &tmp32, buf);
+	safe_unpackstr(&name, buf);
 
 	if (tree_info.srun_addr)
 		port = name_lookup_up(name);
@@ -486,8 +480,8 @@ static int _handle_name_lookup(int fd, buf_t *buf)
 out:
 	resp_buf = init_buf(1024);
 	packstr(port, resp_buf);
-	rc2 = slurm_msg_sendto(fd, get_buf_data(resp_buf),
-			       get_buf_offset(resp_buf));
+	rc2 = slurm_msg_sendto_socket(fd, get_buf_data(resp_buf),
+				      get_buf_offset(resp_buf));
 	rc = MAX(rc, rc2);
 	FREE_NULL_BUFFER(resp_buf);
 	xfree(name);
@@ -504,7 +498,7 @@ unpack_error:
 /* handles ring_in message from one of our stepd children */
 static int _handle_ring(int fd, buf_t *buf)
 {
-	uint32_t rank, count, temp32;
+	uint32_t rank, count;
 	char *left  = NULL;
 	char *right = NULL;
 	int ring_id;
@@ -521,8 +515,8 @@ static int _handle_ring(int fd, buf_t *buf)
          *   string   right - ring in right value */
 	safe_unpack32(&rank,  buf);
 	safe_unpack32(&count, buf);
-	safe_unpackstr_xmalloc(&left,  &temp32, buf);
-	safe_unpackstr_xmalloc(&right, &temp32, buf);
+	safe_unpackstr(&left, buf);
+	safe_unpackstr(&right, buf);
 
 	/* lookup ring_id for this child */
 	ring_id = pmix_ring_id_by_rank(rank);
@@ -553,7 +547,7 @@ unpack_error:
 /* handles ring_out messages coming in from parent in stepd tree */
 static int _handle_ring_resp(int fd, buf_t *buf)
 {
-	uint32_t count, temp32;
+	uint32_t count;
 	char *left  = NULL;
 	char *right = NULL;
 	int rc = SLURM_SUCCESS;
@@ -566,8 +560,8 @@ static int _handle_ring_resp(int fd, buf_t *buf)
          *   string   left  - ring out left value
          *   string   right - ring out right value */
 	safe_unpack32(&count, buf);
-	safe_unpackstr_xmalloc(&left,  &temp32, buf);
-	safe_unpackstr_xmalloc(&right, &temp32, buf);
+	safe_unpackstr(&left, buf);
+	safe_unpackstr(&right, buf);
 
 	/* execute ring out operation */
 	rc = pmix_ring_out(count, left, right);
@@ -631,7 +625,7 @@ tree_msg_to_srun(uint32_t len, char *msg)
 	fd = slurm_open_stream(tree_info.srun_addr, true);
 	if (fd < 0)
 		return SLURM_ERROR;
-	rc = slurm_msg_sendto(fd, msg, len);
+	rc = slurm_msg_sendto_socket(fd, msg, len);
 	if (rc == len) /* all data sent */
 		rc = SLURM_SUCCESS;
 	else
@@ -651,7 +645,7 @@ extern int tree_msg_to_srun_with_resp(uint32_t len, char *msg, buf_t **resp_ptr)
 	fd = slurm_open_stream(tree_info.srun_addr, true);
 	if (fd < 0)
 		return SLURM_ERROR;
-	rc = slurm_msg_sendto(fd, msg, len);
+	rc = slurm_msg_sendto_socket(fd, msg, len);
 	if (rc == len) { 	/* all data sent */
 		safe_read(fd, &len, sizeof(len));
 		len = ntohl(len);
@@ -686,7 +680,7 @@ tree_msg_to_spawned_sruns(uint32_t len, char *msg)
 		fd = slurm_open_stream(&srun_addr, true);
 		if (fd < 0)
 			return SLURM_ERROR;
-		sent = slurm_msg_sendto(fd, msg, len);
+		sent = slurm_msg_sendto_socket(fd, msg, len);
 		if (sent != len)
 			rc = SLURM_ERROR;
 		close(fd);

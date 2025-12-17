@@ -77,7 +77,7 @@ int main(int argc, char *argv[])
 	char *gres_conf = NULL;
 	char *fake_gpus_conf = NULL;
 	struct stat stat_buf;
-	List gres_list = NULL;
+	list_t *gres_list = NULL;
 	log_level_t debug_level = LOG_LEVEL_INFO;
 
 	if (argc < 4) {
@@ -132,7 +132,12 @@ int main(int argc, char *argv[])
 
 	slurm_init(NULL);
 
+#if SLURM_VERSION_NUMBER > SLURM_VERSION_NUM(25,5,0)
+	if (select_g_init() != SLURM_SUCCESS)
+#else
+	// In 25.05.0 the only_default argument was removed from select_g_init()
 	if (select_g_init(1) != SLURM_SUCCESS)
+#endif
 		fatal("failed to initialize node selection plugin");
 
 	// Initialize GRES info (from slurm.conf)

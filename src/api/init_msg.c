@@ -65,7 +65,6 @@ void slurm_init_job_desc_msg(job_desc_msg_t * job_desc_msg)
 	job_desc_msg->cpus_per_task	= NO_VAL16;
 	job_desc_msg->delay_boot	= NO_VAL;
 	job_desc_msg->group_id = SLURM_AUTH_NOBODY;
-	job_desc_msg->job_id		= NO_VAL;
 	job_desc_msg->kill_on_node_fail = NO_VAL16;
 	job_desc_msg->max_cpus		= NO_VAL;
 	job_desc_msg->max_nodes		= NO_VAL;
@@ -91,6 +90,7 @@ void slurm_init_job_desc_msg(job_desc_msg_t * job_desc_msg)
 	job_desc_msg->shared		= NO_VAL16;
 	job_desc_msg->site_factor	= NO_VAL;
 	job_desc_msg->sockets_per_node	= NO_VAL16;
+	job_desc_msg->step_id = SLURM_STEP_ID_INITIALIZER;
 	job_desc_msg->task_dist		= NO_VAL;
 	job_desc_msg->threads_per_core	= NO_VAL16;
 	job_desc_msg->time_limit	= NO_VAL;
@@ -103,13 +103,12 @@ void slurm_init_job_desc_msg(job_desc_msg_t * job_desc_msg)
 /*
  * slurm_init_update_step_msg - initialize step update message with default
  *	values before calling slurm_update_step()
- * OUT step_msg - step update messasge descriptor
+ * OUT step_msg - step update message descriptor
  */
 extern void slurm_init_update_step_msg (step_update_request_msg_t * step_msg)
 {
 	memset(step_msg, 0, sizeof(step_update_request_msg_t));
-	step_msg->job_id     = NO_VAL;
-	step_msg->step_id    = NO_VAL;
+	step_msg->step_id = SLURM_STEP_ID_INITIALIZER;
 	step_msg->time_limit = NO_VAL;
 }
 
@@ -166,17 +165,6 @@ void slurm_init_update_node_msg (update_node_msg_t * update_node_msg)
 	update_node_msg->node_state = NO_VAL;
 	update_node_msg->resume_after = NO_VAL;
 	update_node_msg->weight = NO_VAL;
-}
-
-/*
- * slurm_init_update_front_end_msg - initialize front_end node update message
- * OUT update_front_end_msg - user defined node descriptor
- */
-void slurm_init_update_front_end_msg (update_front_end_msg_t *
-				      update_front_end_msg)
-{
-	memset(update_front_end_msg, 0, sizeof(update_front_end_msg_t));
-	update_front_end_msg->node_state = NO_VAL;
 }
 
 /*

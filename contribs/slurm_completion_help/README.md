@@ -1,10 +1,8 @@
-slurm-helper
-============
+# slurm-helper
 
 Bunch of helper files for the Slurm resource manager
 
-Vim syntax file
----------------
+## Vim syntax file
 
 The Vim syntax file renders the Slurm batch submission scripts easier to read and to spot errors in the submission options.
 
@@ -12,7 +10,7 @@ As submission scripts are indeed shell scripts, and all Slurm options are actual
 
 This syntax file allows vim to understand the Slurm option and highlight them accordingly. Whenever possible, the syntax rules check the validity of the options and put in a special color what is not recognized as a valid option, or valid parameters values.
 
-__Installation__
+### Installation
 
 Under Linux or MacOS, simply copy the file in the directory
 
@@ -20,13 +18,9 @@ Under Linux or MacOS, simply copy the file in the directory
 
 or whatever shell other than ``sh`` you prefer.
 
-For system wide use with bash put the file in
-
-    /etc/bash_completion.d/
-
 The syntax file is then read and applied on a Shell script after the usual syntax file has been processed.
 
-__Known issues__
+### Known issues
 
 * Some regex needed to validate options or parameter values are not exactly correct, but should work in most cases.
   * Currently, value completions do not support complex types (e.g. `param=key0:val0,key1:val1,`).
@@ -36,62 +30,88 @@ __Known issues__
   after a tab.
   Based on http://askubuntu.com/questions/33440/tab-completion-doesnt-work-for-commands you need to alter your /etc/bash.bashrc to make this work correctly.
 
-Bash completion
----------------
+## Bash completion
 
 The Bash completion script offers <TAB> completion for Slurm commands.
 
-__Instalation__
+### Installation
 
-Source the [`slurm_completion.sh`](./__slurm_completion.sh) script. It is
-recommended to automate this by adding a bash sourcing line to your
-`.bashrc` or `.profile`.
+You must have the `bash-completion` package installed for the script to work properly.
+
+There are a number of ways to configure and install bash completions for Slurm. Please refer to
+[`bash-completion`](https://github.com/scop/bash-completion) for general information.
+
+Enable for all users:
+
+- Install Slurm contribs:
+  ```bash
+  ./configure
+  sudo make install-contrib
+- Install just `contribs/slurm_completion_help`
+  ```bash
+  ./configure
+  cd contribs/slurm_completion_help
+  sudo make install
+  ```
+- Build and install certain Slurm from RPM or DEB packages.
+  - DEB: install `slurm-smd-client_[0-9]*.deb`
+  - RPM: install `slurm_[0-9]*.rpm`
+
+Enable for one user:
+
+- Copy [slurm_completion.sh][slurm-completion] into `$HOME/.local/share/bash-completion/completions`, and
+  symbolic link each supported Slurm command to [slurm_completion.sh][slurm-completion]:
+  ```bash
+  for cmd in sacct sacctmgr salloc sattach sbatch sbcast scancel scontrol scrontab sdiag sinfo slurmrestd sprio squeue sreport srun sshare sstat strigger; do
+    ln -sf "$HOME"/.local/share/bash-completion/completions/{slurm_completion.sh,"$cmd"};
+  done
+  ```
+- Copy [slurm_completion.sh][slurm-completion] into `$HOME`, and add a line to source it in `$HOME/.bashrc`:
+  ```bash
+  cp contribs/slurm_completion_help/slurm_completion.sh $HOME/slurm_completion.sh
+  echo ". $HOME/slurm_completion.sh" >>~/.bashrc
+  ```
 
 Additionally, there are a number of environment variables that can be set to
 alter/customize completion behavior. They are documented in
-[`slurm_completion.sh`](./__slurm_completion.sh).
+[slurm_completion.sh][slurm-completion].
 
-```sh
-# .bashrc
-source /path/to/slurm_completion.sh
-```
-
-__Examples__
+### Examples
 
 ```sh
 $ sacct --<tab><tab>
 --accounts=       --endtime=        --local           --state=
 --allclusters     --env-vars        --long            --timelimit-max=
 --allocations     --federation      --name=           --timelimit-min=
---allusers        --fields=         --ncpus=          --truncate 
+--allusers        --fields=         --ncpus=          --truncate
 --associations=   --file=           --nnodes=         --uid=
 --autocomplete=   --flags=          --noconvert       --units=
---batch-script    --format=         --nodelist=       --usage 
---brief           --gid=            --noheader        --use-local-uid 
+--batch-script    --format=         --nodelist=       --usage
+--brief           --gid=            --noheader        --use-local-uid
 --cluster=        --group=          --parsable        --user=
---clusters=       --help            --parsable2       --verbose 
---completion      --help-fields     --partition=      --version 
+--clusters=       --help            --parsable2       --verbose
+--completion      --help-fields     --partition=      --version
 --constraints=    --helpformat      --qos=            --wckeys=
 --delimiter=      --jobs=           --reason=         --whole-hetjob=
---duplicates      --json            --starttime=      --yaml 
+--duplicates      --json            --starttime=      --yaml
 ```
 
 ```sh
 $ squeue --<tab><tab>
 --accounts=      --hide           --nodelist=      --states=
 --all            --iterate=       --nodes=         --steps=
---array          --jobs=          --noheader       --usage 
+--array          --jobs=          --noheader       --usage
 --array-unique   --json           --partitions=    --user=
 --autocomplete=  --licenses=      --priority       --users=
---cluster=       --local          --qos=           --verbose 
---clusters=      --long           --reservation=   --version 
---federation     --me             --sib            --yaml 
---format=        --name=          --sibling        
---Format=        --noconvert      --sort=          
---help           --node=          --start          
+--cluster=       --local          --qos=           --verbose
+--clusters=      --long           --reservation=   --version
+--federation     --me             --sib            --yaml
+--format=        --name=          --sibling
+--Format=        --noconvert      --sort=
+--help           --node=          --start
 
 $ squeue --users=<tab><tab>
-root,    slurm,    user0,    user1,    user2,    user3,  
+root,    slurm,    user0,    user1,    user2,    user3,
 
 $ squeue --Format=<tab><tab>
 Display all 118 possibilities? (y or n)
@@ -123,27 +143,27 @@ cpus-per-task,      originraw,          timeleft,
 
 ```sh
 $ scontrol <tab><tab>
-abort               pidinfo             shutdown 
-cancel_reboot       ping                suspend 
-cluster             reboot              takeover 
-completing          reconfigure         token 
-create              release             top 
-delete              requeue             uhold 
-errnumstr           requeuehold         update 
-fsdampeningfactor   resume              version 
-help                schedloglevel       wait_job 
-hold                setdebug            write 
-listpids            setdebugflags       
-notify              show                
+abort               pidinfo             shutdown
+cancel_reboot       ping                suspend
+cluster             reboot              takeover
+completing          reconfigure         token
+create              release             top
+delete              requeue             uhold
+errnumstr           requeuehold         update
+fsdampeningfactor   resume              version
+help                schedloglevel       wait_job
+hold                setdebug            write
+listpids            setdebugflags
+notify              show
 
 $ scontrol update <tab><tab>
-frontendname=     nodename=         reservationname=  
-jobid=            partitionname=    stepid=           
+frontendname=     nodename=         reservationname=
+jobid=            partitionname=    stepid=
 
 $ scontrol update nodename=node<tab><tab>
 node00,  node03,  node06,  node09,  node12,  node15,  node18,
 node01,  node04,  node07,  node10,  node13,  node16,  node19,
-node02,  node05,  node08,  node11,  node14,  node17,  
+node02,  node05,  node08,  node11,  node14,  node17,
 
 $ scontrol update nodename=node00 <tab><tab>
 activefeatures=     extra=              nodename=
@@ -152,8 +172,11 @@ comment=            nodeaddr=           state=
 cpubind=            nodehostname=       weight=
 
 $ scontrol update nodename=node00 state=<tab><tab>
-cancel_reboot      future             power_down_asap    undrain 
-down               idle               power_down_force   
-drain              noresp             power_up           
-fail               power_down         resume             
+cancel_reboot      future             power_down_asap    undrain
+down               idle               power_down_force
+drain              noresp             power_up
+fail               power_down         resume
 ```
+
+<!-- Links -->
+[slurm-completion]: ./slurm_completion.sh

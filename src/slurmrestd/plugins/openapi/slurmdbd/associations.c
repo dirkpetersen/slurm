@@ -45,7 +45,7 @@
 static void _dump_assoc_cond(ctxt_t *ctxt, slurmdb_assoc_cond_t *cond,
 			     bool only_one)
 {
-	List assoc_list = NULL;
+	list_t *assoc_list = NULL;
 
 	if (!db_query_list(ctxt, &assoc_list, slurmdb_associations_get, cond) &&
 	    (only_one && (list_count(assoc_list) > 1))) {
@@ -63,7 +63,7 @@ static void _delete_assoc(ctxt_t *ctxt, slurmdb_assoc_cond_t *assoc_cond,
 			  bool only_one)
 {
 	int rc = SLURM_SUCCESS;
-	List removed = NULL;
+	list_t *removed = NULL;
 
 	rc = db_query_list(ctxt, &removed, slurmdb_associations_remove,
 			   assoc_cond);
@@ -85,8 +85,8 @@ static void _delete_assoc(ctxt_t *ctxt, slurmdb_assoc_cond_t *assoc_cond,
 static void _diff_tres(char **dst, char *mod)
 {
 	list_itr_t *itr;
-	List dst_list = NULL;
-	List mod_list = NULL;
+	list_t *dst_list = NULL;
+	list_t *mod_list = NULL;
 	slurmdb_tres_rec_t *tres;
 
 	if (!*dst || !*dst[0]) {
@@ -96,9 +96,11 @@ static void _diff_tres(char **dst, char *mod)
 		return;
 	}
 
-	slurmdb_tres_list_from_string(&dst_list, *dst, TRES_STR_FLAG_REPLACE);
+	slurmdb_tres_list_from_string(&dst_list, *dst, TRES_STR_FLAG_REPLACE,
+				      NULL);
 	xfree(*dst);
-	slurmdb_tres_list_from_string(&mod_list, mod, TRES_STR_FLAG_REPLACE);
+	slurmdb_tres_list_from_string(&mod_list, mod, TRES_STR_FLAG_REPLACE,
+				      NULL);
 
 	/* find all removed or tres with updated counts */
 	itr = list_iterator_create(dst_list);
@@ -193,7 +195,6 @@ static slurmdb_assoc_rec_t *_diff_assoc(slurmdb_assoc_rec_t *assoc,
 
 
 	/* skip leaf_usage */
-	/* skip lft */
 
 	assoc->max_jobs = dst->max_jobs;
 	assoc->max_jobs_accrue = dst->max_jobs_accrue;
@@ -233,8 +234,6 @@ static slurmdb_assoc_rec_t *_diff_assoc(slurmdb_assoc_rec_t *assoc,
 	if (dst->qos_list)
 		SWAP(assoc->qos_list, dst->qos_list);
 
-	/* skip rgt */
-
 	assoc->shares_raw = dst->shares_raw;
 
 	/* skip uid */
@@ -260,7 +259,7 @@ static int _foreach_update_assoc(void *x, void *arg)
 		.partition_list = list_create(NULL),
 		.user_list = list_create(NULL),
 	};
-	List assoc_list = NULL;
+	list_t *assoc_list = NULL;
 
 	if (assoc->parent_acct && !assoc->parent_acct[0])
 		xfree(assoc->parent_acct);

@@ -37,6 +37,8 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
 \*****************************************************************************/
 
+#define _GNU_SOURCE
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -55,9 +57,16 @@
 #include <unistd.h>
 
 #include "src/common/read_config.h"
+#include "src/common/slurm_protocol_defs.h"
+#include "src/common/xrandom.h"
 
 #if defined(__FreeBSD__) || defined(__NetBSD__)
 #define	SOL_TCP		IPPROTO_TCP
+#endif
+
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__)
+#include <sys/param.h>
+#include <sys/ucred.h>
 #endif
 
 #ifndef NI_MAXHOST
@@ -66,6 +75,8 @@
 #ifndef NI_MAXSERV
 #define NI_MAXSERV 32
 #endif /* NI_MAXSERV */
+
+#define CON_NAME_PLACE_HOLDER_LEN 25
 
 #include "src/common/log.h"
 #include "src/common/macros.h"
@@ -81,7 +92,7 @@
  */
 strong_alias(net_stream_listen,		slurm_net_stream_listen);
 
-/* open a stream socket on an ephemereal port and put it into
+/* open a stream socket on an ephemeral port and put it into
  * the listen state. fd and port are filled in with the new
  * socket's file descriptor and port #.
  *
@@ -146,7 +157,7 @@ extern void net_set_keep_alive(int sock)
  * back in 9.0.
  *
  * Removing this call might decrease the robustness of communications,
- * but will probably have no noticable effect.
+ * but will probably have no noticeable effect.
  */
 #if !defined (__APPLE__) && (! defined(__FreeBSD__) || (__FreeBSD_version > 900000))
 	if (slurm_conf.keepalive_interval != NO_VAL) {
@@ -191,15 +202,34 @@ extern void net_set_keep_alive(int sock)
 #endif
 }
 
-extern void net_set_nodelay(int sock)
+extern int net_set_nodelay(int sock, bool set, const char *con_name)
 {
-	int opt_int = 1;
+	int opt_int;
 
 	if (sock < 0)
-		return;
+		return EBADF;
 
-	if (setsockopt(sock, SOL_TCP, TCP_NODELAY, &opt_int, sizeof(int)) < 0)
-		error("Unable to set TCP_NODELAY: %m");
+	if (set)
+		opt_int = 1;
+	else
+		opt_int = 0;
+
+	if (setsockopt(sock, SOL_TCP, TCP_NODELAY, &opt_int, sizeof(int))) {
+		int rc = errno;
+		char lcon_name[CON_NAME_PLACE_HOLDER_LEN] = {0};
+
+		if (!con_name) {
+			snprintf(lcon_name, sizeof(lcon_name), "fd:%d", sock);
+			con_name = lcon_name;
+		}
+
+		error("[%s] Unable to set TCP_NODELAY: %s",
+		      con_name, slurm_strerror(rc));
+
+		return rc;
+	}
+
+	return SLURM_SUCCESS;
 }
 
 /*
@@ -248,8 +278,7 @@ int net_stream_listen_ports(int *fd, uint16_t *port, uint16_t *ports, bool local
 
 	xassert(num > 0);
 
-	srandom(getpid());
-	*port = min + (random() % num);
+	*port = min + (xrandom() % num);
 
 	slurm_setup_addr(&sin, 0); /* Decide on IPv4 or IPv6 */
 
@@ -309,15 +338,130 @@ int net_stream_listen_ports(int *fd, uint16_t *port, uint16_t *ports, bool local
 	return -1;
 }
 
+static const char *_ip_reserved_to_str(const slurm_addr_t *addr)
+{
+	if (addr->ss_family == AF_INET) {
+		const struct sockaddr_in *addr4 = (struct sockaddr_in *) addr;
+		const in_addr_t ipv4 = addr4->sin_addr.s_addr;
+
+		if (ipv4 == INADDR_LOOPBACK)
+			return "127.0.0.1";
+		else if (ipv4 == INADDR_ANY)
+			return "0.0.0.0";
+		else if (ipv4 == INADDR_BROADCAST)
+			return "255.255.255.255";
+#ifdef INADDR_DUMMY
+		else if (ipv4 == INADDR_DUMMY)
+			return "192.0.0.8";
+#endif /* INADDR_DUMMY */
+	} else if (addr->ss_family == AF_INET6) {
+		const struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *) addr;
+		const struct in6_addr ipv6 = addr6->sin6_addr;
+
+		/*
+		 * RFC5156 Special-Use IPv6 Addresses
+		 * defined by RFC4291 as "::" or "::1" formatted by RFC6874
+		 * referencing RFC3986:
+		 *	IP-literal = "[" ( IPv6address / IPv6addrz / IPvFuture  ) "]"
+		 *
+		 * RFC6874 Appendix A gives representing numeric IPv6address
+		 * with brackets and without as both valid options. Returning
+		 * addresses with brackets to avoid a constructed string with
+		 * [::]:PORT over :::PORT and [::1]:PORT over ::1:PORT while
+		 * both are valid.
+		 */
+		if (IN6_IS_ADDR_UNSPECIFIED(&ipv6)) {
+			return "[::]";
+		} else if (IN6_IS_ADDR_LOOPBACK(&ipv6))
+			return "[::1]";
+	}
+
+	return NULL;
+}
+
+static char *_fmt_ip_host_port_str(const slurm_addr_t *addr, const char *host)
+{
+	/* Include 2 extra bytes for [] for IPv6 */
+	static const size_t max_host_bytes =
+		MAX(INET_ADDRSTRLEN, (INET6_ADDRSTRLEN + 2));
+	char *resp = NULL;
+	char nhost[max_host_bytes];
+	uint16_t port = 0;
+
+	if (addr->ss_family == AF_INET) {
+		const struct sockaddr_in *in = (struct sockaddr_in *) addr;
+
+		port = ntohs(in->sin_port);
+
+		if (!host) {
+			if (inet_ntop(AF_INET, &in->sin_addr, nhost,
+				      sizeof(nhost))) {
+				host = nhost;
+			} else {
+				/* this should never happen */
+				log_flag_hex(NET, addr, sizeof(*addr),
+					     "%s: inet_ntop(AF_INET) failed: %s",
+					     slurm_strerror(errno));
+				return NULL;
+			}
+		}
+	} else if (addr->ss_family == AF_INET6) {
+		const struct sockaddr_in6 *in6 = (struct sockaddr_in6 *) addr;
+
+		port = ntohs(in6->sin6_port);
+
+		if (!host) {
+			if (inet_ntop(AF_INET6, &in6->sin6_addr, (nhost + 1),
+				      (sizeof(nhost) - 2))) {
+				const size_t len = strlen(nhost + 1);
+				/*
+				 * Construct RFC3986 host port pair:
+				 * IP-literal = "[" ( IPv6address / IPvFuture  ) "]"
+				 */
+				nhost[0] = '[';
+				nhost[len + 1] = ']';
+				nhost[len + 2] = '\0';
+				host = nhost;
+			} else {
+				/* this should never happen */
+				log_flag_hex(NET, addr, sizeof(*addr),
+					     "%s: inet_ntop(AF_INET6) failed: %s",
+					     slurm_strerror(errno));
+				return NULL;
+			}
+		}
+	}
+
+	/*
+	 * RFC3986 definitions:
+	 *	host        = IP-literal / IPv4address / reg-name
+	 *	port        = *DIGIT
+	 *	authority   = [ userinfo "@" ] host [ ":" port ]
+	 *
+	 * Where authority obsoletes the prior hostport from RFC2396:
+	 *	hostport    = host [ ":" port ]
+	 */
+	if (host && port)
+		xstrfmtcat(resp, "%s:%hu", host, port);
+	else if (port)
+		xstrfmtcat(resp, ":%hu", port);
+	else if (host)
+		xstrfmtcat(resp, "%s", host);
+
+	return resp;
+}
+
 extern char *sockaddr_to_string(const slurm_addr_t *addr, socklen_t addrlen)
 {
 	int prev_errno = errno;
 	char *resp = NULL;
-	int port = 0;
-	char *host = NULL;
+	const char *rsv_host = NULL;
 
-	if (addr->ss_family == AF_UNSPEC)
+	if (addr->ss_family == AF_UNSPEC) {
+		log_flag(NET, "%s: Cannot resolve socket's unspecified address family.",
+			 __func__);
 		return NULL;
+	}
 
 	if (addr->ss_family == AF_UNIX) {
 		const struct sockaddr_un *addr_un =
@@ -329,24 +473,22 @@ extern char *sockaddr_to_string(const slurm_addr_t *addr, socklen_t addrlen)
 		/* path may not be set */
 		if (addr_un->sun_path[0])
 			return xstrdup_printf("unix:%s", addr_un->sun_path);
-		else
-			return NULL;
+		else if (addr_un->sun_path[1]) /* abstract socket */
+			return xstrdup_printf("unix:@%s",
+					      &addr_un->sun_path[1]);
+		else /* path not defined */
+			return xstrdup_printf("unix:");
 	}
 
-	if (addr->ss_family == AF_INET)
-		port = ((struct sockaddr_in *) addr)->sin_port;
-	else if (addr->ss_family == AF_INET6)
-		port = ((struct sockaddr_in6 *) addr)->sin6_port;
-
-	host = xgetnameinfo((struct sockaddr *) addr, addrlen);
-
-	/* construct RFC3986 host port pair */
-	if (host && port)
-		xstrfmtcat(resp, "[%s]:%d", host, port);
-	else if (port)
-		xstrfmtcat(resp, "[::]:%d", port);
-
-	xfree(host);
+	/* Check for reserved addresses that getnameinfo() won't resolve */
+	if ((rsv_host = _ip_reserved_to_str(addr))) {
+		resp = _fmt_ip_host_port_str(addr, rsv_host);
+	} else {
+		/* Attempt to resolve hostname */
+		char *host = xgetnameinfo(addr);
+		resp = _fmt_ip_host_port_str(addr, host);
+		xfree(host);
+	}
 
 	/*
 	 * Avoid clobbering errno as this function is likely to be used for
@@ -378,4 +520,59 @@ extern slurm_addr_t sockaddr_from_unix_path(const char *path)
 	/* Did not overflow - set family to indicate success */
 	addr.ss_family = AF_UNIX;
 	return addr;
+}
+
+extern int net_get_peer(int fd, uid_t *cred_uid, gid_t *cred_gid,
+			pid_t *cred_pid)
+{
+	/* set all pointers to invalid defaults */
+	*cred_uid = SLURM_AUTH_NOBODY;
+	*cred_gid = SLURM_AUTH_NOBODY;
+	*cred_pid = 0;
+
+#if !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__NetBSD__)
+	struct ucred cred = {
+		.uid = SLURM_AUTH_NOBODY,
+		.gid = SLURM_AUTH_NOBODY,
+		.pid = 0,
+	};
+	socklen_t len = sizeof(cred);
+
+	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len)) {
+		log_flag(NET, "%s: [fd:%d] getsockopt(SO_PEERCRED) failed: %m",
+			 __func__, fd);
+		return ESLURM_AUTH_SOCKET_INVALID_PEER;
+	}
+
+	*cred_uid = cred.uid;
+	*cred_gid = cred.gid;
+	*cred_pid = cred.pid;
+#else
+	struct xucred cred = {
+		.cr_uid = SLURM_AUTH_NOBODY,
+		.cr_groups = { SLURM_AUTH_NOBODY, },
+		.cr_pid = 0,
+	};
+	socklen_t len = sizeof(cred);
+
+	if (getsockopt(fd, 0, LOCAL_PEERCRED, &cred, &len)) {
+		log_flag(NET, "%s: [fd:%d] getsockopt(SO_PEERCRED) failed: %m",
+			 __func__, fd);
+		return ESLURM_AUTH_SOCKET_INVALID_PEER;
+	}
+
+	*cred_uid = cred.cr_uid;
+	*cred_gid = cred.cr_groups[0];
+	*cred_pid = cred.cr_pid;
+#endif
+
+	/* Sanity check returned creds */
+
+	/* special user/group nobody is never allowed to authenticate */
+	if (*cred_uid == SLURM_AUTH_NOBODY)
+		return ESLURM_AUTH_NOBODY;
+	if (*cred_gid == SLURM_AUTH_NOBODY)
+		return ESLURM_AUTH_NOBODY;
+
+	return SLURM_SUCCESS;
 }

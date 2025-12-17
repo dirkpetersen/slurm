@@ -1,9 +1,6 @@
-#
-
 AUTOMAKE_OPTIONS = foreign
-CLEANFILES = core.*
 
-AM_CPPFLAGS = -I$(top_srcdir) $(CRAY_JOB_CPPFLAGS)
+AM_CPPFLAGS = -I$(top_srcdir)
 
 bin_PROGRAMS = srun
 
@@ -33,7 +30,7 @@ force:
 $(srun_DEPENDENCIES) : force
 	@cd `dirname $@` && $(MAKE) `basename $@`
 
-install-exec-local:
+install-exec-hook:
 	umask 022; \
 	if [ -x /usr/lib/rpm/debugedit ]; then \
 	  srcdir=`cd $(top_srcdir) && pwd`; \
@@ -47,4 +44,3 @@ install-exec-local:
 # module so that a debugger can debugger to spawned tasks
 debugger.o : debugger.c
 	$(COMPILE) -c -g -o debugger.o $(srcdir)/debugger.c
-

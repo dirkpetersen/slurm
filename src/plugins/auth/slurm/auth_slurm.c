@@ -53,35 +53,13 @@
 
 #include "src/plugins/auth/slurm/auth_slurm.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Slurm auth and cred plugin";
 const char plugin_type[] = "auth/slurm";
-const uint32_t plugin_id = AUTH_PLUGIN_SLURM;
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
+/* Required for auth plugins: */
+const uint32_t plugin_id = AUTH_PLUGIN_SLURM;
 const bool hash_enable = true;
 
 bool internal = false;
@@ -107,16 +85,15 @@ static void _run_sack_maybe(void)
 extern int init(void)
 {
 	static bool init_run = false;
-	bool run = false, set = false;
 
 	if (init_run)
 		return SLURM_SUCCESS;
 	init_run = true;
 
-	if (serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))
-		fatal("%s: serializer_g_init() failed", __func__);
+	serializer_required(MIME_TYPE_JSON);
 
-	internal = run_in_daemon(&run, &set, "sackd,slurmd,slurmctld,slurmdbd");
+	internal = run_in_daemon(IS_SACKD | IS_SLURMD | IS_SLURMCTLD |
+				 IS_SLURMDBD);
 
 	if (internal) {
 		debug("running as daemon");
@@ -136,20 +113,23 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	static bool fini_run = false;
 
 	if (fini_run)
-		return SLURM_SUCCESS;
+		return;
 	fini_run = true;
 
 	if (internal) {
-		fini_sack_conmgr();
+		/*
+		 * Do not attempt to remove /run/slurm/sack.socket.
+		 * If multiple daemons are co-located on this node, we may no
+		 * longer be the one that owns that socket, and removing it
+		 * would prevent the current owner from responding.
+		 */
 		fini_internal();
 	}
-
-	return SLURM_SUCCESS;
 }
 
 extern auth_cred_t *auth_p_create(char *auth_info, uid_t r_uid, void *data,
@@ -245,23 +225,42 @@ extern int auth_p_pack(auth_cred_t *cred, buf_t *buf,
 	return SLURM_SUCCESS;
 }
 
-extern auth_cred_t *auth_p_unpack(buf_t *buf, uint16_t protocol_version)
+/* Take ownership of token pointer */
+static auth_cred_t *_cred(char *token, const char *username, uid_t uid,
+			  gid_t gid)
 {
 	auth_cred_t *cred = NULL;
-	uint32_t uint32_tmp;
+
+	if (!token || !token[0]) {
+		error("%s: required token not provided", __func__);
+		errno = ESLURM_AUTH_CRED_INVALID;
+		xfree(token);
+		return NULL;
+	}
+
+	/* Allocate a new credential. */
+	cred = new_cred();
+	cred->token = token;
+	cred->uid = uid;
+	cred->gid = gid;
+	return cred;
+}
+
+extern auth_cred_t *auth_p_unpack(buf_t *buf, uint16_t protocol_version)
+{
+	char *token = NULL;
 
 	if (!buf) {
 		errno = ESLURM_AUTH_BADARG;
 		return NULL;
 	}
 
-	cred = new_cred();
-	safe_unpackstr_xmalloc(&cred->token, &uint32_tmp, buf);
+	safe_unpackstr(&token, buf);
 
-	return cred;
+	return _cred(token, NULL, SLURM_AUTH_NOBODY, SLURM_AUTH_NOBODY);
 
 unpack_error:
-	FREE_NULL_CRED(cred);
+	xfree(token);
 	errno = ESLURM_AUTH_UNPACK;
 	return NULL;
 }
@@ -304,4 +303,11 @@ extern void auth_p_thread_clear(void)
 extern char *auth_p_token_generate(const char *username, int lifespan)
 {
 	return NULL;
+}
+
+extern auth_cred_t *auth_p_cred_generate(const char *token,
+					 const char *username, uid_t uid,
+					 gid_t gid)
+{
+	return _cred(xstrdup(token), username, uid, gid);
 }

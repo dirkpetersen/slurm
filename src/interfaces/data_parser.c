@@ -1,5 +1,5 @@
 /*****************************************************************************\
- *  data_t parser plugin interface
+ *  data.h - data_t parser plugin interface
  ******************************************************************************
  *  Copyright (C) SchedMD LLC.
  *
@@ -51,6 +51,7 @@
 
 #define PARSE_MAJOR_TYPE "data_parser"
 #define PARSE_MAGIC 0x0ea0b1be
+#define LATEST_PLUGIN_NAME "latest"
 
 struct data_parser_s {
 	int magic;
@@ -77,7 +78,6 @@ typedef struct {
 		     char *params);
 	void (*free)(void *arg);
 	int (*assign)(void *arg, data_parser_attr_type_t type, void *obj);
-	int (*specify)(void *arg, data_t *dst);
 	openapi_type_t (*resolve_openapi_type)(void *arg,
 					       data_parser_type_t type,
 					       const char *field);
@@ -91,6 +91,9 @@ typedef struct {
 				   void **references_ptr, data_t *dst,
 				   data_t *schemas);
 	void (*release_refs)(void *arg, void **references_ptr);
+	bool (*is_complex)(void *arg);
+	bool (*is_deprecated)(void *arg);
+	int (*dump_flags)(void *arg, data_t *dst);
 } parse_funcs_t;
 
 typedef struct {
@@ -107,13 +110,15 @@ static const char *parse_syms[] = {
 	"data_parser_p_new",
 	"data_parser_p_free",
 	"data_parser_p_assign",
-	"data_parser_p_specify",
 	"data_parser_p_resolve_openapi_type",
 	"data_parser_p_resolve_type_string",
 	"data_parser_p_increment_reference",
 	"data_parser_p_populate_schema",
 	"data_parser_p_populate_parameters",
 	"data_parser_p_release_references",
+	"data_parser_p_is_complex",
+	"data_parser_p_is_deprecated",
+	"data_parser_p_dump_flags",
 };
 
 static plugins_t *plugins = NULL;
@@ -206,6 +211,8 @@ static data_parser_t *_new_parser(data_parser_on_error_t on_parse_error,
 	parser->arg = funcs->new(on_parse_error, on_dump_error, on_query_error,
 				 error_arg, on_parse_warn, on_dump_warn,
 				 on_query_warn, warn_arg, params);
+	xstrfmtcat(parser->plugin_string, "%s%s", parser->plugin_type,
+		   (parser->params ? parser->params : ""));
 	END_TIMER2(__func__);
 
 	slurm_mutex_lock(&init_mutex);
@@ -243,6 +250,11 @@ static plugin_param_t *_parse_plugin_type(const char *plugin_type)
 			p->plugin_type = xstrdup(type);
 		}
 
+		if (!xstrcasecmp(p->plugin_type, LATEST_PLUGIN_NAME)) {
+			xfree(p->plugin_type);
+			p->plugin_type = xstrdup(SLURM_DATA_PARSER_VERSION);
+		}
+
 		log_flag(DATA, "%s: plugin=%s params=%s",
 		       __func__, p->plugin_type, p->params);
 
@@ -265,8 +277,7 @@ static int _load_plugins(plugin_param_t *pparams, plugrack_foreach_t listf,
 
 	slurm_mutex_lock(&init_mutex);
 
-	if ((rc = serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL)))
-		fatal("JSON plugin loading failed: %s", slurm_strerror(rc));
+	serializer_required(MIME_TYPE_JSON);
 
 	xassert(sizeof(parse_funcs_t) ==
 		(sizeof(void *) * ARRAY_SIZE(parse_syms)));
@@ -290,7 +301,7 @@ static int _load_plugins(plugin_param_t *pparams, plugrack_foreach_t listf,
 
 static int _find_plugin_by_type(const char *plugin_type)
 {
-	if (!plugin_type)
+	if (!plugin_type || !plugins)
 		return -1;
 
 	/* quick match by pointer address */
@@ -457,7 +468,7 @@ cleanup:
 		xfree(pparams);
 	}
 
-	if (plugins)
+	if (plugins && parsers)
 		for (int j = 0; j < plugins->count; j++)
 			FREE_NULL_DATA_PARSER(parsers[j]);
 	xfree(parsers);
@@ -471,14 +482,6 @@ extern const char *data_parser_get_plugin(data_parser_t *parser)
 		return NULL;
 
 	xassert(parser->magic == PARSE_MAGIC);
-
-	/*
-	 * Generate string as requested using full plugin type where the
-	 * original request may not having included data_parser/
-	 */
-	if (!parser->plugin_string)
-		xstrfmtcat(parser->plugin_string, "%s%s", parser->plugin_type,
-			   (parser->params ? parser->params : ""));
 
 	return parser->plugin_string;
 }
@@ -595,12 +598,10 @@ extern int data_parser_g_assign(data_parser_t *parser,
 }
 
 extern openapi_resp_meta_t *data_parser_cli_meta(int argc, char **argv,
-						 const char *mime_type,
-						 const char *data_parser)
+						 const char *mime_type)
 {
 	openapi_resp_meta_t *meta = xmalloc_nz(sizeof(*meta));
 	int tty;
-	char *parser = NULL;
 	char **argvnt = NULL;
 
 	/* need a new array with a NULL terminator */
@@ -618,14 +619,11 @@ extern openapi_resp_meta_t *data_parser_cli_meta(int argc, char **argv,
 	else
 		tty = -1;
 
-	if (data_parser)
-		parser = xstrdup(data_parser);
-
 	*meta = (openapi_resp_meta_t) {
 		.plugin = {
-			.data_parser = parser,
+			.data_parser = NULL,
 			.accounting_storage =
-				slurm_conf.accounting_storage_type,
+				xstrdup(slurm_conf.accounting_storage_type),
 		},
 		.command = argvnt,
 		.client = {
@@ -651,7 +649,7 @@ extern openapi_resp_meta_t *data_parser_cli_meta(int argc, char **argv,
 static void _plugrack_foreach_list(const char *full_type, const char *fq_path,
 				   const plugin_handle_t id, void *arg)
 {
-	info("%s", full_type);
+	dprintf(STDOUT_FILENO, "%s\n", full_type);
 }
 
 static bool _on_error(void *arg, data_parser_type_t type, int error_code,
@@ -762,7 +760,7 @@ extern int data_parser_dump_cli_stdout(data_parser_type_t type, void *obj,
 	char *out = NULL;
 
 	if (!xstrcasecmp(data_parser, "list")) {
-		info("Possible data_parser plugins:");
+		dprintf(STDERR_FILENO, "Possible data_parser plugins:\n");
 		parser = data_parser_g_new(NULL, NULL, NULL, NULL, NULL, NULL,
 					   NULL, NULL, "list",
 					   _plugrack_foreach_list, false);
@@ -781,16 +779,20 @@ extern int data_parser_dump_cli_stdout(data_parser_type_t type, void *obj,
 		data_parser_g_assign(parser, DATA_PARSER_ATTR_DBCONN_PTR,
 				     acct_db_conn);
 
-	if (!meta->plugin.data_parser)
-		meta->plugin.data_parser =
-			xstrdup(data_parser_get_plugin(parser));
+	xassert(!meta->plugin.data_parser);
+	meta->plugin.data_parser = xstrdup(data_parser_get_plugin(parser));
 
 	dresp = data_new();
 
 	if (!data_parser_g_dump(parser, type, obj, obj_bytes, dresp) &&
 	    (data_get_type(dresp) != DATA_TYPE_NULL)) {
+		serializer_flags_t sflags = SER_FLAGS_NONE;
+
+		if (data_parser_g_is_complex(parser))
+			sflags |= SER_FLAGS_COMPLEX;
+
 		serialize_g_data_to_string(&out, NULL, dresp, mime_type,
-					   SER_FLAGS_PRETTY);
+					   sflags);
 	}
 
 	if (out && out[0])
@@ -799,42 +801,28 @@ extern int data_parser_dump_cli_stdout(data_parser_type_t type, void *obj,
 		debug("No output generated");
 
 cleanup:
+	/*
+	 * This is only called from the CLI just before exiting.
+	 * Skip the explicit free here to improve responsiveness.
+	 */
+#ifdef MEMORY_LEAK_DEBUG
 	xfree(out);
 	FREE_NULL_DATA(dresp);
 	FREE_NULL_DATA_PARSER(parser);
-
-	return rc;
-}
-
-extern int data_parser_g_specify(data_parser_t *parser, data_t *dst)
-{
-	int rc;
-	DEF_TIMERS;
-	const parse_funcs_t *funcs;
-
-	if (!parser)
-		return ESLURM_DATA_INVALID_PARSER;
-
-	funcs = plugins->functions[parser->plugin_offset];
-
-	xassert(parser);
-	xassert(plugins);
-	xassert(parser->magic == PARSE_MAGIC);
-	xassert(parser->plugin_offset < plugins->count);
-
-	START_TIMER;
-	rc = funcs->specify(parser->arg, dst);
-	END_TIMER2(__func__);
+#endif
 
 	return rc;
 }
 
 extern data_parser_t *data_parser_cli_parser(const char *data_parser, void *arg)
 {
+	char *default_data_parser = (slurm_conf.data_parser_parameters ?
+				     slurm_conf.data_parser_parameters :
+				     SLURM_DATA_PARSER_VERSION);
 	return data_parser_g_new(_on_error, _on_error, _on_error, arg, _on_warn,
 				 _on_warn, _on_warn, arg,
 				 (data_parser ?  data_parser :
-				  SLURM_DATA_PARSER_VERSION), NULL, false);
+				  default_data_parser), NULL, false);
 }
 
 extern openapi_type_t data_parser_g_resolve_openapi_type(
@@ -945,4 +933,52 @@ extern void data_parser_g_release_references(data_parser_t *parser,
 	xassert(parser->plugin_offset < plugins->count);
 
 	return funcs->release_refs(parser->arg, references_ptr);
+}
+
+extern bool data_parser_g_is_complex(data_parser_t *parser)
+{
+	const parse_funcs_t *funcs;
+
+	if (!parser)
+		return false;
+
+	funcs = plugins->functions[parser->plugin_offset];
+
+	xassert(parser->magic == PARSE_MAGIC);
+	xassert(parser->plugin_offset < plugins->count);
+
+	return funcs->is_complex(parser->arg);
+}
+
+extern bool data_parser_g_is_deprecated(data_parser_t *parser)
+{
+	const parse_funcs_t *funcs;
+
+	if (!parser)
+		return true;
+
+	funcs = plugins->functions[parser->plugin_offset];
+
+	xassert(parser->magic == PARSE_MAGIC);
+	xassert(parser->plugin_offset < plugins->count);
+
+	return funcs->is_deprecated(parser->arg);
+}
+
+extern int data_parser_g_dump_flags(data_parser_t *parser, data_t *dst)
+{
+	const parse_funcs_t *funcs;
+
+	if (!parser)
+		return EINVAL;
+
+	xassert(data_get_type(dst));
+	xassert(parser->magic == PARSE_MAGIC);
+	xassert(plugins && (plugins->magic == PLUGINS_MAGIC));
+	xassert(parser->plugin_offset < plugins->count);
+	xassert(plugins->functions[parser->plugin_offset]);
+
+	funcs = plugins->functions[parser->plugin_offset];
+
+	return funcs->dump_flags(parser->arg, dst);
 }

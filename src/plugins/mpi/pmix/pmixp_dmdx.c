@@ -80,7 +80,7 @@ void _dmdx_free_caddy(dmdx_caddy_t *caddy)
 	xfree(caddy);
 }
 
-static List _dmdx_requests;
+static list_t *_dmdx_requests;
 static uint32_t _dmdx_seq_num = 1;
 
 static void _respond_with_error(int seq_num, int nodeid,
@@ -322,7 +322,7 @@ static void _dmdx_req(buf_t *buf, int nodeid, uint32_t seq_num)
 		goto exit;
 	}
 
-	/* setup temp structure to handle information fro _dmdx_pmix_cb */
+	/* setup temp structure to handle information from _dmdx_pmix_cb */
 	caddy = xmalloc(sizeof(dmdx_caddy_t));
 	caddy->seq_num = seq_num;
 

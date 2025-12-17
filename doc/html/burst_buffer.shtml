@@ -133,7 +133,8 @@ for more information.</li>
 <li>The JSON-C library must be installed in order to build Slurm's
 <code>burst_buffer/datawarp</code> and <code>burst_buffer/lua</code> plugins,
 which must parse JSON format data. See Slurm's
-<a href="download.html#json">JSON installation information</a> for details.</li>
+<a href="related_software.html#json">JSON installation information</a> for
+details.</li>
 </ul>
 
 <h3 id="datawarp_config">Datawarp
@@ -883,7 +884,5 @@ for each job it reads the burst buffer state and does one of the following:</li>
 <p><b>NOTE</b>: There are many other things not listed here that affect the job
 state. This document focuses on burst buffers and does not attempt to address
 all possible job state transitions.</p>
-
-<p style="text-align:center;">Last modified 21 August 2023</p>
 
 <!--#include virtual="footer.txt"-->

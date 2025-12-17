@@ -246,7 +246,7 @@ scontrol_hold(char *op, char *job_str)
 		while ((job_msg.job_id_str = _next_job_id())) {
 			rc2 = slurm_update_job2(&job_msg, &resp);
 			if (rc2 != SLURM_SUCCESS) {
-				rc2 = slurm_get_errno();
+				rc2 = errno;
 				rc = MAX(rc, rc2);
 				exit_code = 1;
 				if (quiet_flag != 1) {
@@ -286,7 +286,7 @@ scontrol_hold(char *op, char *job_str)
 		} else {
 			exit_code = 1;
 			rc = ESLURM_INVALID_JOB_ID;
-			slurm_seterrno(rc);
+			errno = rc;
 			if (quiet_flag != 1) {
 				fprintf(stderr, "%s for job %s\n",
 					slurm_strerror(rc), job_str);
@@ -299,7 +299,7 @@ scontrol_hold(char *op, char *job_str)
 	}
 
 	if (last_job_id != job_id) {
-		if (scontrol_load_job(&jobs, job_id)) {
+		if (scontrol_load_job(&jobs, 0, job_id)) {
 			if (quiet_flag == -1)
 				slurm_perror ("slurm_load_job error");
 			return 1;
@@ -316,7 +316,7 @@ scontrol_hold(char *op, char *job_str)
 		if (!IS_JOB_PENDING(job_ptr)) {
 			if (job_ptr->array_task_id != NO_VAL)
 				continue;
-			slurm_seterrno(ESLURM_JOB_NOT_PENDING);
+			errno = ESLURM_JOB_NOT_PENDING;
 			rc = MAX(rc, ESLURM_JOB_NOT_PENDING);
 		}
 
@@ -329,12 +329,12 @@ scontrol_hold(char *op, char *job_str)
 				   job_ptr->array_job_id,
 				   job_ptr->array_task_id);
 		} else {
-			xstrfmtcat(job_id_str, "%u", job_ptr->job_id);
+			xstrfmtcat(job_id_str, "%u", job_ptr->step_id.job_id);
 		}
 		job_msg.job_id_str = job_id_str;
 		rc2 = slurm_update_job2(&job_msg, &resp);
 		if (rc2 != SLURM_SUCCESS) {
-			rc2 = slurm_get_errno();
+			rc2 = errno;
 			rc = MAX(rc, rc2);
 			exit_code = 1;
 			if (quiet_flag != 1) {
@@ -394,7 +394,7 @@ scontrol_suspend(char *op, char *job_str)
 				exit_code = 1;
 				if (quiet_flag != 1) {
 					fprintf(stderr, "%s for job %s\n",
-						slurm_strerror(slurm_get_errno()),
+						slurm_strerror(errno),
 						job_id_str);
 				}
 			} else if (resp) {
@@ -418,7 +418,7 @@ scontrol_suspend(char *op, char *job_str)
 	} else {
 		exit_code = 1;
 		rc = ESLURM_INVALID_JOB_ID;
-		slurm_seterrno(rc);
+		errno = rc;
 		if (quiet_flag != 1) {
 			fprintf(stderr, "%s for job %s\n",
 				slurm_strerror(rc), job_str);
@@ -455,7 +455,7 @@ scontrol_requeue(uint32_t flags, char *job_str)
 				exit_code = 1;
 				if (quiet_flag != 1) {
 					fprintf(stderr, "%s for job %s\n",
-						slurm_strerror(slurm_get_errno()),
+						slurm_strerror(errno),
 						job_id_str);
 				}
 			} else if (resp) {
@@ -479,7 +479,7 @@ scontrol_requeue(uint32_t flags, char *job_str)
 	} else {
 		exit_code = 1;
 		rc = ESLURM_INVALID_JOB_ID;
-		slurm_seterrno(rc);
+		errno = rc;
 		if (quiet_flag != 1) {
 			fprintf(stderr, "%s for job %s\n",
 				slurm_strerror(rc), job_str);
@@ -504,7 +504,7 @@ scontrol_requeue_hold(uint32_t flags, char *job_str)
 				exit_code = 1;
 				if (quiet_flag != 1) {
 					fprintf(stderr, "%s for job %s\n",
-						slurm_strerror(slurm_get_errno()),
+						slurm_strerror(errno),
 						job_id_str);
 				}
 			} else if (resp) {
@@ -528,7 +528,7 @@ scontrol_requeue_hold(uint32_t flags, char *job_str)
 	} else {
 		exit_code = 1;
 		rc = ESLURM_INVALID_JOB_ID;
-		slurm_seterrno(rc);
+		errno = rc;
 		if (quiet_flag != 1) {
 			fprintf(stderr, "%s for job %s\n",
 				slurm_strerror(rc), job_str);
@@ -556,7 +556,7 @@ scontrol_top_job(char *job_id_str)
 		exit_code = 1;
 		if (quiet_flag != 1) {
 			fprintf(stderr, "%s for job %s\n",
-				slurm_strerror(slurm_get_errno()), job_id_str);
+				slurm_strerror(errno), job_id_str);
 		}
 	}
 }
@@ -619,18 +619,9 @@ extern int scontrol_update_job(int argc, char **argv)
 			job_msg.job_id_str = val;
 		} else if (!xstrncasecmp(tag, "AdminComment", MAX(taglen, 6))) {
 			if (add_info) {
-				if (add_info[0] == '-') {
-					error("Invalid syntax, AdminComment can not be subtracted from.");
-					exit_code = 1;
-					return 0;
-				}
-				job_msg.admin_comment = add_info;
-				/*
-				 * Mark as unset so we know we handled this
-				 * correctly as there is a check later to make
-				 * sure we know we got a +-.
-				 */
-				add_info = NULL;
+				error("Invalid syntax, AdminComment can not be added/subtracted from.");
+				exit_code = 1;
+				return 0;
 			} else
 				job_msg.admin_comment = val;
 			update_cnt++;
@@ -1062,7 +1053,7 @@ extern int scontrol_update_job(int argc, char **argv)
 			update_cnt++;
 		} else if (!xstrncasecmp(tag, "UserID", MAX(taglen, 3))) {
 			uid_t user_id = SLURM_AUTH_NOBODY;
-			if (uid_from_string(val, &user_id) < 0) {
+			if (uid_from_string(val, &user_id) != SLURM_SUCCESS) {
 				exit_code = 1;
 				fprintf (stderr, "Invalid UserID: %s\n", val);
 				fprintf (stderr, "Request aborted\n");
@@ -1086,6 +1077,9 @@ extern int scontrol_update_job(int argc, char **argv)
 			update_cnt++;
 		} else if (!xstrncasecmp(tag, "MailUser", MAX(taglen, 5))) {
 			job_msg.mail_user = val;
+			update_cnt++;
+		} else if (!xstrncasecmp(tag, "MCSLabel", MAX(taglen, 4))) {
+			job_msg.mcs_label = val;
 			update_cnt++;
 		} else {
 			exit_code = 1;
@@ -1139,16 +1133,17 @@ extern int scontrol_update_job(int argc, char **argv)
 			rc2 = slurm_update_job2(&job_msg, &resp);
 			if (update_size && (rc2 == SLURM_SUCCESS)) {
 				/* See check above for one job ID */
-				job_msg.job_id = slurm_atoul(job_msg.job_id_str);
-				_update_job_size(job_msg.job_id);
+				job_msg.step_id.job_id =
+					slurm_atoul(job_msg.job_id_str);
+				_update_job_size(job_msg.step_id.job_id);
 			}
 			if (rc2 != SLURM_SUCCESS) {
-				rc2 = slurm_get_errno();
+				rc2 = errno;
 				rc = MAX(rc, rc2);
 				exit_code = 1;
 				if (quiet_flag != 1) {
 					fprintf(stderr, "%s for job %s\n",
-						slurm_strerror(slurm_get_errno()),
+						slurm_strerror(errno),
 						job_msg.job_id_str);
 				}
 			} else if (resp) {
@@ -1185,7 +1180,7 @@ extern int scontrol_update_job(int argc, char **argv)
 	} else if (job_msg.job_id_str) {
 		exit_code = 1;
 		rc = ESLURM_INVALID_JOB_ID;
-		slurm_seterrno(rc);
+		errno = rc;
 		if (quiet_flag != 1) {
 			fprintf(stderr, "%s for job %s\n",
 				slurm_strerror(rc), job_msg.job_id_str);
@@ -1223,7 +1218,7 @@ extern int scontrol_job_notify(int argc, char **argv)
 	xfree(message);
 
 	if (i)
-		return slurm_get_errno ();
+		return errno;
 	else
 		return 0;
 }
@@ -1239,7 +1234,7 @@ static void _update_job_size(uint32_t job_id)
 
 	if (slurm_allocation_lookup(job_id, &alloc_info) !=
 	    SLURM_SUCCESS) {
-		if (slurm_get_errno() != ESLURM_ALREADY_DONE) {
+		if (errno != ESLURM_ALREADY_DONE) {
 			slurm_perror("slurm_allocation_lookup");
 			return;
 		}
@@ -1402,7 +1397,7 @@ static uint32_t _get_job_time(const char *job_id_str)
 			return time_limit;
 		}
 		for (i = 0; i < resp->record_count; i++) {
-			if ((resp->job_array[i].job_id == job_id) &&
+			if ((resp->job_array[i].step_id.job_id == job_id) &&
 			    (resp->job_array[i].array_task_id == NO_VAL) &&
 			    (resp->job_array[i].array_bitmap == NULL)) {
 				/* Regular job match */
@@ -1486,7 +1481,7 @@ static char *_job_name2id(char *job_name, uint32_t job_uid)
 
 	xassert(job_name);
 
-	rc = scontrol_load_job(&resp, 0);
+	rc = scontrol_load_job(&resp, 0, 0);
 	if (rc == SLURM_SUCCESS) {
 		if (resp->record_count == 0) {
 			error("JobName %s not found", job_name);
@@ -1506,7 +1501,7 @@ static char *_job_name2id(char *job_name, uint32_t job_uid)
 					   job_ptr->array_task_id);
 			} else {
 				xstrfmtcat(job_id_str, "%s%u", sep,
-					   job_ptr->job_id);
+					   job_ptr->step_id.job_id);
 			}
 			sep = ",";
 		}

@@ -51,6 +51,8 @@ typedef struct job_queue_rec {
 	part_record_t *part_ptr;	/* Pointer to partition record. Each
 					 * job may have multiple partitions. */
 	uint32_t priority;		/* Job priority in THIS partition */
+	slurmdb_qos_rec_t *qos_ptr; /* Pointer to the qos record. Each
+				     * job may have requested multiple QOS. */
 	slurmctld_resv_t *resv_ptr;     /* If job didn't ask for a reservation,
 					 * this reservation is one it can run
 					 * in without requesting */
@@ -129,7 +131,8 @@ extern void feature_list_delete(void *x);
  * Return a pointer to the dependency in job_ptr's dependency list that
  * matches dep_ptr, or NULL if none is found.
  *
- * A dependency "matches" when the job_id and depend_type are the same.
+ * A dependency "matches" when the array_task_id, job_id and depend_type
+ * are the same.
  */
 extern depend_spec_t *find_dependency(job_record_t *job_ptr,
 				      depend_spec_t *dep_ptr);
@@ -146,7 +149,7 @@ extern int handle_job_dependency_updates(void *object, void *arg);
 
 /*
  * job_is_completing - Determine if jobs are in the process of completing.
- * IN/OUT  eff_cg_bitmap - optional bitmap of all relevent completing nodes,
+ * IN/OUT  eff_cg_bitmap - optional bitmap of all relevant completing nodes,
  *                         relevenace determined by filtering via CompleteWait
  *                         if NULL, function will terminate at first completing
  *                         job
@@ -228,7 +231,7 @@ extern void schedule(bool full_queue);
 extern void set_job_elig_time(void);
 
 /*
- * sort_job_queue - sort job_queue in decending priority order
+ * sort_job_queue - sort job_queue in descending priority order
  * IN/OUT job_queue - sorted job queue previously made by build_job_queue()
  */
 extern void sort_job_queue(list_t *job_queue);
@@ -256,9 +259,13 @@ extern int test_job_dependency(job_record_t *job_ptr, bool *was_changed);
  * new format (e.g. "afterok:123:124,after:128").
  * IN job_ptr - job record to have dependency and depend_list updated
  * IN new_depend - new dependency description
+ * IN is_remote_cluster = if true, then this is a remote cluster. Do not
+ *    discard invalid dependencies. Instead, update the dependency like normal,
+ *    but return an error code.
  * RET returns an error code from slurm_errno.h
  */
-extern int update_job_dependency(job_record_t *job_ptr, char *new_depend);
+extern int update_job_dependency(job_record_t *job_ptr, char *new_depend,
+				 bool is_remote_cluster);
 
 /*
  * new_depend_list is a dependency list that came from a sibling cluster. It

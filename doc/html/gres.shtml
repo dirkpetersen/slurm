@@ -8,6 +8,8 @@
 <li><a href="#Configuration">Configuration</a></li>
 <li><a href="#Running_Jobs">Running Jobs</a></li>
 <li><a href="#AutoDetect">AutoDetect</a></li>
+<li><a href="#Socket_Affinity">Socket Affinity</a></li>
+<li><a href="#Accounting">Accounting</a></li>
 <li><a href="#GPU_Management">GPU Management</a></li>
 <li><a href="#MPS_Management">MPS Management</a></li>
 <li><a href="#MIG_Management">MIG Management</a></li>
@@ -93,7 +95,7 @@ specified by the <I>GresTypes</I> and <I>Gres</I> configuration parameters.
 <I>type</I> identifies a specific type of that generic resource (e.g. a
 specific model of GPU).
 <I>count</I> specifies how many resources are required and has a default
-value of 1. For example:<BR> 
+value of 1. For example:<BR>
 <I>sbatch --gres=gpu:kepler:2 ...</I>.</P>
 
 <p>Requests for typed vs non-typed generic resources must be consistent
@@ -154,15 +156,42 @@ wait
 <a class="slurm_link" href="#AutoDetect"></a>
 </h2>
 
-<p>If <i>AutoDetect=nvml</i>, <i>AutoDetect=rsmi</i>, <i>AutoDetect=nrt</i>,
-or <i>AutoDetect=oneapi</i> are set in <i>gres.conf</i>, configuration details
-will automatically be filled in for any system-detected GPU. This removes the
-need to explicitly configure GPUs in gres.conf, though the <i>Gres=</i> line in
-slurm.conf is still required in order to tell slurmctld how many GRES to expect.
-Note that <i>AutoDetect=nvml</i>, <i>AutoDetect=rsmi</i>, and
-<i>AutoDetect=oneapi</i> need their corresponding GPU management libraries
+<p>If <i>AutoDetect=nvml</i>, <i>AutoDetect=nvidia</i>, <i>AutoDetect=rsmi</i>,
+<i>AutoDetect=nrt</i>, or <i>AutoDetect=oneapi</i> are set in <i>gres.conf</i>,
+configuration details will automatically be filled in for any system-detected
+GPU. This removes the need to explicitly configure GPUs in gres.conf, though the
+<i>Gres=</i> line in slurm.conf is still required in order to tell slurmctld how
+many GRES to expect.</p>
+
+<p>Note that <i>AutoDetect=nvml</i>, <i>AutoDetect=rsmi</i>,
+and <i>AutoDetect=oneapi</i> need their corresponding GPU management libraries
 installed on the node and found during Slurm configuration in order to work.
-</P>
+Both <i>AutoDetect=nvml</i> and <i>AutoDetect=nvidia</i> detect NVIDIA GPUs.
+<i>AutoDetect=nvidia</i> (added in Slurm 24.11) doesn't require the
+nvml library to be installed, but doesn't detect MIGs or NVlinks.</p>
+
+<p>When AutoDetect needs to load a GPU management library as stated above it
+will usually unload this library immediately after the slurmd is started
+allowing other processes to access the library afterwards. This is not the case
+when <i>AcctGatherEnergyType=acct_gather_energy/gpu</i> is set in the
+slurm.conf. In this configuration the slurmd will keep the GPU library specified
+by the AutoDetect option loaded to track GPU energy usage.</p>
+
+<p><i>AutoDetect=nvml</i> and <i>AutoDetect=rsmi</i> also cause the slurmstepd
+to load and hold open the library to perform accounting on GPU usage when the
+associated step has requested a gpu. If you do not want this to happen
+have <i>JobAcctGatherParams=DisableGPUAcct</i> in the slurm.conf.</p>
+
+<p><i>AutoDetect=nvml</i>, <i>AutoDetect=rsmi</i> and <i>AutoDetect=oneapi</i>
+will cause the slurmstepd to load and hold open the library to configure the gpu
+frequency when <i>--gpu-freq</i> is requested with the job.</p>
+
+<p>In the above situations when a GPU management library is held open by a
+process it makes it so any other process can not configure the GPU. If you are
+requiring to make changes in a Prolog or such you will want to not
+have <i>AcctGatherEnergyType=acct_gather_energy/gpu</i> in the slurm.conf. If
+jobs share gpus on the node, you may also need to set
+<i>JobAcctGatherParams=DisableGPUAcct</i> in the slurm.conf.</p>
 
 <P>By default, all system-detected devices are added to the node.
 However, if <i>Type</i> and <i>File</i> in gres.conf match a GPU on
@@ -207,26 +236,14 @@ assumed to be as the configuration says.
 <P>For <i>Type</i> to match a system-detected device, it must either exactly
 match or be a substring of the GPU name reported by slurmd via the AutoDetect
 mechanism. This GPU name will have all spaces replaced with underscores. To see
-the GPU name, set <i>SlurmdDebug=debug2</i> in your slurm.conf and either
-restart or reconfigure <b>slurmd</b> and check the slurmd log. For example,
-with <i>AutoDetect=nvml</i>:</P>
+the detected GPUs and their names, run: <code class="commandline">slurmd -C
+</code>
 
 <PRE>
-debug:  gpu/nvml: init: init: GPU NVML plugin loaded
-debug2: gpu/nvml: _nvml_init: Successfully initialized NVML
-debug:  gpu/nvml: _get_system_gpu_list_nvml: Systems Graphics Driver Version: 450.36.06
-debug:  gpu/nvml: _get_system_gpu_list_nvml: NVML Library Version: 11.450.36.06
-debug2: gpu/nvml: _get_system_gpu_list_nvml: Total CPU count: 6
-debug2: gpu/nvml: _get_system_gpu_list_nvml: Device count: 1
-debug2: gpu/nvml: _get_system_gpu_list_nvml: GPU index 0:
-debug2: gpu/nvml: _get_system_gpu_list_nvml:     Name: geforce_rtx_2060
-debug2: gpu/nvml: _get_system_gpu_list_nvml:     UUID: GPU-g44ef22a-d954-c552-b5c4-7371354534b2
-debug2: gpu/nvml: _get_system_gpu_list_nvml:     PCI Domain/Bus/Device: 0:1:0
-debug2: gpu/nvml: _get_system_gpu_list_nvml:     PCI Bus ID: 00000000:01:00.0
-debug2: gpu/nvml: _get_system_gpu_list_nvml:     NVLinks: -1
-debug2: gpu/nvml: _get_system_gpu_list_nvml:     Device File (minor number): /dev/nvidia0
-debug2: gpu/nvml: _get_system_gpu_list_nvml:     CPU Affinity Range - Machine: 0-5
-debug2: gpu/nvml: _get_system_gpu_list_nvml:     Core Affinity Range - Abstract: 0-5
+$ slurmd -C
+NodeName=node0 ... Gres=gpu:geforce_rtx_2060:1 ...
+Found gpu:geforce_rtx_2060:1 with Autodetect=nvml (Substring of gpu name may be used instead)
+UpTime=...
 </PRE>
 
 <P>In this example, the GPU's name is reported as
@@ -236,6 +253,155 @@ geforce</code>, <code class="commandline">rtx</code>, <code class="commandline">
 2060</code>, <code class="commandline">geforce_rtx_2060</code>, or any other
 substring, and <b>slurmd</b> should be able to match it to the system-detected
 device <code class="commandline">geforce_rtx_2060</code>.
+
+To check your configuration you may run: <code class="commandline">slurmd -G
+</code> This will test and print the gres setup based on the current
+configuration, including any autodetected gres that are being ignored.
+
+<h2 id="Socket_Affinity">Socket Affinity Configuration
+<a class="slurm_link" href="#Socket_Affinity"></a>
+</h2>
+
+<p>Slurm's job scheduler handles GRES affinity on a socket basis internally.
+However, the <I>gres.conf</I> interface allows administrators to specify <code
+class="commandline">Cores</code> for GPU affinity configuration. This creates
+a common misconception that Slurm will respect core-level affinity during job
+scheduling, which it does not and never has. This can lead to issues where job
+allocations and job steps don't align correctly, since job steps examine cores
+while jobs use sockets.</p>
+
+<p>To prevent administrators from specify a core affinity for the device that
+Slurm cannot currently respect, Slurm validates that any specified <code
+class="commandline">Cores</code> align with socket boundaries and will generate
+errors if they do not.</p>
+
+<p>When using <code class="commandline">AutoDetect=nvml</code> or other GPU
+autodetection methods, GPU core affinity is automatically detected based on the
+hardware topology reported by the GPU driver. On many modern systems with
+complex cache hierarchies, the autodetected GPU affinity may not align with
+Slurm's socket boundaries.</p>
+
+<p>When this mismatch occurs, you'll see errors like:</p>
+<pre>
+error: _check_core_range_matches_sock: gres/gpu GRES autodetected core affinity 0-7 on node node0 doesn't match socket boundaries. (Socket 0 is cores 0-1)
+</pre>
+
+<p>The recommended solution is to configure Slurm to align its socket definition
+with the hardware topology using topology parameters such as
+<code class="commandline">l3cache_as_socket</code> or
+<code class="commandline">numa_node_as_socket</code> and changing
+SocketsPerBoard and CoresPerSocket to match.</p>
+
+<p>Before making permanent changes, test how your hardware will be detected with
+the parameter:</p>
+
+<pre>
+$ slurmd -C --parameters=l3cache_as_socket
+NodeName=node0 CPUs=32 Boards=1 SocketsPerBoard=8 CoresPerSocket=2 ThreadsPerCore=2 RealMemory=128762 Parameters=l3cache_as_socket Gres=gpu:nvidia_a100-pcie-40gb:2
+</pre>
+
+<p>This command shows how Slurm will detect the hardware with the parameter
+applied. The socket count and cores per socket may differ from the physical
+hardware, but will match the GPU affinity boundaries. You can compare the
+output with <code class="commandline">nvidia-smi topo -m</code> to verify which
+topology parameter aligns with your GPU affinity.</p>
+
+<p>Add the parameter to your node configuration in <i>slurm.conf</i>. You can
+apply it globally via <code class="commandline">SlurmdParameters</code> or
+per-node using the <code class="commandline">Parameters</code> option:</p>
+
+<pre>
+# Global configuration
+SlurmdParameters=l3cache_as_socket
+
+# Per-node configuration (recommended when only some nodes need this)
+NodeName=node0 CPUs=32 Boards=1 SocketsPerBoard=8 CoresPerSocket=2 ThreadsPerCore=2 Parameters=l3cache_as_socket Gres=gpu:a100:2
+</pre>
+
+<p>With that parameter set, use autodetection in <i>gres.conf</i>:</p>
+
+<pre>
+AutoDetect=nvml
+</pre>
+
+<p>The GPU core affinity will now align with Slurm's socket boundaries, and the
+node should come online without errors.</p>
+
+<p>As an alternative, you can manually specify core affinity in <i>gres.conf</i>
+that aligns with your actual socket boundaries. However, this requires disabling
+autodetect:</p>
+
+<pre>
+# Manually specify cores for each GPU
+NodeName=node0 Autodetect=off Name=gpu Type=a100 File=/dev/nvidia0 Cores=0-15
+NodeName=node0 Autodetect=off Name=gpu Type=a100 File=/dev/nvidia1 Cores=16-31
+</pre>
+
+<p><b>NOTE</b>: Manual configuration must still align with socket boundaries or
+it will be rejected.</p>
+
+<h2 id="Accounting">Accounting
+<a class="slurm_link" href="#Accounting"></a>
+</h2>
+
+<p>GPU memory and GPU utilization can be tracked as
+<a href="https://slurm.schedmd.com/tres.html">TRES</a> for tasks using GPU
+resources. If <code>AccountingStorageTRES=gres/gpu</code> is configured,
+gres/gpumem and gres/gpuutil will automatically be configured and gathered from
+GPU jobs. gres/gpumem and gres/gpuutil can also be set individually when
+gres/gpu is not set.</p>
+
+<p>gres/gpumem and gres/gpuutil are only available for NVIDIA GPUs when using
+<code>AutoDetect=nvml</code>, and AMD GPUs when using
+<code>AutoDetect=rsmi</code>.</p>
+
+<p>NVML does not support utilization metrics for MIGs, so Slurm does not
+provide gpumem or gpuutil accounting for MIG devices. See
+<a href="https://docs.nvidia.com/datacenter/tesla/mig-user-guide/#gpu-utilization-metrics">
+NVIDIA's MIG User Guide</a>.</p>
+
+<p>Here is an example node with two NVIDIA A100 GPUs:</p>
+<pre>
+$ nvidia-smi -L
+GPU 0: NVIDIA A100-PCIE-40GB (UUID: GPU-...)
+GPU 1: NVIDIA A100-PCIE-40GB (UUID: GPU-...)
+</pre>
+
+<p>The following is an excerpt from an example slurm.conf and gres.conf which
+will automatically enable tracking for gres/gpumem and gres/gpuutil.</p>
+
+<p>slurm.conf:</p>
+<pre>
+AccountingStorageTres=gres/gpu
+NodeName=n1 Gres=gpu:a100:2
+</pre>
+
+<p>gres.conf:</p>
+<pre>
+AutoDetect=nvml
+</pre>
+
+<p>Here's an example of a job with two tasks that uses one GPU per task, two
+GPUs total.</p>
+<pre>
+$ srun --tres-per-task=gres/gpu:1 -n2 --gpus=2 --mem=2G gpu_burn
+GPU 0: NVIDIA A100-PCIE-40GB (UUID: GPU-...)
+GPU 0: NVIDIA A100-PCIE-40GB (UUID: GPU-...)
+</pre>
+
+<p>After the job has finished, we can see utilization details of these TRES
+using sacct. Note that there are multiple tasks here and we can use
+TRESUsageIn[Min,Max,Ave,Tot] to examine the "highwater marks" for gpumem and
+gpuutil over all the ranks in the step, as is true for other TRESUsage*
+values:</p>
+<pre>
+$ sacct -j 1277.0 --format=tresusageinave -p
+TRESUsageInAve|
+cpu=00:00:11,energy=0,fs/disk=87613,gres/gpumem=36266M,gres/gpuutil=100,mem=628748K,pages=0,vmem=0|
+$ sacct -j 1277.0 --format=tresusageintot -p
+TRESUsageInTot|
+cpu=00:00:22,energy=0,fs/disk=175227,gres/gpumem=72532M,gres/gpuutil=200,mem=1257496K,pages=0,vmem=0|
+</pre>
 
 <h2 id="GPU_Management">GPU Management
 <a class="slurm_link" href="#GPU_Management"></a>
@@ -626,7 +792,5 @@ which would be the same as if it were a GPU.
 
 <p>Steps with shards have<code class="commandline">SLURM_SHARDS_ON_NODE</code>
 set indicating the number of shards allocated.</p>
-
-<p style="text-align: center;">Last modified 16 February 2024</p>
 
 <!--#include virtual="footer.txt"-->

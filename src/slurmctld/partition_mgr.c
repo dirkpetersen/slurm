@@ -59,11 +59,14 @@
 #include "src/common/part_record.h"
 #include "src/common/slurm_protocol_pack.h"
 #include "src/common/slurm_resource_info.h"
+#include "src/common/state_save.h"
 #include "src/common/uid.h"
 #include "src/common/xstring.h"
 
 #include "src/interfaces/burst_buffer.h"
+#include "src/interfaces/priority.h"
 #include "src/interfaces/select.h"
+#include "src/interfaces/topology.h"
 
 #include "src/slurmctld/gang.h"
 #include "src/slurmctld/groups.h"
@@ -99,7 +102,6 @@ uint16_t part_max_priority = DEF_PART_MAX_PRIORITY;
 static int    _dump_part_state(void *x, void *arg);
 static void   _list_delete_part(void *part_entry);
 static int    _match_part_ptr(void *part_ptr, void *key);
-static buf_t *_open_part_state_file(char **state_file);
 static void   _unlink_free_nodes(bitstr_t *old_bitmap, part_record_t *part_ptr);
 
 static int _calc_part_tres(void *x, void *arg)
@@ -358,9 +360,7 @@ part_record_t *create_ctld_part_record(const char *name)
 int dump_all_part_state(void)
 {
 	/* Save high-water mark to avoid buffer growth with copies */
-	static int high_buffer_size = BUF_SIZE;
-	int error_code = 0, log_fd;
-	char *old_file, *new_file, *reg_file;
+	static uint32_t high_buffer_size = BUF_SIZE;
 	/* Locks: Read partition */
 	slurmctld_lock_t part_read_lock =
 	    { READ_LOCK, NO_LOCK, NO_LOCK, READ_LOCK, NO_LOCK };
@@ -376,60 +376,9 @@ int dump_all_part_state(void)
 	/* write partition records to buffer */
 	lock_slurmctld(part_read_lock);
 	list_for_each_ro(part_list, _dump_part_state, buffer);
-
-	old_file = xstrdup(slurm_conf.state_save_location);
-	xstrcat(old_file, "/part_state.old");
-	reg_file = xstrdup(slurm_conf.state_save_location);
-	xstrcat(reg_file, "/part_state");
-	new_file = xstrdup(slurm_conf.state_save_location);
-	xstrcat(new_file, "/part_state.new");
 	unlock_slurmctld(part_read_lock);
 
-	/* write the buffer to file */
-	lock_state_files();
-	log_fd = creat(new_file, 0600);
-	if (log_fd < 0) {
-		error("Can't save state, error creating file %s, %m",
-		      new_file);
-		error_code = errno;
-	} else {
-		int pos = 0, nwrite = get_buf_offset(buffer), amount, rc;
-		char *data = (char *)get_buf_data(buffer);
-		high_buffer_size = MAX(nwrite, high_buffer_size);
-		while (nwrite > 0) {
-			amount = write(log_fd, &data[pos], nwrite);
-			if ((amount < 0) && (errno != EINTR)) {
-				error("Error writing file %s, %m", new_file);
-				error_code = errno;
-				break;
-			}
-			nwrite -= amount;
-			pos    += amount;
-		}
-
-		rc = fsync_and_close(log_fd, "partition");
-		if (rc && !error_code)
-			error_code = rc;
-	}
-	if (error_code)
-		(void) unlink(new_file);
-	else {			/* file shuffle */
-		(void) unlink(old_file);
-		if (link(reg_file, old_file)) {
-			debug4("unable to create link for %s -> %s: %m",
-			       reg_file, old_file);
-		}
-		(void) unlink(reg_file);
-		if (link(new_file, reg_file)) {
-			debug4("unable to create link for %s -> %s: %m",
-			       new_file, reg_file);
-		}
-		(void) unlink(new_file);
-	}
-	xfree(old_file);
-	xfree(reg_file);
-	xfree(new_file);
-	unlock_state_files();
+	save_buf_to_state("part_state", buffer, &high_buffer_size);
 
 	FREE_NULL_BUFFER(buffer);
 	END_TIMER2(__func__);
@@ -462,29 +411,6 @@ static int _dump_part_state(void *x, void *arg)
 	return 0;
 }
 
-/* Open the partition state save file, or backup if necessary.
- * state_file IN - the name of the state save file used
- * RET the file description to read from or error code
- */
-static buf_t *_open_part_state_file(char **state_file)
-{
-	buf_t *buf;
-
-	*state_file = xstrdup(slurm_conf.state_save_location);
-	xstrcat(*state_file, "/part_state");
-	buf = create_mmap_buf(*state_file);
-	if (!buf) {
-		error("Could not open partition state file %s: %m",
-		      *state_file);
-	} else 	/* Success */
-		return buf;
-
-	error("NOTE: Trying backup partition state save file. Information may be lost!");
-	xstrcat(*state_file, ".old");
-	buf = create_mmap_buf(*state_file);
-	return buf;
-}
-
 /*
  * load_all_part_state - load the partition state from file, recover on
  *	slurmctld restart. execute this after loading the configuration
@@ -511,17 +437,14 @@ extern int load_all_part_state(uint16_t reconfig_flags)
 	}
 
 	/* read the file */
-	lock_state_files();
-	buffer = _open_part_state_file(&state_file);
+	buffer = state_save_open("part_state", &state_file);
 	if (!buffer) {
 		info("No partition state file (%s) to recover",
 		     state_file);
 		xfree(state_file);
-		unlock_state_files();
 		return ENOENT;
 	}
 	xfree(state_file);
-	unlock_state_files();
 
 	safe_unpackstr(&ver_str, buffer);
 	debug3("Version string in part_state header is %s", ver_str);
@@ -639,7 +562,7 @@ extern int load_all_part_state(uint16_t reconfig_flags)
 		xfree(part_ptr->allow_qos);
 		part_ptr->allow_qos = part_rec_state->allow_qos;
 		part_rec_state->allow_qos = NULL;
-		qos_list_build(part_ptr->allow_qos,
+		qos_list_build(part_ptr->allow_qos, false, true,
 			       &part_ptr->allow_qos_bitstr);
 
 		if (part_rec_state->qos_char) {
@@ -650,10 +573,11 @@ extern int load_all_part_state(uint16_t reconfig_flags)
 
 			memset(&qos_rec, 0, sizeof(slurmdb_qos_rec_t));
 			qos_rec.name = part_ptr->qos_char;
-			if (assoc_mgr_fill_in_qos(
-				    acct_db_conn, &qos_rec, accounting_enforce,
-				    (slurmdb_qos_rec_t **)&part_ptr->qos_ptr, 0)
-			    != SLURM_SUCCESS) {
+			if ((assoc_mgr_fill_in_qos(acct_db_conn, &qos_rec,
+						   accounting_enforce,
+						   &part_ptr->qos_ptr,
+						   0) != SLURM_SUCCESS) ||
+			    !part_ptr->qos_ptr) {
 				error("Partition %s has an invalid qos (%s), "
 				      "please check your configuration",
 				      part_ptr->name, qos_rec.name);
@@ -679,7 +603,8 @@ extern int load_all_part_state(uint16_t reconfig_flags)
 		xfree(part_ptr->deny_qos);
 		part_ptr->deny_qos = part_rec_state->deny_qos;
 		part_rec_state->deny_qos = NULL;
-		qos_list_build(part_ptr->deny_qos, &part_ptr->deny_qos_bitstr);
+		qos_list_build(part_ptr->deny_qos, false, true,
+			       &part_ptr->deny_qos_bitstr);
 
 		/*
 		 * Store saved nodelist in orig_nodes. nodes will be regenerated
@@ -689,6 +614,10 @@ extern int load_all_part_state(uint16_t reconfig_flags)
 		xfree(part_ptr->orig_nodes);
 		part_ptr->orig_nodes = part_rec_state->nodes;
 		part_rec_state->nodes = NULL;
+
+		xfree(part_ptr->topology_name);
+		part_ptr->topology_name = part_rec_state->topology_name;
+		part_rec_state->topology_name = NULL;
 
 		part_record_delete(part_rec_state);
 	}
@@ -747,44 +676,71 @@ extern list_t *part_list_copy(list_t *part_list_src)
 /*
  * get_part_list - find record for named partition(s)
  * IN name - partition name(s) in a comma separated list
- * OUT err_part - The first invalid partition name.
- * RET list of pointers to the partitions or NULL if not found
+ * OUT part_ptr_list - sorted list of pointers to the partitions or NULL
+ * OUT prim_part_ptr - pointer to the primary partition
+ * OUT err_part - All the invalid partition names.
+ * OUT first_valid - bool ptr indicating if the first partition in name is valid
  * NOTE: Caller must free the returned list
  * NOTE: Caller must free err_part
  */
-extern list_t *get_part_list(char *name, char **err_part)
+extern void get_part_list(char *name, list_t **part_ptr_list,
+			  part_record_t **prim_part_ptr, char **err_part,
+			  bool *first_valid)
 {
 	part_record_t *part_ptr;
-	list_t *job_part_list = NULL;
 	char *token, *last = NULL, *tmp_name;
+	bool first_iteration = true;
+
+	*part_ptr_list = NULL;
+	*prim_part_ptr = NULL;
+
+	if (err_part)
+		xfree(*err_part);
+
+	if (first_valid)
+		*first_valid = true;
 
 	if (name == NULL)
-		return job_part_list;
+		return;
 
 	tmp_name = xstrdup(name);
 	token = strtok_r(tmp_name, ",", &last);
 	while (token) {
 		part_ptr = list_find_first(part_list, &list_find_part, token);
 		if (part_ptr) {
-			if (job_part_list == NULL) {
-				job_part_list = list_create(NULL);
-			}
-			if (!list_find_first(job_part_list, &_match_part_ptr,
-					     part_ptr)) {
-				list_append(job_part_list, part_ptr);
-			}
+			if (!(*part_ptr_list))
+				*part_ptr_list = list_create(NULL);
+			if (!list_find_first(*part_ptr_list, &_match_part_ptr,
+					     part_ptr))
+				list_append(*part_ptr_list, part_ptr);
 		} else {
-			FREE_NULL_LIST(job_part_list);
-			if (err_part) {
-				xfree(*err_part);
-				*err_part = xstrdup(token);
-			}
-			break;
+			if (err_part)
+				xstrfmtcat(*err_part, "%s%s",
+					   *err_part ? "," : "",
+					   token);
+			if (first_iteration && first_valid)
+				*first_valid = false;
 		}
 		token = strtok_r(NULL, ",", &last);
+		first_iteration = false;
+	}
+
+	if (*part_ptr_list) {
+		/*
+		 * Return the first part_ptr in the list before sorting. On
+		 * state load, the first partition in the list is the running
+		 * partition -- for multi-partition jobs. Other times it doesn't
+		 * matter what the returned part_ptr is because it will be
+		 * modified when scheduling the different job_queue_rec_t's.
+		 *
+		 * The part_ptr_list always needs to be sorted by priority_tier.
+		 */
+		*prim_part_ptr = list_peek(*part_ptr_list);
+		list_sort(*part_ptr_list, priority_sort_part_tier);
+		if (list_count(*part_ptr_list) == 1)
+			FREE_NULL_LIST(*part_ptr_list);
 	}
 	xfree(tmp_name);
-	return job_part_list;
 }
 
 /*
@@ -1031,7 +987,7 @@ extern buf_t *pack_all_part(uint16_t show_flags, uid_t uid,
  */
 void pack_part(part_record_t *part_ptr, buf_t *buffer, uint16_t protocol_version)
 {
-	if (protocol_version >= SLURM_24_05_PROTOCOL_VERSION) {
+	if (protocol_version >= SLURM_25_05_PROTOCOL_VERSION) {
 		if (default_part_loc == part_ptr)
 			part_ptr->flags |= PART_FLAG_DEFAULT;
 		else
@@ -1075,12 +1031,12 @@ void pack_part(part_record_t *part_ptr, buf_t *buffer, uint16_t protocol_version
 		packstr(part_ptr->nodesets, buffer);
 		pack_bit_str_hex(part_ptr->node_bitmap, buffer);
 		packstr(part_ptr->billing_weights_str, buffer);
+		packstr(part_ptr->topology_name, buffer);
 		packstr(part_ptr->tres_fmt_str, buffer);
-		(void)slurm_pack_list(part_ptr->job_defaults_list,
-				      job_defaults_pack, buffer,
-				      protocol_version);
+		(void) slurm_pack_list(part_ptr->job_defaults_list,
+				       job_defaults_pack, buffer,
+				       protocol_version);
 	} else if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		uint16_t tmp_uint16;
 		if (default_part_loc == part_ptr)
 			part_ptr->flags |= PART_FLAG_DEFAULT;
 		else
@@ -1100,8 +1056,7 @@ void pack_part(part_record_t *part_ptr, buf_t *buffer, uint16_t protocol_version
 		pack32(part_ptr->max_cpus_per_socket, buffer);
 		pack64(part_ptr->max_mem_per_cpu, buffer);
 
-		tmp_uint16 = part_ptr->flags;
-		pack16(tmp_uint16, buffer);
+		pack32(part_ptr->flags, buffer);
 		pack16(part_ptr->max_share, buffer);
 		pack16(part_ptr->over_time_limit, buffer);
 		pack16(part_ptr->preempt_mode, buffer);
@@ -1344,27 +1299,6 @@ extern int update_part(update_part_msg_t * part_desc, bool create_flag)
 		part_ptr->flags &= (~PART_FLAG_EXCLUSIVE_TOPO);
 	}
 
-	if (part_desc->flags & PART_FLAG_DEFAULT) {
-		if (default_part_name == NULL) {
-			info("%s: setting default partition to %s", __func__,
-			     part_desc->name);
-		} else if (xstrcmp(default_part_name, part_desc->name) != 0) {
-			info("%s: changing default partition from %s to %s",
-			     __func__, default_part_name, part_desc->name);
-		}
-		xfree(default_part_name);
-		default_part_name = xstrdup(part_desc->name);
-		default_part_loc = part_ptr;
-		part_ptr->flags |= PART_FLAG_DEFAULT;
-	} else if ((part_desc->flags & PART_FLAG_DEFAULT_CLR) &&
-		   (default_part_loc == part_ptr)) {
-		info("%s: clearing default partition from %s", __func__,
-		     part_desc->name);
-		xfree(default_part_name);
-		default_part_loc = NULL;
-		part_ptr->flags &= (~PART_FLAG_DEFAULT);
-	}
-
 	if (part_desc->flags & PART_FLAG_LLN) {
 		info("%s: setting LLN for partition %s", __func__,
 		     part_desc->name);
@@ -1404,35 +1338,46 @@ extern int update_part(update_part_msg_t * part_desc, bool create_flag)
 		part_ptr->over_time_limit = part_desc->over_time_limit;
 	}
 
-	if (part_desc->preempt_mode != NO_VAL16 &&
-	    (!(part_desc->preempt_mode & PREEMPT_MODE_GANG))) {
-		uint16_t new_mode;
+	if (part_desc->preempt_mode != NO_VAL16) {
+		if (!(part_desc->preempt_mode & PREEMPT_MODE_GANG)) {
+			uint16_t new_mode;
 
-		new_mode = part_desc->preempt_mode & (~PREEMPT_MODE_GANG);
-		if (new_mode <= PREEMPT_MODE_CANCEL) {
-			/*
-			 * This is a valid mode, but if GANG was enabled at
-			 * cluster level, always leave it set.
-			 */
-			if (part_ptr->preempt_mode & PREEMPT_MODE_GANG)
-				new_mode = new_mode | PREEMPT_MODE_GANG;
+			new_mode =
+				part_desc->preempt_mode & (~PREEMPT_MODE_GANG);
 
-			info("%s: setting preempt_mode to %s for partition %s",
-			     __func__, preempt_mode_string(new_mode),
-			     part_desc->name);
-			part_ptr->preempt_mode = new_mode;
+			if (new_mode <= PREEMPT_MODE_CANCEL) {
+				/*
+				 * This is a valid mode, but if GANG was enabled
+				 * at cluster level, always leave it set.
+				 */
+				if ((part_ptr->preempt_mode != NO_VAL16) &&
+				    (part_ptr->preempt_mode &
+				     PREEMPT_MODE_GANG))
+					new_mode = new_mode | PREEMPT_MODE_GANG;
+				info("%s: setting preempt_mode to %s for partition %s",
+				     __func__,
+				     preempt_mode_string(new_mode),
+				     part_desc->name);
+				part_ptr->preempt_mode = new_mode;
+			} else {
+				info("%s: invalid preempt_mode %u", __func__, new_mode);
+			}
 		} else {
-			info("%s: invalid preempt_mode %u", __func__, new_mode);
+			info("%s: PreemptMode=GANG is a cluster-wide option and cannot be set at partition level",
+			      __func__);
 		}
-	} else if (part_desc->preempt_mode & PREEMPT_MODE_GANG) {
-		info("%s: PreemptMode=GANG is a cluster-wide option and cannot be set at partition level",
-		      __func__);
 	}
 
 	if (part_desc->priority_tier != NO_VAL16) {
+		bool changed =
+			part_ptr->priority_tier != part_desc->priority_tier;
 		info("%s: setting PriorityTier to %u for partition %s",
 		     __func__, part_desc->priority_tier, part_desc->name);
 		part_ptr->priority_tier = part_desc->priority_tier;
+
+		/* Need to resort all job partition lists */
+		if (changed)
+			sort_all_jobs_partition_lists();
 	}
 
 	if (part_desc->priority_job_factor != NO_VAL16) {
@@ -1520,18 +1465,27 @@ extern int update_part(update_part_msg_t * part_desc, bool create_flag)
 	}
 
 	if (part_desc->allow_qos != NULL) {
-		xfree(part_ptr->allow_qos);
-		if ((xstrcasecmp(part_desc->allow_qos, "ALL") == 0) ||
-		    (part_desc->allow_qos[0] == '\0')) {
+		bitstr_t *tmp_allow_qos_bitstr = NULL;
+		if (qos_list_build(part_desc->allow_qos, false, false,
+				   &tmp_allow_qos_bitstr) != SLURM_SUCCESS) {
+			error("%s: invalid qos (%s) given for AllowQOS",
+			      __func__, part_desc->allow_qos);
+			error_code = ESLURM_INVALID_QOS;
+		} else if ((xstrcasecmp(part_desc->allow_qos, "ALL") == 0) ||
+			   (part_desc->allow_qos[0] == '\0')) {
 			info("%s: setting AllowQOS to ALL for partition %s",
 			     __func__, part_desc->name);
+			xfree(part_ptr->allow_qos);
+			FREE_NULL_BITMAP(part_ptr->allow_qos_bitstr);
 		} else {
+			xfree(part_ptr->allow_qos);
 			part_ptr->allow_qos = part_desc->allow_qos;
 			part_desc->allow_qos = NULL;
+			FREE_NULL_BITMAP(part_ptr->allow_qos_bitstr);
+			part_ptr->allow_qos_bitstr = tmp_allow_qos_bitstr;
 			info("%s: setting AllowQOS to %s for partition %s",
 			     __func__, part_ptr->allow_qos, part_desc->name);
 		}
-		qos_list_build(part_ptr->allow_qos,&part_ptr->allow_qos_bitstr);
 	}
 
 	if (part_desc->qos_char && part_desc->qos_char[0] == '\0') {
@@ -1569,10 +1523,10 @@ extern int update_part(update_part_msg_t * part_desc, bool create_flag)
 		memset(&qos_rec, 0, sizeof(slurmdb_qos_rec_t));
 		qos_rec.name = part_desc->qos_char;
 		assoc_mgr_lock(&locks);
-		if (assoc_mgr_fill_in_qos(
+		if ((assoc_mgr_fill_in_qos(
 			    acct_db_conn, &qos_rec, accounting_enforce,
 			    (slurmdb_qos_rec_t **)&qos, true)
-		    != SLURM_SUCCESS) {
+		     != SLURM_SUCCESS) || !qos) {
 			error("%s: invalid qos (%s) given",
 			      __func__, qos_rec.name);
 			error_code = ESLURM_INVALID_QOS;
@@ -1690,15 +1644,25 @@ extern int update_part(update_part_msg_t * part_desc, bool create_flag)
 	}
 
 	if (part_desc->deny_qos != NULL) {
-		xfree(part_ptr->deny_qos);
-		if (part_desc->deny_qos[0] == '\0')
+		bitstr_t *tmp_deny_qos_bitstr = NULL;
+		if (qos_list_build(part_desc->deny_qos, false, false,
+				   &tmp_deny_qos_bitstr) != SLURM_SUCCESS) {
+			error("%s: invalid qos (%s) given for DenyQOS",
+			      __func__, part_desc->deny_qos);
+			error_code = ESLURM_INVALID_QOS;
+		} else {
 			xfree(part_ptr->deny_qos);
-		part_ptr->deny_qos = part_desc->deny_qos;
-		part_desc->deny_qos = NULL;
-		info("%s: setting DenyQOS to %s for partition %s", __func__,
-		     part_ptr->deny_qos, part_desc->name);
-		qos_list_build(part_ptr->deny_qos, &part_ptr->deny_qos_bitstr);
+			if (part_desc->deny_qos[0] != '\0') {
+				part_ptr->deny_qos = part_desc->deny_qos;
+				part_desc->deny_qos = NULL;
+			}
+			FREE_NULL_BITMAP(part_ptr->deny_qos_bitstr);
+			part_ptr->deny_qos_bitstr = tmp_deny_qos_bitstr;
+			info("%s: setting DenyQOS to %s for partition %s",
+			     __func__, part_ptr->deny_qos, part_desc->name);
+		}
 	}
+
 	if (part_desc->allow_qos && part_desc->deny_qos) {
 		error("%s: Both AllowQOS and DenyQOS are defined, DenyQOS will be ignored",
 		      __func__);
@@ -1823,8 +1787,56 @@ extern int update_part(update_part_msg_t * part_desc, bool create_flag)
 		part_ptr->node_bitmap = bit_alloc(node_record_count);
 	}
 
+	if (part_desc->topology_name) {
+		char *old_topo_name = part_ptr->topology_name;
+
+		info("%s: Setting Topology to %s for partition %s",
+		      __func__, part_desc->topology_name, part_desc->name);
+
+		if (part_desc->topology_name[0] == '\0') {
+			part_ptr->topology_name = NULL;
+			part_ptr->topology_idx = 0;
+			xfree(old_topo_name);
+		} else {
+			part_ptr->topology_name = part_desc->topology_name;
+
+			if (set_part_topology_idx(part_ptr, NULL)) {
+				error("Failed to set part %s's topology to %s",
+				      part_ptr->name, part_ptr->topology_name);
+				part_ptr->topology_name = old_topo_name;
+				error_code = ESLURM_REQUESTED_TOPO_CONFIG_UNAVAILABLE;
+			} else {
+				part_desc->topology_name = NULL;
+				xfree(old_topo_name);
+			}
+		}
+	}
+
 fini:
 	if (error_code == SLURM_SUCCESS) {
+		if (part_desc->flags & PART_FLAG_DEFAULT) {
+			if (default_part_name == NULL) {
+				info("%s: setting default partition to %s",
+				     __func__, part_desc->name);
+			} else if (xstrcmp(default_part_name,
+					   part_desc->name) != 0) {
+				info("%s: changing default partition from %s to %s",
+				     __func__, default_part_name,
+				     part_desc->name);
+			}
+			xfree(default_part_name);
+			default_part_name = xstrdup(part_desc->name);
+			default_part_loc = part_ptr;
+			part_ptr->flags |= PART_FLAG_DEFAULT;
+		} else if ((part_desc->flags & PART_FLAG_DEFAULT_CLR) &&
+			   (default_part_loc == part_ptr)) {
+			info("%s: clearing default partition from %s", __func__,
+			     part_desc->name);
+			xfree(default_part_name);
+			default_part_loc = NULL;
+			part_ptr->flags &= (~PART_FLAG_DEFAULT);
+		}
+
 		gs_reconfig();
 		select_g_reconfigure();		/* notify select plugin too */
 	} else if (create_flag) {
@@ -2276,4 +2288,17 @@ extern char *part_list_to_xstr(list_t *list)
 	list_for_each(list, _foreach_part_name_to_xstr, &part_names);
 
 	return part_names.names;
+}
+
+extern int set_part_topology_idx(void *x, void *arg)
+{
+	part_record_t *part_ptr = x;
+
+	if (!part_ptr->topology_name)
+		part_ptr->topology_idx = 0;
+	else if (topology_g_get(TOPO_DATA_TCTX_IDX, part_ptr->topology_name,
+				&(part_ptr->topology_idx)))
+		return -1;
+
+	return 0;
 }

@@ -101,7 +101,7 @@ static int _first_job_roll_up(mysql_conn_t *mysql_conn, time_t first_start)
 }
 
 extern int as_mysql_fix_runaway_jobs(mysql_conn_t *mysql_conn, uint32_t uid,
-				     List runaway_jobs)
+				     list_t *runaway_jobs)
 {
 	char *query = NULL, *job_ids = NULL;
 	slurmdb_job_rec_t *job = NULL;
@@ -109,9 +109,10 @@ extern int as_mysql_fix_runaway_jobs(mysql_conn_t *mysql_conn, uint32_t uid,
 	int rc = SLURM_SUCCESS;
 	slurmdb_job_rec_t *first_job;
 	char *temp_cluster_name = mysql_conn->cluster_name;
+	uint32_t end_state = JOB_COMPLETE;
 
 	if (!runaway_jobs) {
-		error("%s: No List of runaway jobs to fix given.",
+		error("%s: No list of runaway jobs to fix given.",
 		      __func__);
 		rc = SLURM_ERROR;
 		goto bail;
@@ -120,7 +121,7 @@ extern int as_mysql_fix_runaway_jobs(mysql_conn_t *mysql_conn, uint32_t uid,
 	list_sort(runaway_jobs, slurmdb_job_sort_by_submit_time);
 
 	if (!(first_job = list_peek(runaway_jobs))) {
-		error("%s: List of runaway jobs to fix is unexpectedly empty",
+		error("%s: list of runaway jobs to fix is unexpectedly empty",
 		      __func__);
 		rc = SLURM_ERROR;
 		goto bail;
@@ -142,6 +143,21 @@ extern int as_mysql_fix_runaway_jobs(mysql_conn_t *mysql_conn, uint32_t uid,
 	 * cluster name, change back before return
 	 */
 	mysql_conn->cluster_name = first_job->cluster;
+
+	/*
+	 * Check if we need to copy the state of the jobs as their end state.
+	 * Since jobs are processed and sent in bulk, we only need to
+	 * check one. This is only checked just in case the request is from
+	 * an old client that does not have the option to choose the end
+	 * job state, in which case we need to set the jobs as COMPLETED.
+	 */
+	if (first_job->flags & SLURMDB_JOB_FLAG_ALTERED) {
+		end_state = first_job->state;
+		if ((end_state != JOB_COMPLETE) && (end_state != JOB_FAILED)) {
+			rc = ESLURM_INVALID_JOB_STATE;
+			goto bail;
+		}
+	}
 
 	/*
 	 * Double check if we are at least an operator, this check should had
@@ -175,7 +191,7 @@ extern int as_mysql_fix_runaway_jobs(mysql_conn_t *mysql_conn, uint32_t uid,
 			       "GREATEST(time_start, time_eligible, time_submit), "
 			       "state=%d WHERE time_end=0 && id_job IN (%s);",
 			       mysql_conn->cluster_name, job_table,
-			       JOB_COMPLETE, job_ids);
+			       end_state, job_ids);
 
 	DB_DEBUG(DB_QUERY, mysql_conn->conn, "query\n%s", query);
 	rc = mysql_db_query(mysql_conn, query);

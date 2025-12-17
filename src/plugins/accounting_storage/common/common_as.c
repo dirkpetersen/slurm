@@ -45,10 +45,13 @@
 #include "src/common/slurm_xlator.h"
 
 #include "src/common/env.h"
-#include "src/common/slurmdbd_defs.h"
-#include "src/interfaces/auth.h"
 #include "src/common/slurm_time.h"
+#include "src/common/slurmdbd_defs.h"
 #include "src/common/xstring.h"
+
+#include "src/interfaces/auth.h"
+#include "src/interfaces/conn.h"
+
 #include "src/slurmdbd/read_config.h"
 #include "common_as.h"
 
@@ -57,10 +60,8 @@
  * overwritten when linking with the slurmctld.
  */
 #if defined(__APPLE__)
-extern __thread bool drop_priv __attribute__((weak_import));
 extern slurmdbd_conf_t *slurmdbd_conf __attribute__((weak_import));
 #else
-__thread bool drop_priv;
 slurmdbd_conf_t *slurmdbd_conf;
 #endif
 
@@ -71,6 +72,10 @@ extern char *assoc_month_table;
 extern char *cluster_day_table;
 extern char *cluster_hour_table;
 extern char *cluster_month_table;
+
+extern char *qos_day_table;
+extern char *qos_hour_table;
+extern char *qos_month_table;
 
 extern char *wckey_day_table;
 extern char *wckey_hour_table;
@@ -93,7 +98,7 @@ static int _sort_update_object_dec(void *a, void *b)
 	return 0;
 }
 
-static void _dump_slurmdb_assoc_records(List assoc_list)
+static void _dump_slurmdb_assoc_records(list_t *assoc_list)
 {
 	slurmdb_assoc_rec_t *assoc = NULL;
 	list_itr_t *itr = NULL;
@@ -111,7 +116,7 @@ static void _dump_slurmdb_clus_res_record(slurmdb_clus_res_rec_t *clus_res)
 	debug("\t\t\tallowed=%u", clus_res->allowed);
 }
 
-static void _dump_slurmdb_clus_res_records(List clus_res_list)
+static void _dump_slurmdb_clus_res_records(list_t *clus_res_list)
 {
 	slurmdb_clus_res_rec_t *clus_res = NULL;
 	list_itr_t *itr = NULL;
@@ -122,7 +127,7 @@ static void _dump_slurmdb_clus_res_records(List clus_res_list)
 	list_iterator_destroy(itr);
 }
 
-static void _dump_slurmdb_res_records(List res_list)
+static void _dump_slurmdb_res_records(list_t *res_list)
 {
 	slurmdb_res_rec_t *res = NULL;
 	list_itr_t *itr = NULL;
@@ -148,10 +153,6 @@ static bool _is_user_min_admin_level(void *db_conn, uid_t uid,
 {
 	bool is_admin = 1;
 
-#ifndef NDEBUG
-	if (drop_priv)
-		return false;
-#endif
 	/*
 	 * We have to check the authentication here in the
 	 * plugin since we don't know what accounts are being
@@ -194,7 +195,7 @@ extern bool _is_user_any_coord_internal(void *db_conn, slurmdb_user_rec_t *user,
  * NOTE: This function will take the object given and free it later so it
  *       needs to be removed from a existing lists prior.
  */
-extern int addto_update_list(List update_list, slurmdb_update_type_t type,
+extern int addto_update_list(list_t *update_list, slurmdb_update_type_t type,
 			     void *object)
 {
 	slurmdb_update_object_t *update_object = NULL;
@@ -215,7 +216,7 @@ extern int addto_update_list(List update_list, slurmdb_update_type_t type,
 		update_list, slurmdb_find_update_object_in_list, &type);
 
 	if (update_object) {
-		/* here we prepend primarly for remove association
+		/* here we prepend primarily for remove association
 		   since parents need to be removed last, and they are
 		   removed first in the calling code */
 		if (type == SLURMDB_UPDATE_FEDS) {
@@ -345,7 +346,7 @@ extern int addto_update_list(List update_list, slurmdb_update_type_t type,
  * dump_update_list - dump contents of updates
  * IN update_list: updates to perform
  */
-extern void dump_update_list(List update_list)
+extern void dump_update_list(list_t *update_list)
 {
 	list_itr_t *itr = NULL;
 	slurmdb_update_object_t *object = NULL;
@@ -418,7 +419,7 @@ extern void dump_update_list(List update_list)
 extern int cluster_first_reg(char *host, uint16_t port, uint16_t rpc_version)
 {
 	slurm_addr_t ctld_address;
-	int fd;
+	void *conn = NULL;
 	int rc = SLURM_SUCCESS;
 
 	info("First time to register cluster requesting "
@@ -426,8 +427,7 @@ extern int cluster_first_reg(char *host, uint16_t port, uint16_t rpc_version)
 
 	memset(&ctld_address, 0, sizeof(ctld_address));
 	slurm_set_addr(&ctld_address, port, host);
-	fd = slurm_open_msg_conn(&ctld_address);
-	if (fd < 0) {
+	if (!(conn = slurm_open_msg_conn(&ctld_address, NULL))) {
 		error("can not open socket back to slurmctld "
 		      "%s(%u): %m", host, port);
 		rc = SLURM_ERROR;
@@ -445,12 +445,12 @@ extern int cluster_first_reg(char *host, uint16_t port, uint16_t rpc_version)
 		out_msg.flags = SLURM_GLOBAL_AUTH_KEY;
 		out_msg.data = &update;
 		slurm_msg_set_r_uid(&out_msg, SLURM_AUTH_UID_ANY);
-		slurm_send_node_msg(fd, &out_msg);
+		slurm_send_node_msg(conn, &out_msg);
 		/* We probably need to add matching recv_msg function
 		 * for an arbitrary fd or should these be fire
 		 * and forget?  For this, that we can probably
 		 * forget about it */
-		close(fd);
+		conn_g_destroy(conn, true);
 	}
 	return rc;
 }
@@ -527,8 +527,12 @@ extern int set_usage_information(char **usage_table,
 	if (start_tm.tm_hour || end_tm.tm_hour || (end-start < 86400)
 	   || (end > my_time)) {
 		switch (type) {
+		case DBD_GET_ASSOC_NG_USAGE:
 		case DBD_GET_ASSOC_USAGE:
 			my_usage_table = assoc_hour_table;
+			break;
+		case DBD_GET_QOS_USAGE:
+			my_usage_table = qos_hour_table;
 			break;
 		case DBD_GET_WCKEY_USAGE:
 			my_usage_table = wckey_hour_table;
@@ -544,8 +548,12 @@ extern int set_usage_information(char **usage_table,
 	} else if (start_tm.tm_mday == 1 && end_tm.tm_mday == 1
 		  && (end-start > 86400)) {
 		switch (type) {
+		case DBD_GET_ASSOC_NG_USAGE:
 		case DBD_GET_ASSOC_USAGE:
 			my_usage_table = assoc_month_table;
+			break;
+		case DBD_GET_QOS_USAGE:
+			my_usage_table = qos_month_table;
 			break;
 		case DBD_GET_WCKEY_USAGE:
 			my_usage_table = wckey_month_table;
@@ -574,7 +582,7 @@ extern int set_usage_information(char **usage_table,
  * IN/OUT qos_list: list of QOS'es
  * IN delta_qos_list: list of delta QOS'es
  */
-extern void merge_delta_qos_list(List qos_list, List delta_qos_list)
+extern void merge_delta_qos_list(list_t *qos_list, list_t *delta_qos_list)
 {
 	list_itr_t *curr_itr = list_iterator_create(qos_list);
 	list_itr_t *new_itr = list_iterator_create(delta_qos_list);
@@ -974,7 +982,7 @@ extern int as_build_step_start_msg(dbd_step_start_msg_t *req,
 	req->db_index    = step_ptr->job_ptr->db_index;
 	req->name        = step_ptr->name;
 	req->nodes       = node_list;
-	/* reate req->node_inx outside of locks when packing */
+	/* create req->node_inx outside of locks when packing */
 	req->node_cnt    = nodes;
 	if (step_ptr->start_time > step_ptr->job_ptr->resize_time)
 		req->start_time = step_ptr->start_time;
@@ -987,6 +995,8 @@ extern int as_build_step_start_msg(dbd_step_start_msg_t *req,
 		req->job_submit_time   =
 			step_ptr->job_ptr->details->submit_time;
 
+	req->time_limit = step_ptr->time_limit;
+
 	memcpy(&req->step_id, &step_ptr->step_id, sizeof(req->step_id));
 
 	if (step_ptr->step_layout)
@@ -994,6 +1004,13 @@ extern int as_build_step_start_msg(dbd_step_start_msg_t *req,
 	req->task_dist   = task_dist;
 
 	req->total_tasks = tasks;
+
+	if (!(slurm_conf.conf_flags & CONF_FLAG_NO_STDIO)) {
+		req->cwd = step_ptr->cwd;
+		req->std_err = step_ptr->std_err;
+		req->std_in = step_ptr->std_in;
+		req->std_out = step_ptr->std_out;
+	}
 
 	req->submit_line = step_ptr->submit_line;
 	req->tres_alloc_str = step_ptr->tres_alloc_str;
@@ -1037,17 +1054,7 @@ extern int as_build_step_comp_msg(dbd_step_comp_msg_t *req,
 	req->db_index    = step_ptr->job_ptr->db_index;
 	req->end_time    = time(NULL);	/* called at step completion */
 	req->exit_code   = step_ptr->exit_code;
-#ifndef HAVE_FRONT_END
-	/* Only send this info on a non-frontend system since this
-	 * information is of no use on systems that run on a front-end
-	 * node.  Since something else is running the job.
-	 */
 	req->jobacct     = step_ptr->jobacct;
-#else
-	if (step_ptr->step_id.step_id == SLURM_BATCH_SCRIPT)
-		req->jobacct     = step_ptr->jobacct;
-#endif
-
 	req->req_uid     = step_ptr->requid;
 	if (step_ptr->start_time > step_ptr->job_ptr->resize_time)
 		req->start_time = step_ptr->start_time;

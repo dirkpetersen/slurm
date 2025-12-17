@@ -33,123 +33,246 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
 \*****************************************************************************/
 
-#include "src/common/fd.h"
+#include <errno.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdlib.h>
+
 #include "src/common/log.h"
 #include "src/common/macros.h"
+#include "src/common/probes.h"
 #include "src/common/read_config.h"
+#include "src/common/slurm_time.h"
+#include "src/common/threadpool.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
+#include "src/common/xstring.h"
 
 #include "src/conmgr/conmgr.h"
+#include "src/conmgr/delayed.h"
 #include "src/conmgr/mgr.h"
-#include "src/conmgr/workq.h"
+#include "src/conmgr/polling.h"
+#include "src/conmgr/signals.h"
+
+#include "src/interfaces/tls.h"
+#include "src/interfaces/url_parser.h"
 
 #define MAX_CONNECTIONS_DEFAULT 150
+#define CTIME_STR_LEN 72
 
 conmgr_t mgr = CONMGR_DEFAULT;
 
+static sig_atomic_t enabled_init = 0;
+static bool enabled_status = false;
+
 static void _atfork_child(void)
 {
+	/* Do nothing if conmgr was not running or already cleaned up */
+	if (!mgr.initialized || !mgr.connections)
+		return;
+
 	/*
-	 * Force conmgr to return to default state before it was initialized at
-	 * forking as all of the prior state is completely unusable.
+	 * fork() while conmgr was running which means mgr's state is invalid
+	 * and must not be used. Set mgr to same state as if conmgr_init() and
+	 * conmgr_fini() was already called while being in an error state.
 	 */
 	mgr = CONMGR_DEFAULT;
+	mgr.initialized = true;
+	mgr.shutdown_requested = true;
+	mgr.error = ESHUTDOWN;
 }
 
-extern void conmgr_init(int thread_count, int max_connections,
-			conmgr_callbacks_t callbacks)
+static void _at_exit(void)
 {
-	if (max_connections < 1)
-		max_connections = MAX_CONNECTIONS_DEFAULT;
+	/* Skip locking mgr.mutex to avoid a deadlock */
+	mgr.shutdown_requested = true;
+}
 
-	workq_init(thread_count);
+/* Caller must hold mgr.mutex lock */
+static void _probe_verbose(probe_log_t *log)
+{
+	char conf_read_timeout[CTIME_STR_LEN] = "∞";
+	char conf_write_timeout[CTIME_STR_LEN] = "∞";
+	char conf_connect_timeout[CTIME_STR_LEN] = "∞";
+	char watch_max_sleep[CTIME_STR_LEN] = "∞";
+	char quiesce_timeout[CTIME_STR_LEN] = "∞";
+	char quiesce_start[CTIME_STR_LEN] = { 0 };
+	char *quiesce_start_delim = "";
+
+	if (mgr.conf_read_timeout.tv_sec || mgr.conf_read_timeout.tv_nsec)
+		timespec_ctime(mgr.conf_read_timeout, false, conf_read_timeout,
+			       sizeof(conf_read_timeout));
+	if (mgr.conf_write_timeout.tv_sec || mgr.conf_write_timeout.tv_nsec)
+		timespec_ctime(mgr.conf_write_timeout, false,
+			       conf_write_timeout, sizeof(conf_write_timeout));
+	if (mgr.conf_connect_timeout.tv_sec || mgr.conf_connect_timeout.tv_nsec)
+		timespec_ctime(mgr.conf_connect_timeout, false,
+			       conf_connect_timeout,
+			       sizeof(conf_connect_timeout));
+	if (mgr.watch_max_sleep.tv_sec || mgr.watch_max_sleep.tv_nsec)
+		timespec_ctime(mgr.watch_max_sleep, true, watch_max_sleep,
+			       sizeof(watch_max_sleep));
+	if (mgr.quiesce.conf_timeout.tv_sec || mgr.quiesce.conf_timeout.tv_nsec)
+		timespec_ctime(mgr.quiesce.conf_timeout, false, quiesce_timeout,
+			       sizeof(quiesce_timeout));
+	if (mgr.quiesce.requested) {
+		quiesce_start_delim = "@";
+		timespec_ctime(mgr.quiesce.start, true, quiesce_start,
+			       sizeof(quiesce_start));
+	}
+
+	probe_log(log, "config: max_connections:%d delay_write_complete:%us read_timeout:%s write_timeout:%s connect_timeout:%s quiesce_timeout:%s threads=%d",
+	     mgr.conf_max_connections, mgr.conf_delay_write_complete,
+	     conf_read_timeout, conf_write_timeout, conf_connect_timeout,
+	     quiesce_timeout, mgr.workers.conf_threads);
+
+	probe_log(log, "status: initialized:%c shutdown_requested:%c",
+	     BOOL_CHARIFY(mgr.initialized), BOOL_CHARIFY(mgr.shutdown_requested));
+
+	probe_log(log, "watch: max_sleep:%s polling:%c inspecting:%c waiting_on_work:%c",
+	     watch_max_sleep, BOOL_CHARIFY(mgr.poll_active),
+	     BOOL_CHARIFY(mgr.inspecting), BOOL_CHARIFY(mgr.waiting_on_work));
+
+	probe_log(log, "quiesce: requested:%c%s%s active:%c",
+	     BOOL_CHARIFY(mgr.quiesce.requested), quiesce_start_delim,
+	     quiesce_start, BOOL_CHARIFY(mgr.quiesce.active));
+}
+
+static probe_status_t _probe(probe_log_t *log)
+{
+	probe_status_t status = PROBE_RC_UNKNOWN;
 
 	slurm_mutex_lock(&mgr.mutex);
 
-	mgr.shutdown_requested = false;
+	if (log)
+		_probe_verbose(log);
 
-	if (!mgr.at_fork_installed) {
-		int rc;
+	if (!mgr.initialized)
+		status = PROBE_RC_UNKNOWN;
+	else if (!mgr.watch_thread)
+		status = PROBE_RC_DOWN;
+	else if (mgr.shutdown_requested)
+		status = PROBE_RC_ONLINE;
+	else if (mgr.quiesce.requested)
+		status = PROBE_RC_BUSY;
+	else
+		status = PROBE_RC_READY;
 
-		if ((rc = pthread_atfork(NULL, NULL, _atfork_child)))
-			fatal_abort("%s: pthread_atfork() failed: %s",
-				    __func__, slurm_strerror(rc));
+	slurm_mutex_unlock(&mgr.mutex);
 
-		mgr.at_fork_installed = true;
-	} else {
-		/* already initialized */
-		mgr.max_connections = MAX(max_connections, mgr.max_connections);
+	return status;
+}
 
-		/* Catch if callbacks are different while ignoring NULLS */
-		xassert(!callbacks.parse || !mgr.callbacks.parse);
-		xassert(!callbacks.free_parse || !mgr.callbacks.free_parse);
+extern void conmgr_init(int thread_count, int default_thread_count,
+			int max_connections)
+{
+	int rc = EINVAL;
 
-		if (callbacks.parse)
-			mgr.callbacks.parse = callbacks.parse;
-		if (callbacks.free_parse)
-			mgr.callbacks.free_parse = callbacks.free_parse;
+	(void) url_parser_g_init();
 
+	/* The configured value takes the highest precedence */
+	if (mgr.conf_max_connections > 0)
+		max_connections = mgr.conf_max_connections;
+	else if (max_connections < 1)
+		max_connections = MAX_CONNECTIONS_DEFAULT;
+	xassert(max_connections > 0);
+
+	slurm_mutex_lock(&mgr.mutex);
+
+	if (mgr.initialized) {
 		slurm_mutex_unlock(&mgr.mutex);
+		debug5("%s: skipping - already initialized", __func__);
 		return;
 	}
+
+	enabled_status = true;
+	mgr.shutdown_requested = false;
+
+	workers_init(thread_count, default_thread_count);
+
+	if ((rc = pthread_atfork(NULL, NULL, _atfork_child)))
+		fatal_abort("%s: pthread_atfork() failed: %s",
+			    __func__, slurm_strerror(rc));
+
+	add_work(true, NULL,
+		 (conmgr_callback_t) {
+			 .func = on_signal_alarm,
+			 .func_name = XSTRINGIFY(on_signal_alarm),
+		 },
+		 (conmgr_work_control_t) {
+			 .depend_type = CONMGR_WORK_DEP_SIGNAL,
+			 .on_signal_number = SIGALRM,
+			 .schedule_type = CONMGR_WORK_SCHED_FIFO,
+		 },
+		 0, __func__);
+
+	if (!mgr.conf_delay_write_complete)
+		mgr.conf_delay_write_complete = slurm_conf.msg_timeout;
+	if (!mgr.conf_read_timeout.tv_nsec && !mgr.conf_read_timeout.tv_sec)
+		mgr.conf_read_timeout.tv_sec = slurm_conf.msg_timeout;
+	if (!mgr.conf_write_timeout.tv_nsec && !mgr.conf_write_timeout.tv_sec)
+		mgr.conf_write_timeout.tv_sec = slurm_conf.msg_timeout;
+	if (!mgr.conf_connect_timeout.tv_nsec &&
+	    !mgr.conf_connect_timeout.tv_sec)
+		mgr.conf_connect_timeout.tv_sec = slurm_conf.msg_timeout;
+	if (!mgr.quiesce.conf_timeout.tv_nsec &&
+	    !mgr.quiesce.conf_timeout.tv_sec)
+		mgr.quiesce.conf_timeout.tv_sec = (2 * slurm_conf.msg_timeout);
 
 	mgr.max_connections = max_connections;
 	mgr.connections = list_create(NULL);
 	mgr.listen_conns = list_create(NULL);
 	mgr.complete_conns = list_create(NULL);
-	mgr.callbacks = callbacks;
-	mgr.deferred_funcs = list_create(NULL);
+	mgr.work = list_create(NULL);
+	init_delayed_work();
 
-	if (pipe(mgr.event_fd))
-		fatal("%s: unable to open unnamed pipe: %m", __func__);
-
-	fd_set_nonblocking(mgr.event_fd[0]);
-	fd_set_blocking(mgr.event_fd[1]);
-
-	if (pipe(mgr.signal_fd))
-		fatal("%s: unable to open unnamed pipe: %m", __func__);
-
-	/* block for writes only */
-	fd_set_blocking(mgr.signal_fd[0]);
-	fd_set_blocking(mgr.signal_fd[1]);
-
-	add_signal_work(SIGALRM, on_signal_alarm, NULL,
-			XSTRINGIFY(on_signal_alarm));
+	pollctl_init(mgr.max_connections);
 
 	mgr.initialized = true;
 	slurm_mutex_unlock(&mgr.mutex);
+
+	/* Hook into atexit() in always clean shutdown if exit() called */
+	(void) atexit(_at_exit);
+
+	probe_register("conmgr", _probe);
+	probe_register("conmgr->connections", probe_connections);
+	probe_register("conmgr->work", probe_work);
 }
 
 extern void conmgr_fini(void)
 {
 	slurm_mutex_lock(&mgr.mutex);
 
-	if (!mgr.initialized) {
-		log_flag(CONMGR, "%s: Ignoring duplicate shutdown request",
-			 __func__);
+	if (!mgr.initialized)
+		fatal_abort("%s: shutdown but never initialized", __func__);
+
+	mgr.shutdown_requested = true;
+
+	if (mgr.watch_thread) {
+		slurm_mutex_unlock(&mgr.mutex);
+		wait_for_watch();
+		slurm_mutex_lock(&mgr.mutex);
+	}
+
+	if (!mgr.connections) {
+		log_flag(CONMGR, "%s: skipping clean up", __func__);
 		slurm_mutex_unlock(&mgr.mutex);
 		return;
 	}
 
-	mgr.initialized = false;
-	mgr.shutdown_requested = true;
-	mgr.quiesced = false;
-
-	/* run all deferred work if there is any */
-	requeue_deferred_funcs();
-
 	log_flag(CONMGR, "%s: connection manager shutting down", __func__);
+
+	/* stop and cleanup signal manager */
+	signal_mgr_fini();
 
 	/* processing may still be running at this point in a thread */
 	close_all_connections();
 
 	/* tell all timers about being canceled */
-	cancel_delayed_work();
+	cancel_delayed_work(false);
 
-	/* deferred_funcs should have been cleared by conmgr_run() */
-	xassert(list_is_empty(mgr.deferred_funcs));
-	FREE_NULL_LIST(mgr.deferred_funcs);
+	/* wait until all workers are done */
+	workers_shutdown();
 
 	/*
 	 * At this point, there should be no threads running.
@@ -161,30 +284,34 @@ extern void conmgr_fini(void)
 
 	free_delayed_work();
 
-	if (((mgr.event_fd[0] >= 0) && close(mgr.event_fd[0])) ||
-	    ((mgr.event_fd[1] >= 0) && close(mgr.event_fd[1])))
-		error("%s: unable to close event_fd: %m", __func__);
+	workers_fini();
 
-	if (((mgr.signal_fd[0] >= 0) && close(mgr.signal_fd[0])) ||
-	    ((mgr.signal_fd[1] >= 0) && close(mgr.signal_fd[1])))
-		error("%s: unable to close signal_fd: %m", __func__);
+	xassert(!mgr.quiesce.requested);
+	xassert(!mgr.quiesce.active);
+	xassert(!mgr.quiesce.start.tv_sec);
 
-	xfree(mgr.signal_work);
+	/* work should have been cleared by workers_fini() */
+	xassert(list_is_empty(mgr.work));
+	FREE_NULL_LIST(mgr.work);
 
-	slurm_mutex_unlock(&mgr.mutex);
+	pollctl_fini();
+
 	/*
 	 * Do not destroy the mutex or cond so that this function does not
 	 * crash when it tries to lock mgr.mutex if called more than once.
 	 */
 	/* slurm_mutex_destroy(&mgr.mutex); */
-	/* slurm_cond_destroy(&mgr.cond); */
 
-	workq_fini();
+	slurm_mutex_unlock(&mgr.mutex);
+
+	(void) tls_g_fini();
+	url_parser_g_fini();
 }
 
 extern int conmgr_run(bool blocking)
 {
 	int rc = SLURM_SUCCESS;
+	bool running = false;
 
 	slurm_mutex_lock(&mgr.mutex);
 
@@ -198,17 +325,21 @@ extern int conmgr_run(bool blocking)
 	}
 
 	xassert(!mgr.error || !mgr.exit_on_error);
-	mgr.quiesced = false;
-	requeue_deferred_funcs();
+
+	if (mgr.watch_thread)
+		running = true;
+	else if (!blocking)
+		slurm_thread_create(&mgr.watch_thread, watch_thread, NULL);
+	else
+		mgr.watch_thread = pthread_self();
+
 	slurm_mutex_unlock(&mgr.mutex);
 
 	if (blocking) {
-		watch((void *) 1);
-	} else {
-		slurm_mutex_lock(&mgr.mutex);
-		if (!mgr.watching)
-			queue_func(true, watch, NULL, XSTRINGIFY(watch));
-		slurm_mutex_unlock(&mgr.mutex);
+		if (running)
+			wait_for_watch();
+		else
+			(void) watch(NULL);
 	}
 
 	slurm_mutex_lock(&mgr.mutex);
@@ -223,28 +354,11 @@ extern void conmgr_request_shutdown(void)
 	log_flag(CONMGR, "%s: shutdown requested", __func__);
 
 	slurm_mutex_lock(&mgr.mutex);
-	mgr.shutdown_requested = true;
-	signal_change(true);
-	slurm_mutex_unlock(&mgr.mutex);
-}
-
-extern void conmgr_quiesce(bool wait)
-{
-	log_flag(CONMGR, "%s: quiesce requested", __func__);
-
-	slurm_mutex_lock(&mgr.mutex);
-	if (mgr.quiesced || mgr.shutdown_requested) {
-		slurm_mutex_unlock(&mgr.mutex);
-		return;
+	if (mgr.initialized) {
+		mgr.shutdown_requested = true;
+		EVENT_SIGNAL(&mgr.watch_sleep);
 	}
-
-	mgr.quiesced = true;
-	signal_change(true);
-
-	if (wait)
-		wait_for_watch();
-	else
-		slurm_mutex_unlock(&mgr.mutex);
+	slurm_mutex_unlock(&mgr.mutex);
 }
 
 extern void conmgr_set_exit_on_error(bool exit_on_error)
@@ -274,4 +388,169 @@ extern int conmgr_get_error(void)
 	slurm_mutex_unlock(&mgr.mutex);
 
 	return rc;
+}
+
+extern bool conmgr_enabled(void)
+{
+	if (enabled_init)
+		return enabled_status;
+
+	slurm_mutex_lock(&mgr.mutex);
+	enabled_status = mgr.initialized;
+	slurm_mutex_unlock(&mgr.mutex);
+
+	log_flag(CONMGR, "%s: enabled=%c",
+		 __func__, BOOL_CHARIFY(enabled_status));
+
+	enabled_init = true;
+	return enabled_status;
+}
+
+extern int conmgr_set_params(const char *params)
+{
+	char *tmp_str = NULL, *tok = NULL, *saveptr = NULL;
+
+	slurm_mutex_lock(&mgr.mutex);
+	/*
+	 * This should be called before conmgr is initialized so that params
+	 * are applied on initialization.
+	 */
+	xassert(!mgr.initialized);
+
+	tmp_str = xstrdup(params);
+	tok = strtok_r(tmp_str, ",", &saveptr);
+	while (tok) {
+		if (!xstrncasecmp(tok, CONMGR_PARAM_THREADS,
+				  strlen(CONMGR_PARAM_THREADS))) {
+			const unsigned long count =
+				slurm_atoul(tok + strlen(CONMGR_PARAM_THREADS));
+
+			mgr.workers.conf_threads = count;
+
+			log_flag(CONMGR, "%s: %s set %lu threads",
+				 __func__, tok, count);
+		} else if (!xstrncasecmp(tok, CONMGR_PARAM_MAX_CONN,
+				  strlen(CONMGR_PARAM_MAX_CONN))) {
+			const unsigned long count =
+				slurm_atoul(tok + strlen(CONMGR_PARAM_MAX_CONN));
+
+			if (count < 1)
+				fatal("%s: There must be at least 1 max connection",
+				      __func__);
+
+			mgr.conf_max_connections = count;
+
+			log_flag(CONMGR, "%s: %s activated with %lu max connections",
+				 __func__, tok, count);
+		} else if (!xstrncasecmp(tok, CONMGR_PARAM_QUIESCE_TIMEOUT,
+				  strlen(CONMGR_PARAM_QUIESCE_TIMEOUT))) {
+			const unsigned long count = slurm_atoul(tok +
+				strlen(CONMGR_PARAM_QUIESCE_TIMEOUT));
+
+			if (count == ULONG_MAX)
+				fatal("%s: Invalid timeout: %m", __func__);
+
+			mgr.quiesce.conf_timeout.tv_sec = count;
+			log_flag(CONMGR, "%s: %s activated with %lu seconds",
+				 __func__, tok, count);
+		} else if (!xstrcasecmp(tok, CONMGR_PARAM_POLL_ONLY)) {
+			log_flag(CONMGR, "%s: %s activated", __func__, tok);
+			pollctl_set_mode(POLL_MODE_POLL);
+		} else if (
+			!xstrncasecmp(tok, CONMGR_PARAM_WAIT_WRITE_DELAY,
+				      strlen(CONMGR_PARAM_WAIT_WRITE_DELAY))) {
+			const unsigned long count = slurm_atoul(tok +
+				strlen(CONMGR_PARAM_WAIT_WRITE_DELAY));
+			log_flag(CONMGR, "%s: %s activated", __func__, tok);
+			mgr.conf_delay_write_complete = count;
+		} else if (!xstrncasecmp(tok, CONMGR_PARAM_READ_TIMEOUT,
+					 strlen(CONMGR_PARAM_READ_TIMEOUT))) {
+			const unsigned long count = slurm_atoul(tok +
+				strlen(CONMGR_PARAM_READ_TIMEOUT));
+			log_flag(CONMGR, "%s: %s activated", __func__, tok);
+			mgr.conf_read_timeout.tv_sec = count;
+		} else if (!xstrncasecmp(tok, CONMGR_PARAM_WRITE_TIMEOUT,
+					 strlen(CONMGR_PARAM_WRITE_TIMEOUT))) {
+			const unsigned long count = slurm_atoul(tok +
+				strlen(CONMGR_PARAM_WRITE_TIMEOUT));
+			log_flag(CONMGR, "%s: %s activated", __func__, tok);
+			mgr.conf_write_timeout.tv_sec = count;
+		} else if (
+			!xstrncasecmp(tok, CONMGR_PARAM_CONNECT_TIMEOUT,
+				      strlen(CONMGR_PARAM_CONNECT_TIMEOUT))) {
+			const unsigned long count = slurm_atoul(tok +
+				strlen(CONMGR_PARAM_CONNECT_TIMEOUT));
+			log_flag(CONMGR, "%s: %s activated", __func__, tok);
+			mgr.conf_connect_timeout.tv_sec = count;
+		} else {
+			log_flag(CONMGR, "%s: Ignoring parameter %s",
+				 __func__, tok);
+		}
+
+		tok = strtok_r(NULL, ",", &saveptr);
+	}
+
+	slurm_mutex_unlock(&mgr.mutex);
+	xfree(tmp_str);
+	return SLURM_SUCCESS;
+}
+
+extern void conmgr_quiesce(const char *caller)
+{
+	slurm_mutex_lock(&mgr.mutex);
+
+	log_flag(CONMGR, "%s->%s: quiesce requested", caller, __func__);
+
+	/* wait until other request has completed */
+	while (mgr.quiesce.requested)
+		EVENT_WAIT(&mgr.quiesce.on_stop_quiesced, &mgr.mutex);
+
+	xassert(!mgr.quiesce.active);
+	mgr.quiesce.requested = true;
+	xassert(!mgr.quiesce.start.tv_sec);
+	mgr.quiesce.start = timespec_now();
+
+	while (!mgr.quiesce.active) {
+		EVENT_SIGNAL(&mgr.watch_sleep);
+		EVENT_WAIT(&mgr.quiesce.on_start_quiesced, &mgr.mutex);
+	}
+
+	slurm_mutex_unlock(&mgr.mutex);
+}
+
+extern void conmgr_unquiesce(const char *caller)
+{
+	slurm_mutex_lock(&mgr.mutex);
+
+	xassert(mgr.quiesce.requested);
+	xassert(mgr.quiesce.active);
+	xassert(mgr.quiesce.start.tv_sec);
+
+	mgr.quiesce.requested = false;
+	mgr.quiesce.active = false;
+	mgr.quiesce.start.tv_sec = 0;
+
+	EVENT_BROADCAST(&mgr.quiesce.on_stop_quiesced);
+
+	/*
+	 * If watch() never gets to an active quiesce then watch() may not be
+	 * waiting on on_stop_quiesced event before conmgr_unquiesce() is
+	 * called. Then watch() could still be waiting for a watch_sleep event
+	 * and not a on_stop_quiesced event which could result it in never
+	 * waking up.
+	 */
+	EVENT_SIGNAL(&mgr.watch_sleep);
+
+	slurm_mutex_unlock(&mgr.mutex);
+}
+
+extern bool conmgr_is_quiesced(void)
+{
+	bool quiesced;
+
+	slurm_mutex_lock(&mgr.mutex);
+	quiesced = mgr.quiesce.requested;
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return quiesced;
 }

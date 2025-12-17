@@ -37,25 +37,28 @@
 
 #include <unistd.h>
 
+#include "slurm/slurm_errno.h"
 #include "slurm/slurm.h"
 
+#include "src/common/http.h"
+#include "src/common/http_mime.h"
 #include "src/common/list.h"
 #include "src/common/log.h"
+#include "src/common/read_config.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
+
 #include "src/interfaces/serializer.h"
 
+#include "src/slurmrestd/http.h"
 #include "src/slurmrestd/operations.h"
 #include "src/slurmrestd/rest_auth.h"
 
 static pthread_rwlock_t paths_lock = PTHREAD_RWLOCK_INITIALIZER;
-static List paths = NULL;
+static list_t *paths = NULL;
 static data_parser_t **parsers; /* symlink to parser array */
-serializer_flags_t yaml_flags = SER_FLAGS_PRETTY;
-serializer_flags_t json_flags = SER_FLAGS_PRETTY;
-
-#define MAGIC_HEADER_ACCEPT 0xDF9EAABE
+bool inetd_mode = false;
 
 typedef struct {
 #define PATH_MAGIC 0xDFFEA1AE
@@ -71,17 +74,6 @@ typedef struct {
 	/* assigned parser */
 	data_parser_t *parser;
 } path_t;
-
-typedef struct {
-	int magic; /* MAGIC_HEADER_ACCEPT */
-	char *type; /* mime type and sub type unchanged */
-	float q; /* quality factor (priority) */
-} http_header_accept_t;
-
-static const char *_name(const on_http_request_args_t *args)
-{
-	return conmgr_fd_get_name(args->context->con);
-}
 
 static void _check_path_magic(const path_t *path)
 {
@@ -227,37 +219,44 @@ extern int bind_operation_path(const openapi_path_binding_t *op_path,
 	return rc;
 }
 
-static int _operations_router_reject(const on_http_request_args_t *args,
-				     const char *err,
-				     http_status_code_t err_code,
+static int _operations_router_reject(on_http_request_args_t *args,
+				     const char *err, slurm_err_t error_code,
 				     const char *body_encoding)
 {
 	send_http_response_args_t send_args = {
-		.con = args->context->con,
 		.headers = list_create(NULL),
 		.http_major = args->http_major,
 		.http_minor = args->http_minor,
-		.status_code = err_code,
-		.body = err,
-		.body_encoding = (body_encoding ? body_encoding : "text/plain"),
-		.body_length = (err ? strlen(err) : 0),
+		.body_encoding =
+			(body_encoding ? body_encoding : MIME_TYPE_TEXT),
 	};
-	http_header_entry_t close = {
+	http_header_t close = {
+		.magic = HTTP_HEADER_MAGIC,
 		.name = "Connection",
 		.value = "Close",
 	};
 
+	send_args.con = conmgr_fd_get_ref(args->con);
+	send_args.status_code = http_status_from_error(error_code);
+
+	if (!err)
+		send_args.body = slurm_strerror(error_code);
+	else
+		send_args.body = err;
+
+	send_args.body_length = strlen(send_args.body);
+
 	/* Always warn that connection will be closed after the body is sent */
 	list_append(send_args.headers, &close);
 
-	(void) send_http_response(&send_args);
+	(void) send_http_response(args->context, &send_args);
 
 	/* close connection on error */
-	conmgr_queue_close_fd(args->context->con);
+	conmgr_queue_close_fd(send_args.con);
 
 	FREE_NULL_LIST(send_args.headers);
 
-	return SLURM_ERROR;
+	return error_code;
 }
 
 static int _resolve_path(on_http_request_args_t *args, int *path_tag,
@@ -265,9 +264,8 @@ static int _resolve_path(on_http_request_args_t *args, int *path_tag,
 {
 	data_t *path = parse_url_path(args->path, true, false);
 	if (!path)
-		return _operations_router_reject(
-			args, "Unable to parse URL path.",
-			HTTP_STATUS_CODE_ERROR_BAD_REQUEST, NULL);
+		return _operations_router_reject(args, NULL,
+						 ESLURM_URL_INVALID_PATH, NULL);
 
 	/* attempt to identify path leaf types */
 	(void) data_convert_tree(path, DATA_TYPE_NONE);
@@ -277,15 +275,12 @@ static int _resolve_path(on_http_request_args_t *args, int *path_tag,
 	FREE_NULL_DATA(path);
 
 	if (*path_tag == -1)
-		return _operations_router_reject(
-			args,
-			"Unable find requested URL. Please view /openapi/v3 for API reference.",
-			HTTP_STATUS_CODE_ERROR_NOT_FOUND, NULL);
+		return _operations_router_reject(args, NULL,
+						 ESLURM_REST_UNKNOWN_URL, NULL);
 	else if (*path_tag == -2)
-		return _operations_router_reject(
-			args,
-			"Requested REST method is not defined at URL. Please view /openapi/v3 for API reference.",
-			HTTP_STATUS_CODE_ERROR_METHOD_NOT_ALLOWED, NULL);
+		return _operations_router_reject(args, NULL,
+						 ESLURM_REST_UNKNOWN_URL_METHOD,
+						 NULL);
 	else
 		return SLURM_SUCCESS;
 }
@@ -308,225 +303,54 @@ static int _get_query(on_http_request_args_t *args, data_t **query,
 			query, args->query,
 			(args->query ? strlen(args->query) : 0), read_mime);
 
-	if (rc || !*query)
-		return _operations_router_reject(
-			args, "Unable to parse query.",
-			HTTP_STATUS_CODE_ERROR_BAD_REQUEST, NULL);
+	if (!rc && !*query)
+		rc = ESLURM_REST_INVALID_QUERY;
+
+	if (rc)
+		return _operations_router_reject(args, NULL, rc, NULL);
 	else
 		return SLURM_SUCCESS;
-
-}
-
-static void _parse_http_accept_entry(char *entry, List l)
-{
-	char *save_ptr = NULL;
-	char *token = NULL;
-	char *buffer = xstrdup(entry);
-	http_header_accept_t *act = xmalloc(sizeof(*act));
-	act->magic = MAGIC_HEADER_ACCEPT;
-	act->type = NULL;
-	act->q = 1; /* default to 1 per rfc7231:5.3.1 */
-
-	token = strtok_r(buffer, ";", &save_ptr);
-
-	if (token) {
-		/* first token is the mime type */
-		xstrtrim(token);
-		act->type = xstrdup(token);
-	}
-	while ((token = strtok_r(NULL, ",", &save_ptr))) {
-		xstrtrim(token);
-		sscanf(token, "q=%f", &act->q);
-	}
-	xfree(buffer);
-
-	debug5("%s: found %s with q=%f", __func__, act->type, act->q);
-
-	list_append(l, act);
-}
-
-static int _compare_q(void *x, void *y)
-{
-	http_header_accept_t **xobj_ptr = x;
-	http_header_accept_t **yobj_ptr = y;
-	http_header_accept_t *xobj = *xobj_ptr;
-	http_header_accept_t *yobj = *yobj_ptr;
-
-	xassert(xobj->magic == MAGIC_HEADER_ACCEPT);
-	xassert(yobj->magic == MAGIC_HEADER_ACCEPT);
-
-	if (xobj->q < yobj->q)
-		return -1;
-	else if (xobj->q > yobj->q)
-		return 1;
-
-	return 0;
-}
-
-static void _http_accept_list_delete(void *x)
-{
-	http_header_accept_t *obj = (http_header_accept_t *) x;
-
-	if (!obj)
-		return;
-
-	xassert(obj->magic == MAGIC_HEADER_ACCEPT);
-	obj->magic = ~MAGIC_HEADER_ACCEPT;
-
-	xfree(obj->type);
-	xfree(obj);
-}
-
-static List _parse_http_accept(const char *accept)
-{
-	List l = list_create(_http_accept_list_delete);
-	xassert(accept);
-	char *save_ptr = NULL;
-	char *token = NULL;
-	char *buffer = xstrdup(accept);
-
-	token = strtok_r(buffer, ",", &save_ptr);
-	while (token) {
-		xstrtrim(token);
-		_parse_http_accept_entry(token, l);
-		token = strtok_r(NULL, ",", &save_ptr);
-	}
-	xfree(buffer);
-
-	list_sort(l, _compare_q);
-
-	return l;
-}
-
-static int _resolve_mime(on_http_request_args_t *args, const char **read_mime,
-			 const char **write_mime, const char **plugin_ptr)
-{
-	*read_mime = args->content_type;
-
-	//TODO: check Content-encoding and make sure it is identity only!
-	//https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Encoding
-
-	if (!*read_mime) {
-		*read_mime = MIME_TYPE_URL_ENCODED;
-
-		debug4("%s: [%s] did not provide a known content type header. Assuming URL encoded.",
-		       __func__, _name(args));
-	}
-
-	if (args->accept) {
-		List accept = _parse_http_accept(args->accept);
-		http_header_accept_t *ptr = NULL;
-		list_itr_t *itr = list_iterator_create(accept);
-		while ((ptr = list_next(itr))) {
-			xassert(ptr->magic == MAGIC_HEADER_ACCEPT);
-
-			debug4("%s: [%s] accepts %s with q=%f",
-			       __func__, _name(args), ptr->type, ptr->q);
-
-			if ((*write_mime = resolve_mime_type(ptr->type,
-							     plugin_ptr))) {
-				debug4("%s: [%s] found accepts %s=%s with q=%f",
-				       __func__, _name(args), ptr->type,
-				       *write_mime, ptr->q);
-				break;
-			} else {
-				debug4("%s: [%s] rejecting accepts %s with q=%f",
-				       __func__, _name(args), ptr->type,
-				       ptr->q);
-			}
-		}
-		list_iterator_destroy(itr);
-		FREE_NULL_LIST(accept);
-	} else {
-		debug3("%s: [%s] Accept header not specified. Defaulting to JSON.",
-		       __func__, _name(args));
-		*write_mime = MIME_TYPE_JSON;
-	}
-
-	if (!*write_mime)
-		return _operations_router_reject(
-			args, "Accept content type is unknown",
-			HTTP_STATUS_CODE_ERROR_UNSUPPORTED_MEDIA_TYPE, NULL);
-
-	/*
-	 * RFC7230 3.3: Allows for any request to have a BODY but doesn't require
-	 * the server do anything with it.
-	 *	Request message framing is independent of method semantics, even
-	 *	if the method does not define any use for a message body.
-	 * RFC7231 Appendix B:
-	 *	To be consistent with the method-neutral parsing algorithm of
-	 *	[RFC7230], the definition of GET has been relaxed so that
-	 *	requests can have a body, even though a body has no meaning for
-	 *	GET.  (Section 4.3.1)
-	 *
-	 * In order to avoid confusing the client when their query or body gets
-	 * ignored, reject request when both query and body are provided.
-	 */
-	if ((args->body_length > 0) && args->query && args->query[0])
-		return _operations_router_reject(
-			args,
-			"Unexpected HTTP body provided when URL Query provided",
-			HTTP_STATUS_CODE_ERROR_BAD_REQUEST, NULL);
-
-	if (xstrcasecmp(*read_mime, MIME_TYPE_URL_ENCODED) &&
-	    (args->body_length == 0)) {
-		/*
-		 * RFC7273#3.1.1.5 only specifies a sender SHOULD send
-		 * the correct content-type header but allows for them to be
-		 * wrong and expects the server to handle that gracefully.
-		 *
-		 * We will instead override the mime type if there is empty body
-		 * content to avoid unneccesssily rejecting otherwise compliant
-		 * requests.
-		 */
-		debug("%s: [%s] Overriding content type from %s to %s for %s",
-		      __func__, _name(args), *read_mime, MIME_TYPE_URL_ENCODED,
-		      get_http_method_string(args->method));
-
-		*read_mime = MIME_TYPE_URL_ENCODED;
-	}
-
-	debug3("%s: [%s] mime read: %s write: %s",
-	       __func__, _name(args), *read_mime, *write_mime);
-
-	return SLURM_SUCCESS;
 }
 
 static int _call_handler(on_http_request_args_t *args, data_t *params,
 			 data_t *query, const openapi_path_binding_t *op_path,
 			 int callback_tag, const char *write_mime,
-			 data_parser_t *parser, const openapi_resp_meta_t *meta,
-			 const char *plugin)
+			 data_parser_t *parser, const openapi_resp_meta_t *meta)
 {
 	int rc;
 	data_t *resp = data_new();
 	char *body = NULL;
-	http_status_code_t e;
+	http_status_code_t e = HTTP_STATUS_CODE_INVALID;
+	void *auth = NULL;
+	void *db_conn = NULL;
 
 	xassert(op_path);
 	debug3("%s: [%s] BEGIN: calling ctxt handler: 0x%"PRIXPTR"[%d] for path: %s",
-	       __func__, _name(args), (uintptr_t) op_path->callback,
+	       __func__, args->name, (uintptr_t) op_path->callback,
 	       callback_tag, args->path);
 
-	rc = wrap_openapi_ctxt_callback(_name(args), args->method, params,
-					query, callback_tag, resp,
-					args->context->auth, parser, op_path,
-					meta);
+	auth = http_context_set_auth(args->context, NULL);
+
+	if (!(op_path->flags & OP_BIND_NO_SLURMDBD) &&
+	    slurm_conf.accounting_storage_type)
+		db_conn = openapi_get_db_conn(auth);
+
+	rc = wrap_openapi_ctxt_callback(args->name, args->method, params, query,
+					callback_tag, resp, db_conn, parser,
+					op_path, meta);
 
 	/*
 	 * Clear auth context after callback is complete. Client has to provide
 	 * full auth for every request already.
 	 */
-	FREE_NULL_REST_AUTH(args->context->auth);
+	FREE_NULL_REST_AUTH(auth);
 
 	if (data_get_type(resp) != DATA_TYPE_NULL) {
 		int rc2;
-		serializer_flags_t sflags = SER_FLAGS_PRETTY;
+		serializer_flags_t sflags = SER_FLAGS_NONE;
 
-		if (!xstrcmp(plugin, MIME_TYPE_JSON_PLUGIN))
-			sflags = json_flags;
-		else if (!xstrcmp(plugin, MIME_TYPE_YAML_PLUGIN))
-			sflags = yaml_flags;
+		if (data_parser_g_is_complex(parser))
+			sflags |= SER_FLAGS_COMPLEX;
 
 		rc2 = serialize_g_data_to_string(&body, NULL, resp, write_mime,
 						 sflags);
@@ -543,31 +367,17 @@ static int _call_handler(on_http_request_args_t *args, data_t *params,
 		 *
 		 */
 		send_http_response_args_t send_args = {
-			.con = args->context->con,
 			.http_major = args->http_major,
 			.http_minor = args->http_minor,
 			.status_code = HTTP_STATUS_CODE_REDIRECT_NOT_MODIFIED,
 		};
+		send_args.con = conmgr_fd_get_ref(args->con);
 		e = send_args.status_code;
-		rc = send_http_response(&send_args);
+		rc = send_http_response(args->context, &send_args);
 	} else if (rc && (rc != ESLURM_REST_EMPTY_RESULT)) {
-		e = HTTP_STATUS_CODE_SRVERR_INTERNAL;
-
-		if (rc == ESLURM_REST_INVALID_QUERY)
-			e = HTTP_STATUS_CODE_ERROR_UNPROCESSABLE_CONTENT;
-		else if (rc == ESLURM_REST_FAIL_PARSING)
-			e = HTTP_STATUS_CODE_ERROR_BAD_REQUEST;
-		else if (rc == ESLURM_REST_INVALID_JOBS_DESC)
-			e = HTTP_STATUS_CODE_ERROR_BAD_REQUEST;
-		else if (rc == ESLURM_DATA_UNKNOWN_MIME_TYPE)
-			e = HTTP_STATUS_CODE_ERROR_UNSUPPORTED_MEDIA_TYPE;
-		else if (rc == ESLURM_INVALID_JOB_ID)
-			e = HTTP_STATUS_CODE_ERROR_NOT_FOUND;
-
-		rc = _operations_router_reject(args, body, e, write_mime);
+		rc = _operations_router_reject(args, body, rc, write_mime);
 	} else {
 		send_http_response_args_t send_args = {
-			.con = args->context->con,
 			.http_major = args->http_major,
 			.http_minor = args->http_minor,
 			.status_code = HTTP_STATUS_CODE_SUCCESS_OK,
@@ -575,20 +385,23 @@ static int _call_handler(on_http_request_args_t *args, data_t *params,
 			.body_length = 0,
 		};
 
+		send_args.con = conmgr_fd_get_ref(args->con);
+
 		if (body) {
 			send_args.body = body;
 			send_args.body_length = strlen(body);
 			send_args.body_encoding = write_mime;
 		}
 
-		rc = send_http_response(&send_args);
+		rc = send_http_response(args->context, &send_args);
 		e = send_args.status_code;
 	}
 
 	debug3("%s: [%s] END: calling handler: (0x%"PRIXPTR") callback_tag %d for path: %s rc[%d]=%s status[%d]=%s",
-	       __func__, _name(args), (uintptr_t) op_path->callback,
-	       callback_tag, args->path, rc, slurm_strerror(rc), e,
-	       get_http_status_code_string(e));
+	       __func__, args->name, (uintptr_t) op_path->callback,
+	       callback_tag, args->path, rc, slurm_strerror(rc),
+	       ((e == HTTP_STATUS_CODE_INVALID) ? http_status_from_error(rc) :
+		e), get_http_status_code_string(e));
 
 	xfree(body);
 	FREE_NULL_DATA(resp);
@@ -596,7 +409,10 @@ static int _call_handler(on_http_request_args_t *args, data_t *params,
 	return rc;
 }
 
-extern int operations_router(on_http_request_args_t *args)
+extern int operations_router(on_http_request_args_t *args, http_con_t *hcon,
+			     const char *name,
+			     const http_con_request_t *request,
+			     http_context_t *ctxt)
 {
 	int rc = SLURM_SUCCESS;
 	data_t *query = NULL;
@@ -604,19 +420,16 @@ extern int operations_router(on_http_request_args_t *args)
 	int path_tag;
 	path_t *path = NULL;
 	int callback_tag;
-	const char *read_mime = NULL, *write_mime = NULL, *plugin = NULL;
+	const char *read_mime = NULL, *write_mime = NULL;
 	data_parser_t *parser = NULL;
 
 	info("%s: [%s] %s %s",
-	     __func__, _name(args), get_http_method_string(args->method),
-	     args->path);
+	     __func__, name, get_http_method_string(args->method), args->path);
 
 	if ((rc = rest_authenticate_http_request(args))) {
 		error("%s: [%s] authentication failed: %s",
-		      __func__, _name(args), slurm_strerror(rc));
-		_operations_router_reject(args, "Authentication failure",
-					  HTTP_STATUS_CODE_ERROR_UNAUTHORIZED,
-					  NULL);
+		      __func__, name, slurm_strerror(rc));
+		_operations_router_reject(args, NULL, rc, NULL);
 		return rc;
 	}
 
@@ -640,25 +453,26 @@ extern int operations_router(on_http_request_args_t *args)
 	slurm_rwlock_unlock(&paths_lock);
 
 	debug5("%s: [%s] found callback handler: (0x%"PRIXPTR") callback_tag=%d path=%s parser=%s",
-	       __func__, _name(args), (uintptr_t) path->op_path->callback,
+	       __func__, name, (uintptr_t) path->op_path->callback,
 	       callback_tag, args->path,
 	       (parser ? data_parser_get_plugin(parser) : ""));
 
-	if ((rc = _resolve_mime(args, &read_mime, &write_mime, &plugin)))
+	if ((rc = http_resolve_mime_types(name, request, &read_mime,
+					  &write_mime)))
 		goto cleanup;
 
 	if ((rc = _get_query(args, &query, read_mime)))
 		goto cleanup;
 
 	rc = _call_handler(args, params, query, path->op_path, callback_tag,
-			   write_mime, parser, path->meta, plugin);
+			   write_mime, parser, path->meta);
 
 cleanup:
 	FREE_NULL_DATA(query);
 	FREE_NULL_DATA(params);
 
 	/* always clear the auth context */
-	FREE_NULL_REST_AUTH(args->context->auth);
+	http_context_free_null_auth(args->context);
 
 	return rc;
 }

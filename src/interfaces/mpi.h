@@ -53,6 +53,7 @@ enum mpi_plugin_type {
 	MPI_PLUGIN_PMIX3 = 105,
 	MPI_PLUGIN_PMIX4 = 106,
 	MPI_PLUGIN_PMIX5 = 107,
+	MPI_PLUGIN_PMIX6 = 108,
 };
 
 typedef struct slurm_mpi_context *slurm_mpi_context_t;
@@ -146,7 +147,7 @@ extern int mpi_g_client_fini(mpi_plugin_client_state_t *state);
 extern int mpi_g_daemon_init(void);
 
 /* Deliver a printable list to the client with config from all loaded plugins */
-extern List mpi_g_conf_get_printable(void);
+extern list_t *mpi_g_conf_get_printable(void);
 
 /* Functions to send config from Slurmd to Slurstepd, peer to peer */
 extern int mpi_conf_send_stepd(int fd, uint32_t plugin_id);

@@ -75,6 +75,7 @@ static bool has_task_exit = false;
 
 struct spank_plugin_operations {
 	spank_f *init;
+	int *init_failure_mode;
 	spank_f *job_prolog;
 	spank_f *init_post_opt;
 	spank_f *local_user_init;
@@ -88,9 +89,10 @@ struct spank_plugin_operations {
 	spank_f *exit;
 };
 
-const int n_spank_syms = 12;
+const int n_spank_syms = 13;
 const char *spank_syms[] = {
 	"slurm_spank_init",
+	"slurm_spank_init_failure_mode",
 	"slurm_spank_job_prolog",
 	"slurm_spank_init_post_opt",
 	"slurm_spank_local_user_init",
@@ -168,8 +170,8 @@ struct spank_handle {
  */
 struct spank_stack {
 	enum spank_context_type type;/*  Type of context for this stack      */
-	List plugin_list;	     /*  Stack of spank plugins              */
-	List option_cache;           /*  Cache of plugin options in this ctx */
+	list_t *plugin_list;         /*  Stack of spank plugins              */
+	list_t *option_cache;        /*  Cache of plugin options in this ctx */
 	int  spank_optval;           /*  optvalue for next plugin option     */
 	const char * plugin_path;    /*  default path to search for plugins  */
 };
@@ -187,9 +189,10 @@ static int _spank_option_register(struct spank_plugin *p,
 static int _spank_stack_load (struct spank_stack *stack, const char *file);
 static void _spank_plugin_destroy (struct spank_plugin *);
 static void _spank_plugin_opt_destroy (struct spank_plugin_opt *);
-static void _spank_stack_get_remote_options(struct spank_stack *, List, List);
+static void _spank_stack_get_remote_options(struct spank_stack *, list_t *,
+					    list_t *);
 static void _spank_stack_get_remote_options_env(struct spank_stack *, char **,
-						List);
+						list_t *);
 static void _spank_stack_set_remote_options_env(struct spank_stack *stack);
 static int dyn_spank_set_job_env (const char *var, const char *val, int ovwt);
 static char *_opt_env_name(struct spank_plugin_opt *p, char *buf, size_t siz);
@@ -227,7 +230,7 @@ spank_stack_create (const char *file, enum spank_context_type type)
 	return (stack);
 }
 
-static List get_global_option_cache (void)
+static list_t *get_global_option_cache(void)
 {
 	if (global_spank_stack)
 		return (global_spank_stack->option_cache);
@@ -236,7 +239,7 @@ static List get_global_option_cache (void)
 }
 
 
-static int plugin_in_list (List l, struct spank_plugin *sp)
+static int plugin_in_list(list_t *l, struct spank_plugin *sp)
 {
 	int rc = 0;
 	struct spank_plugin *p;
@@ -334,8 +337,11 @@ static struct spank_plugin *_spank_plugin_create(struct spank_stack *stack,
 	int e;
 	struct spank_plugin_operations ops;
 
-	if ((e = plugin_load_from_file(&p, path)) != SLURM_SUCCESS) {
-		error("spank: %s: %s", path, slurm_strerror(e));
+	if ((e = plugin_load_from_file(&p, path, required)) != SLURM_SUCCESS) {
+		if (required)
+			error("spank: %s: %s", path, slurm_strerror(e));
+		else
+			verbose("spank: %s: %s", path, slurm_strerror(e));
 		return NULL;
 	}
 
@@ -749,6 +755,8 @@ static int _do_call_stack(struct spank_stack *stack,
 		if (rc && sp->required) {
 			error("spank: required plugin %s: "
 			      "%s() failed with rc=%d", name, fn_name, rc);
+			if ((type == SPANK_INIT) && sp->ops.init_failure_mode)
+				rc = *(sp->ops.init_failure_mode);
 			break;
 		} else
 			rc = SLURM_SUCCESS;
@@ -787,7 +795,7 @@ int _spank_init(enum spank_context_type context, stepd_step_rec_t *step)
 static int spank_stack_post_opt (struct spank_stack * stack,
 				 stepd_step_rec_t *step)
 {
-	List found_opts = job_options_create();
+	list_t *found_opts = job_options_create();
 
 	/*
 	 *  Get any remote options from job launch message:
@@ -815,8 +823,10 @@ static int spank_stack_post_opt (struct spank_stack * stack,
 
 static int spank_init_remote (stepd_step_rec_t *step)
 {
-	if (_spank_init (S_TYPE_REMOTE, step) < 0)
-		return (-1);
+	int rc = SLURM_SUCCESS;
+
+	if ((rc = _spank_init(S_TYPE_REMOTE, step)))
+		return rc;
 
 	/*
 	 * _spank_init initializes global_spank_stack
@@ -1021,7 +1031,7 @@ _spank_option_register(struct spank_plugin *p, struct spank_option *opt)
 	int disabled = 0;
 	struct spank_plugin_opt *spopt;
 	struct spank_stack *stack;
-	List option_cache;
+	list_t *option_cache;
 
 	stack = p->stack;
 	if (stack == NULL) {
@@ -1105,7 +1115,7 @@ struct option *spank_option_table_create(const struct option *orig)
 	struct option *opts = NULL;
 	list_itr_t *i = NULL;
 
-	List option_cache = get_global_option_cache();
+	list_t *option_cache = get_global_option_cache();
 	if (option_cache == NULL)
 		return (NULL);
 
@@ -1171,7 +1181,7 @@ extern int spank_process_option(int optval, const char *arg)
 {
 	struct spank_plugin_opt *opt;
 	int rc = 0;
-	List option_cache = get_global_option_cache();
+	list_t *option_cache = get_global_option_cache();
 
 	if (option_cache == NULL || (list_count(option_cache) == 0)) {
 		debug("No spank option cache");
@@ -1198,7 +1208,7 @@ extern int spank_process_env_options(void)
 	const char *arg;
 	struct spank_plugin_opt *option;
 	list_itr_t *i;
-	List option_cache = get_global_option_cache();
+	list_t *option_cache = get_global_option_cache();
 	int rc = 0;
 
 	if (option_cache == NULL || (list_count(option_cache) == 0))
@@ -1363,7 +1373,7 @@ void spank_print_options(FILE * fp, int left_pad, int width)
 {
 	struct spank_plugin_opt *p;
 	list_itr_t *i;
-	List option_cache = get_global_option_cache();
+	list_t *option_cache = get_global_option_cache();
 
 	if ((option_cache == NULL) || (list_count(option_cache) == 0))
 		return;
@@ -1461,7 +1471,7 @@ static void _spank_stack_set_remote_options_env(struct spank_stack *stack)
 {
 	struct spank_plugin_opt *p;
 	list_itr_t *i;
-	List option_cache;
+	list_t *option_cache;
 
 	if (stack == NULL)
 		return;
@@ -1479,11 +1489,11 @@ static void _spank_stack_set_remote_options_env(struct spank_stack *stack)
 	list_iterator_destroy(i);
 }
 
-void spank_set_remote_options(List opts)
+void spank_set_remote_options(list_t *opts)
 {
 	struct spank_plugin_opt *p;
 	list_itr_t *i;
-	List option_cache;
+	list_t *option_cache;
 
 	if (global_spank_stack == NULL)
 		return;
@@ -1531,7 +1541,7 @@ spank_stack_find_option_by_name(struct spank_stack *stack, const char *str)
 	struct opt_find_args args;
 	char *buf;
 	char *name;
-	List option_cache = stack->option_cache;
+	list_t *option_cache = stack->option_cache;
 
 	buf = xstrdup(str);
 	if (!(name = xstrchr(buf, ':'))) {
@@ -1567,7 +1577,7 @@ spank_option_getopt (spank_t sp, struct spank_option *opt, char **argp)
 {
 	const char *val;
 	char var[1024];
-	List option_cache;
+	list_t *option_cache;
 	struct spank_plugin_opt *spopt;
 
 	if (argp)
@@ -1661,13 +1671,13 @@ static int _opt_info_find(struct job_option_info *info,
 }
 
 static void _spank_stack_get_remote_options_env(struct spank_stack *stack,
-						char **env, List found_opts)
+						char **env, list_t *found_opts)
 {
 	char var [1024];
 	const char *arg;
 	struct spank_plugin_opt *option;
 	list_itr_t *i;
-	List option_cache = stack->option_cache;
+	list_t *option_cache = stack->option_cache;
 
 	if (!option_cache)
 		return;
@@ -1697,7 +1707,7 @@ static void _spank_stack_get_remote_options_env(struct spank_stack *stack,
 }
 
 static void _spank_stack_get_remote_options(struct spank_stack *stack,
-					    List opts, List found_opts)
+					    list_t *opts, list_t *found_opts)
 {
 	const struct job_option_info *j;
 	list_itr_t *li;
@@ -2511,7 +2521,7 @@ size_t spank_get_plugin_option_names(const char *plugin_name, char ***opts)
 	struct spank_plugin_opt *spopt;
 	size_t nopts = 0;
 
-	List options = get_global_option_cache();
+	list_t *options = get_global_option_cache();
 	list_itr_t *i;
 
 	i = list_iterator_create(options);
@@ -2534,7 +2544,7 @@ size_t spank_get_plugin_option_names(const char *plugin_name, char ***opts)
  */
 extern char *spank_option_get(char *name)
 {
-	List option_cache = get_global_option_cache();
+	list_t *option_cache = get_global_option_cache();
 	struct spank_plugin_opt *spopt;
 
 	if (!option_cache)
@@ -2559,7 +2569,7 @@ extern char *spank_option_get(char *name)
  */
 extern char *spank_option_plugin(char *optname)
 {
-	List option_cache = get_global_option_cache();
+	list_t *option_cache = get_global_option_cache();
 	struct spank_plugin_opt *spopt;
 
 	if (!option_cache)
@@ -2578,7 +2588,7 @@ extern char *spank_option_plugin(char *optname)
  */
 extern bool spank_option_isset(char *name)
 {
-	List option_cache = get_global_option_cache();
+	list_t *option_cache = get_global_option_cache();
 	struct spank_plugin_opt *spopt;
 
 	if (!option_cache)
@@ -2605,7 +2615,7 @@ extern bool spank_option_isset(char *name)
 extern bool spank_option_get_next_set(char **plugin, char **name,
 				      char **value, void **state)
 {
-	List option_cache = get_global_option_cache();
+	list_t *option_cache = get_global_option_cache();
 	list_itr_t **iter = *state;
 	struct spank_plugin_opt *spopt;
 

@@ -1,7 +1,6 @@
 # Makefile for cli_filter/lua plugin
 
 AUTOMAKE_OPTIONS = foreign
-CLEANFILES = core.*
 
 PLUGIN_FLAGS = -module -avoid-version --export-dynamic
 
@@ -24,4 +23,3 @@ $(cli_filter_lua_la_LIBADD) : force
 else
 EXTRA_cli_filter_lua_la_SOURCES = cli_filter_lua.c
 endif
-

@@ -48,6 +48,16 @@
 #include "src/slurmctld/slurmctld.h"
 #include "src/interfaces/accounting_storage.h"
 
+/* JobCompParams enabled events. */
+#define JOBCOMP_CONF_JOB_FINISH SLURM_BIT(0) /* enable_job_finish */
+#define JOBCOMP_CONF_JOB_START SLURM_BIT(1) /* enable_job_start */
+
+typedef enum {
+	JOBCOMP_EVENT_INVALID = 0,
+	JOBCOMP_EVENT_JOB_FINISH,
+	JOBCOMP_EVENT_JOB_START,
+} jobcomp_event_t;
+
 typedef struct {
 	uint32_t jobid;
 	char *partition;
@@ -93,16 +103,19 @@ extern int jobcomp_g_init(void);
 extern int jobcomp_g_fini(void);
 
 /* write record of a job's completion */
-extern int jobcomp_g_write(job_record_t *job_ptr);
+extern int jobcomp_g_record_job_end(job_record_t *job_ptr);
 
 /*
  * get info from the storage
  * returns List of jobcomp_job_rec_t *
  * note List needs to be freed when called
  */
-extern List jobcomp_g_get_jobs(slurmdb_job_cond_t *job_cond);
+extern list_t *jobcomp_g_get_jobs(slurmdb_job_cond_t *job_cond);
 
 /* set the location based on JobCompLoc */
 extern int jobcomp_g_set_location(void);
+
+/* write record of a job's start */
+extern int jobcomp_g_record_job_start(job_record_t *job_ptr);
 
 #endif

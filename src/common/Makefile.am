@@ -26,19 +26,22 @@ libcommon_la_SOURCES =				\
 	daemonize.h				\
 	data.c					\
 	data.h					\
+	dynamic_plugin_data.c			\
+	dynamic_plugin_data.h			\
 	eio.c					\
 	eio.h					\
 	env.c					\
 	env.h					\
 	extra_constraints.c			\
 	extra_constraints.h			\
+	events.c				\
+	events.h				\
 	fd.c					\
 	fd.h					\
 	fetch_config.c				\
 	fetch_config.h				\
 	forward.c				\
 	forward.h				\
-	front_end.h				\
 	global_defaults.c			\
 	group_cache.c				\
 	group_cache.h				\
@@ -48,6 +51,14 @@ libcommon_la_SOURCES =				\
 	hostlist.h				\
 	http.h					\
 	http.c					\
+	http_con.h				\
+	http_con.c				\
+	http_mime.h				\
+	http_mime.c				\
+	http_router.h				\
+	http_router.c				\
+	http_switch.h				\
+	http_switch.c				\
 	identity.h				\
 	identity.c				\
 	id_util.h				\
@@ -75,6 +86,8 @@ libcommon_la_SOURCES =				\
 	net.h					\
 	node_conf.c				\
 	node_conf.h				\
+	node_features.c				\
+	node_features.h				\
 	oci_config.c				\
 	oci_config.h				\
 	openapi.c				\
@@ -101,6 +114,8 @@ libcommon_la_SOURCES =				\
 	port_mgr.h				\
 	print_fields.c				\
 	print_fields.h				\
+	probes.c				\
+	probes.h				\
 	proc_args.c				\
 	proc_args.h				\
 	read_config.c				\
@@ -116,6 +131,8 @@ libcommon_la_SOURCES =				\
 	sack_api.h				\
 	setproctitle.c				\
 	setproctitle.h				\
+	sluid.c					\
+	sluid.h					\
 	slurm_errno.c				\
 	slurm_opt.c				\
 	slurm_opt.h				\
@@ -151,12 +168,18 @@ libcommon_la_SOURCES =				\
 	slurmdbd_pack.h				\
 	spank.c					\
 	spank.h					\
+	state_save.c				\
+	state_save.h				\
 	stepd_api.c				\
 	stepd_api.h				\
+	stepd_proxy.c				\
+	stepd_proxy.h				\
 	strlcpy.c				\
 	strlcpy.h				\
 	strnatcmp.c				\
 	strnatcmp.h				\
+	threadpool.c				\
+	threadpool.h				\
 	timers.c				\
 	timers.h				\
 	track_script.c				\
@@ -184,8 +207,12 @@ libcommon_la_SOURCES =				\
 	xhash.h					\
 	xmalloc.c				\
 	xmalloc.h				\
+	xrandom.c				\
+	xrandom.h				\
 	xregex.c				\
 	xregex.h				\
+	xsched.c				\
+	xsched.h				\
 	xsystemd.c				\
 	xsystemd.h				\
 	xsignal.c				\

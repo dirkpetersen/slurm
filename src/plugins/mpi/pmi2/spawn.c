@@ -193,7 +193,6 @@ extern int spawn_req_unpack(spawn_req_t **req_ptr, buf_t *buf)
 {
 	spawn_req_t *req = NULL;
 	spawn_subcmd_t *subcmd = NULL;
-	uint32_t temp32;
 	int i, j;
 	void *auth_cred;
 	uid_t auth_uid, my_uid;
@@ -224,7 +223,7 @@ extern int spawn_req_unpack(spawn_req_t **req_ptr, buf_t *buf)
 	req = xmalloc(sizeof(spawn_req_t));
 
 	safe_unpack32(&req->seq, buf);
-	safe_unpackstr_xmalloc(&req->from_node, &temp32, buf);
+	safe_unpackstr(&req->from_node, buf);
 	safe_unpack32(&req->subcmd_cnt, buf);
 	/* subcmd_cnt must be greater than 0 */
 	safe_xcalloc(req->subcmds, req->subcmd_cnt, sizeof(spawn_subcmd_t *));
@@ -233,23 +232,22 @@ extern int spawn_req_unpack(spawn_req_t **req_ptr, buf_t *buf)
 		safe_xcalloc(req->pp_keys, req->preput_cnt, sizeof(char *));
 		safe_xcalloc(req->pp_vals, req->preput_cnt, sizeof(char *));
 		for (i = 0; i < req->preput_cnt; i ++) {
-			safe_unpackstr_xmalloc(&req->pp_keys[i], &temp32, buf);
-			safe_unpackstr_xmalloc(&req->pp_vals[i], &temp32, buf);
+			safe_unpackstr(&req->pp_keys[i], buf);
+			safe_unpackstr(&req->pp_vals[i], buf);
 		}
 	}
 	for (i = 0; i < req->subcmd_cnt; i ++) {
 		req->subcmds[i] = spawn_subcmd_new();
 		subcmd = req->subcmds[i];
 
-		safe_unpackstr_xmalloc(&(subcmd->cmd), &temp32, buf);
+		safe_unpackstr(&(subcmd->cmd), buf);
 		safe_unpack32(&(subcmd->max_procs), buf);
 		safe_unpack32(&(subcmd->argc), buf);
 		if (subcmd->argc > 0) {
 			safe_xcalloc(subcmd->argv, subcmd->argc,
 				     sizeof(char *));
 			for (j = 0; j < subcmd->argc; j ++) {
-				safe_unpackstr_xmalloc(&(subcmd->argv[j]),
-						       &temp32, buf);
+				safe_unpackstr(&(subcmd->argv[j]), buf);
 			}
 		}
 		safe_unpack32(&(subcmd->info_cnt), buf);
@@ -259,10 +257,8 @@ extern int spawn_req_unpack(spawn_req_t **req_ptr, buf_t *buf)
 			safe_xcalloc(subcmd->info_vals, subcmd->info_cnt,
 				     sizeof(char *));
 			for (j = 0; j < subcmd->info_cnt; j ++) {
-				safe_unpackstr_xmalloc(&(subcmd->info_keys[j]),
-						       &temp32, buf);
-				safe_unpackstr_xmalloc(&(subcmd->info_vals[j]),
-						       &temp32, buf);
+				safe_unpackstr(&(subcmd->info_keys[j]), buf);
+				safe_unpackstr(&(subcmd->info_vals[j]), buf);
 			}
 		}
 	}
@@ -333,7 +329,6 @@ extern void spawn_resp_pack(spawn_resp_t *resp, buf_t *buf)
 extern int spawn_resp_unpack(spawn_resp_t **resp_ptr, buf_t *buf)
 {
 	spawn_resp_t *resp = NULL;
-	uint32_t temp32;
 	int i;
 
 	resp = xmalloc(sizeof(spawn_resp_t));
@@ -341,7 +336,7 @@ extern int spawn_resp_unpack(spawn_resp_t **resp_ptr, buf_t *buf)
 	safe_unpack32(&resp->seq, buf);
 	safe_unpack32((uint32_t *)&resp->rc, buf);
 	safe_unpack16((uint16_t *)&resp->pmi_port, buf);
-	safe_unpackstr_xmalloc(&resp->jobid, &temp32, buf);
+	safe_unpackstr(&resp->jobid, buf);
 	safe_unpack32(&resp->error_cnt, buf);
 	if (resp->error_cnt > 0) {
 		safe_xcalloc(resp->error_codes, resp->error_cnt, sizeof(int));
@@ -407,7 +402,8 @@ spawn_resp_send_to_fd(spawn_resp_t *resp, int fd)
 /* 	cmd = TREE_CMD_SPAWN_RESP; */
 /* 	pack16(cmd, buf); */
 	spawn_resp_pack(resp, buf);
-	rc = slurm_msg_sendto(fd, get_buf_data(buf), get_buf_offset(buf));
+	rc = slurm_msg_sendto_socket(fd, get_buf_data(buf),
+				     get_buf_offset(buf));
 	FREE_NULL_BUFFER(buf);
 
 	return rc;
@@ -713,7 +709,7 @@ spawn_job_wait(void)
 	for (i = 1; i < spawn_seq; i ++) {
 		if (!spawned_srun_pids[i])
 			continue;
-		/* terminte it */
+		/* terminate it */
 		kill(spawned_srun_pids[i], SIGTERM);
 	}
 }

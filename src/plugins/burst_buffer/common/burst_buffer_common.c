@@ -83,25 +83,28 @@ static void	_bb_job_del2(bb_job_t *bb_job);
 static uid_t *	_parse_users(char *buf);
 static char *	_print_users(uid_t *buf);
 
-/* Translate comma delimitted list of users into a UID array,
+/* Translate comma delimited list of users into a UID array,
  * Return value must be xfreed */
 static uid_t *_parse_users(char *buf)
 {
 	char *tmp, *tok, *save_ptr = NULL;
 	int inx = 0, array_size;
+	uid_t uid = NO_VAL;
 	uid_t *user_array = NULL;
 
 	if (!buf)
 		return user_array;
 	tmp = xstrdup(buf);
 	array_size = 1;
-	user_array = xmalloc(sizeof(uid_t) * array_size);
+	user_array = xcalloc(array_size, sizeof(uid_t));
 	tok = strtok_r(tmp, ",", &save_ptr);
 	while (tok) {
-		if ((uid_from_string(tok, user_array + inx) == -1) ||
-		    (user_array[inx] == 0)) {
+		uid = NO_VAL;
+		if ((uid_from_string(tok, &uid) != SLURM_SUCCESS) ||
+		    (uid == 0)) {
 			error("%s: ignoring invalid user: %s", __func__, tok);
 		} else {
+			user_array[inx] = uid;
 			if (++inx >= array_size) {
 				array_size *= 2;
 				user_array = xrealloc(user_array,
@@ -139,9 +142,9 @@ static char *_print_users(uid_t *buf)
 /* Allocate burst buffer hash tables */
 extern void bb_alloc_cache(bb_state_t *state_ptr)
 {
-	state_ptr->bb_ahash = xmalloc(sizeof(bb_alloc_t *) * BB_HASH_SIZE);
-	state_ptr->bb_jhash = xmalloc(sizeof(bb_job_t *)   * BB_HASH_SIZE);
-	state_ptr->bb_uhash = xmalloc(sizeof(bb_user_t *)  * BB_HASH_SIZE);
+	state_ptr->bb_ahash = xcalloc(BB_HASH_SIZE, sizeof(bb_alloc_t *));
+	state_ptr->bb_jhash = xcalloc(BB_HASH_SIZE, sizeof(bb_job_t *));
+	state_ptr->bb_uhash = xcalloc(BB_HASH_SIZE, sizeof(bb_user_t *));
 }
 
 /* Clear all cached burst buffer records, freeing all memory. */
@@ -729,33 +732,6 @@ extern void bb_load_config(bb_state_t *state_ptr, char *plugin_type)
 	}
 }
 
-extern int bb_open_state_file(const char *file_name, char **state_file)
-{
-	int state_fd;
-	struct stat stat_buf;
-
-	*state_file = xstrdup(slurm_conf.state_save_location);
-	xstrfmtcat(*state_file, "/%s", file_name);
-	state_fd = open(*state_file, O_RDONLY);
-	if (state_fd < 0) {
-		error("Could not open burst buffer state file %s: %m",
-		      *state_file);
-	} else if (fstat(state_fd, &stat_buf) < 0) {
-		error("Could not stat burst buffer state file %s: %m",
-		      *state_file);
-		(void) close(state_fd);
-	} else if (stat_buf.st_size < 4) {
-		error("Burst buffer state file %s too small", *state_file);
-		(void) close(state_fd);
-	} else	/* Success */
-		return state_fd;
-
-	error("NOTE: Trying backup burst buffer state save file. Information may be lost!");
-	xstrcat(*state_file, ".old");
-	state_fd = open(*state_file, O_RDONLY);
-	return state_fd;
-}
-
 static void _pack_alloc(struct bb_alloc *bb_alloc, buf_t *buffer,
 			uint16_t protocol_version)
 {
@@ -829,7 +805,7 @@ extern void bb_pack_state(bb_state_t *state_ptr, buf_t *buffer,
 	int i;
 
 
-	if (protocol_version >= SLURM_24_05_PROTOCOL_VERSION) {
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
 		packstr(config_ptr->allow_users_str, buffer);
 		packstr(config_ptr->create_buffer,   buffer);
 		packstr(config_ptr->default_pool,    buffer);
@@ -848,35 +824,6 @@ extern void bb_pack_state(bb_state_t *state_ptr, buf_t *buffer,
 			pack64(config_ptr->pool_ptr[i].used_space, buffer);
 		}
 		pack32(config_ptr->poll_interval, buffer);
-		pack32(config_ptr->other_timeout,    buffer);
-		packstr(config_ptr->start_stage_in,  buffer);
-		packstr(config_ptr->start_stage_out, buffer);
-		packstr(config_ptr->stop_stage_in,   buffer);
-		packstr(config_ptr->stop_stage_out,  buffer);
-		pack32(config_ptr->stage_in_timeout, buffer);
-		pack32(config_ptr->stage_out_timeout,buffer);
-		pack64(state_ptr->total_space,       buffer);
-		pack64(state_ptr->unfree_space,      buffer);
-		pack64(state_ptr->used_space,        buffer);
-		pack32(config_ptr->validate_timeout, buffer);
-	} else if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		packstr(config_ptr->allow_users_str, buffer);
-		packstr(config_ptr->create_buffer,   buffer);
-		packstr(config_ptr->default_pool,    buffer);
-		packstr(config_ptr->deny_users_str,  buffer);
-		packstr(config_ptr->destroy_buffer,  buffer);
-		pack32(config_ptr->flags,            buffer);
-		packstr(config_ptr->get_sys_state,   buffer);
-		packstr(config_ptr->get_sys_status,   buffer);
-		pack64(config_ptr->granularity,      buffer);
-		pack32(config_ptr->pool_cnt,         buffer);
-		for (i = 0; i < config_ptr->pool_cnt; i++) {
-			packstr(config_ptr->pool_ptr[i].name, buffer);
-			pack64(config_ptr->pool_ptr[i].total_space, buffer);
-			pack64(config_ptr->pool_ptr[i].granularity, buffer);
-			pack64(config_ptr->pool_ptr[i].unfree_space, buffer);
-			pack64(config_ptr->pool_ptr[i].used_space, buffer);
-		}
 		pack32(config_ptr->other_timeout,    buffer);
 		packstr(config_ptr->start_stage_in,  buffer);
 		packstr(config_ptr->start_stage_out, buffer);
@@ -964,8 +911,7 @@ extern uint64_t bb_get_size_num(char *tok, uint64_t granularity)
 	}
 
 	if (granularity > 1) {
-		bb_size_u = ((bb_size_u + granularity - 1) / granularity) *
-			    granularity;
+		bb_size_u = ROUNDUP(bb_size_u, granularity) * granularity;
 	}
 
 	return bb_size_u;
@@ -1779,7 +1725,7 @@ extern int bb_test_size_limit(job_record_t *job_ptr, bb_job_t *bb_job,
 	int i, j, k, rc = BB_CAN_START_NOW;
 	bool avail_ok, do_preempt, preempt_ok;
 	time_t now = time(NULL);
-	List preempt_list = NULL;
+	list_t *preempt_list = NULL;
 	list_itr_t *preempt_iter;
 	bb_state_t bb_state = *bb_state_ptr;
 
@@ -2043,7 +1989,7 @@ extern void bb_update_system_comment(job_record_t *job_ptr, char *operation,
 		slurmdb_job_cond_t job_cond;
 		slurmdb_job_rec_t job_rec;
 		slurm_selected_step_t selected_step;
-		List ret_list;
+		list_t *ret_list;
 
 		memset(&job_cond, 0, sizeof(slurmdb_job_cond_t));
 		memset(&job_rec, 0, sizeof(slurmdb_job_rec_t));
@@ -2201,53 +2147,4 @@ extern int bb_write_nid_file(char *file_name, char *node_list,
 	}
 	return rc;
 #endif
-}
-
-extern void bb_write_state_file(char* old_file, char *reg_file, char *new_file,
-				const char *plugin, buf_t *buffer,
-				int buffer_size, time_t save_time,
-				time_t *last_save_time)
-{
-	int state_fd, error_code = 0;
-
-	state_fd = creat(new_file, 0600);
-	if (state_fd < 0) {
-		error("Can't save state, error creating file %s, %m",
-		      new_file);
-		error_code = errno;
-	} else {
-		int pos = 0, nwrite = get_buf_offset(buffer), amount, rc;
-		char *data = (char *)get_buf_data(buffer);
-		buffer_size = MAX(nwrite, buffer_size);
-		while (nwrite > 0) {
-			amount = write(state_fd, &data[pos], nwrite);
-			if ((amount < 0) && (errno != EINTR)) {
-				error("Error writing file %s, %m", new_file);
-				break;
-			}
-			nwrite -= amount;
-			pos    += amount;
-		}
-
-		rc = fsync_and_close(state_fd, plugin);
-		if (rc && !error_code)
-			error_code = rc;
-	}
-	if (error_code)
-		(void) unlink(new_file);
-	else {
-		/* file shuffle */
-		*last_save_time = save_time;
-		(void) unlink(old_file);
-		if (link(reg_file, old_file)) {
-			debug4("unable to create link for %s -> %s: %m",
-			       reg_file, old_file);
-		}
-		(void) unlink(reg_file);
-		if (link(new_file, reg_file)) {
-			debug4("unable to create link for %s -> %s: %m",
-			       new_file, reg_file);
-		}
-		(void) unlink(new_file);
-	}
 }

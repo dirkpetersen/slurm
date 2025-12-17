@@ -102,6 +102,8 @@ strong_alias(unpackmem_xmalloc,	slurm_unpackmem_xmalloc);
 strong_alias(unpackstr_xmalloc, slurm_unpackstr_xmalloc);
 strong_alias(unpackstr_xmalloc_escaped, slurm_unpackstr_xmalloc_escaped);
 strong_alias(unpackstr_xmalloc_chooser, slurm_unpackstr_xmalloc_chooser);
+strong_alias(packstr_func, slurm_packstr_func);
+strong_alias(safe_unpackstr_func, slurm_safe_unpackstr_func);
 strong_alias(packstr_array,	slurm_packstr_array);
 strong_alias(unpackstr_array,	slurm_unpackstr_array);
 strong_alias(packmem_array,	slurm_packmem_array);
@@ -214,9 +216,16 @@ void grow_buf(buf_t *buffer, uint32_t size)
 
 extern int try_grow_buf(buf_t *buffer, uint32_t size)
 {
-	uint64_t new_size = ((uint64_t) size) + buffer->size;
+	uint64_t new_size = buffer->size + BUF_SIZE;
 
 	xassert(buffer->magic == BUF_MAGIC);
+
+	/*
+	 * Force increase to always be at least BUF_SIZE to reduce number of
+	 * successive xrealloc()s that get called while packing larger RPCs
+	 */
+	if (size >= BUF_SIZE)
+		new_size += size;
 
 	if (buffer->mmaped || buffer->shadow)
 		return EINVAL;
@@ -237,7 +246,6 @@ extern int try_grow_buf(buf_t *buffer, uint32_t size)
 extern int try_grow_buf_remaining(buf_t *buffer, uint32_t size)
 {
 	xassert(buffer->magic == BUF_MAGIC);
-	xassert(size > 0);
 
 	if (remaining_buf(buffer) < size)
 		return try_grow_buf(buffer, size);
@@ -317,25 +325,6 @@ void *xfer_buf_data(buf_t *my_buf)
 	data_ptr = (void *) my_buf->head;
 	xfree(my_buf);
 	return data_ptr;
-}
-
-extern int swap_buf_data(buf_t *x, buf_t *y)
-{
-	if (!x || !y)
-		return EINVAL;
-
-	xassert(x->magic == BUF_MAGIC);
-	xassert(y->magic == BUF_MAGIC);
-	xassert(xsize(x->head) >= 0);
-	xassert(xsize(y->head) >= 0);
-
-	SWAP(x->head, y->head);
-	SWAP(x->processed, y->processed);
-	SWAP(x->size, y->size);
-	SWAP(x->mmaped, y->mmaped);
-	SWAP(x->shadow, y->shadow);
-
-	return SLURM_SUCCESS;
 }
 
 /*
@@ -1038,6 +1027,22 @@ int unpackstr_xmalloc_chooser(char **valp, uint32_t *size_valp, buf_t *buf)
 		return unpackstr_xmalloc(valp, size_valp, buf);
 }
 
+extern void packstr_func(void *str, uint16_t protocol_version, buf_t *buffer)
+{
+	packstr(str, buffer);
+}
+
+extern int safe_unpackstr_func(void **object,
+			       uint16_t protocol_version,
+			       buf_t *buffer)
+{
+	safe_unpackstr((char **)object, buffer);
+
+	return SLURM_SUCCESS;
+
+unpack_error:
+	return SLURM_ERROR;
+}
 
 /*
  * Given a pointer to array of char * (char ** or char *[] ) and a size

@@ -28,8 +28,6 @@ START_TEST(pack_back2_null_rec)
 	buf_t *buf = init_buf(1024);
 
 	slurmdb_init_cluster_rec(&pack_rec, false);
-	pack_rec.fed.state        = 0;
-	pack_rec.dimensions       = 1;
 
 	slurmdb_pack_cluster_rec(NULL, SLURM_MIN_PROTOCOL_VERSION, buf);
 
@@ -46,9 +44,8 @@ START_TEST(pack_back2_null_rec)
 	ck_assert(pack_rec.fed.send        == unpack_rec->fed.send);
 	/* 17.11 */
 	ck_assert(pack_rec.fed.feature_list == unpack_rec->fed.feature_list);
-
-	/* root_assoc gets unpacked into a empty structure */
-	ck_assert(unpack_rec->root_assoc != NULL);
+	/* NULL pack leaves root_assoc as NULL */
+	ck_assert(unpack_rec->root_assoc == NULL);
 
 	ck_assert(pack_rec.classification   == unpack_rec->classification);
 	ck_assert(pack_rec.dimensions       == unpack_rec->dimensions);
@@ -91,11 +88,11 @@ START_TEST(pack_back2_rec)
 	pack_rec.rpc_version      = 9;
 
 	persist_conn_t p_recv = {0};
-	p_recv.fd = 11;
+	p_recv.conn = (void *) 1;
 	pack_rec.fed.recv         = &p_recv;
 
 	persist_conn_t p_send = {0};
-	p_send.fd = 10;
+	p_send.conn = (void *) 1;
 	pack_rec.fed.send         = &p_send;
 
 
@@ -117,8 +114,6 @@ START_TEST(pack_back2_rec)
 
 	ck_assert(unpack_rec->fed.recv != NULL);
 	ck_assert(unpack_rec->fed.send != NULL);
-	ck_assert_int_eq(((persist_conn_t *)unpack_rec->fed.recv)->fd, -1);
-	ck_assert_int_eq(((persist_conn_t *)unpack_rec->fed.send)->fd, -1);
 
 	ck_assert_str_eq(pack_rec.control_host, unpack_rec->control_host);
 	ck_assert_str_eq(pack_rec.fed.name, unpack_rec->fed.name);
@@ -197,37 +192,36 @@ END_TEST
 START_TEST(pack_back1_null_rec)
 {
 	int rc;
-	slurmdb_cluster_rec_t pack_rec;
 	slurmdb_cluster_rec_t *unpack_rec;
 	buf_t *buf = init_buf(1024);
 
-	slurmdb_init_cluster_rec(&pack_rec, false);
-	pack_rec.fed.state        = 0;
-	pack_rec.dimensions       = 1;
 	slurmdb_pack_cluster_rec(NULL, SLURM_ONE_BACK_PROTOCOL_VERSION, buf);
 
 	set_buf_offset(buf, 0);
 
 	rc = slurmdb_unpack_cluster_rec((void **)&unpack_rec, SLURM_ONE_BACK_PROTOCOL_VERSION, buf);
 	ck_assert_int_eq(rc, SLURM_SUCCESS);
-	ck_assert(pack_rec.accounting_list == unpack_rec->accounting_list);
-	ck_assert(pack_rec.control_host    == unpack_rec->control_host);
-	ck_assert(pack_rec.fed.name        == unpack_rec->fed.name);
-	ck_assert(pack_rec.name            == unpack_rec->name);
-	ck_assert(pack_rec.nodes           == unpack_rec->nodes);
-	ck_assert(pack_rec.fed.recv        == unpack_rec->fed.recv);
-	ck_assert(pack_rec.fed.send        == unpack_rec->fed.send);
-	ck_assert(pack_rec.fed.feature_list == unpack_rec->fed.feature_list);
+	/*
+	 * cluster_rec should be what slurmdb_init_cluster_rec() sets as an
+	 * unpack of a NULL is only an unpack of a bool and we skip the rest.
+	 */
+	ck_assert(!unpack_rec->accounting_list);
+	ck_assert(!unpack_rec->control_host);
+	ck_assert(!unpack_rec->fed.name);
+	ck_assert(!unpack_rec->name);
+	ck_assert(!unpack_rec->nodes);
+	ck_assert(!unpack_rec->fed.recv);
+	ck_assert(!unpack_rec->fed.send);
+	ck_assert(!unpack_rec->fed.feature_list);
 
-	/* root_assoc gets unpacked into a empty structure */
-	ck_assert(unpack_rec->root_assoc != NULL);
+	ck_assert(!unpack_rec->root_assoc);
 
-	ck_assert(pack_rec.classification   == unpack_rec->classification);
-	ck_assert(pack_rec.dimensions       == unpack_rec->dimensions);
-	ck_assert(pack_rec.fed.id           == unpack_rec->fed.id);
-	ck_assert(pack_rec.fed.state        == unpack_rec->fed.state);
-	ck_assert(pack_rec.flags            == unpack_rec->flags);
-	ck_assert(pack_rec.rpc_version      == unpack_rec->rpc_version);
+	ck_assert(!unpack_rec->classification);
+	ck_assert(!unpack_rec->dimensions);
+	ck_assert(!unpack_rec->fed.id);
+	ck_assert(unpack_rec->fed.state == NO_VAL);
+	ck_assert(unpack_rec->flags == NO_VAL);
+	ck_assert(!unpack_rec->rpc_version);
 
 	free_buf(buf);
 	slurmdb_destroy_cluster_rec(unpack_rec);
@@ -263,11 +257,11 @@ START_TEST(pack_back1_rec)
 	pack_rec.rpc_version      = 9;
 
 	persist_conn_t p_recv = {0};
-	p_recv.fd = 11;
+	p_recv.conn = (void *) 1;
 	pack_rec.fed.recv         = &p_recv;
 
 	persist_conn_t p_send = {0};
-	p_send.fd = 10;
+	p_send.conn = (void *) 1;
 	pack_rec.fed.send         = &p_send;
 
 
@@ -289,8 +283,6 @@ START_TEST(pack_back1_rec)
 
 	ck_assert(unpack_rec->fed.recv != NULL);
 	ck_assert(unpack_rec->fed.send != NULL);
-	ck_assert_int_eq(((persist_conn_t *)unpack_rec->fed.recv)->fd, -1);
-	ck_assert_int_eq(((persist_conn_t *)unpack_rec->fed.send)->fd, -1);
 
 	ck_assert_str_eq(pack_rec.control_host, unpack_rec->control_host);
 	ck_assert_str_eq(pack_rec.fed.name, unpack_rec->fed.name);

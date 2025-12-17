@@ -3,7 +3,7 @@
  *		Periodically when pending jobs can start.
  *		This is a minimal implementation of the logic found in
  *		src/plugins/sched/backfill/backfill.c and disregards
- *		how jobs are scheduled sequencially.
+ *		how jobs are scheduled sequentially.
  *****************************************************************************
  *  Copyright (C) 2003-2007 The Regents of the University of California.
  *  Copyright (C) 2008-2010 Lawrence Livermore National Security.
@@ -139,7 +139,7 @@ static void _load_config(void)
 static void _compute_start_times(void)
 {
 	int j, rc = SLURM_SUCCESS, job_cnt = 0;
-	List job_queue;
+	list_t *job_queue = NULL;
 	job_queue_rec_t *job_queue_rec;
 	job_record_t *job_ptr;
 	part_record_t *part_ptr;
@@ -203,7 +203,8 @@ static void _compute_start_times(void)
 				       min_nodes, max_nodes, req_nodes,
 				       SELECT_MODE_WILL_RUN,
 				       NULL, NULL,
-				       &resv_exc);
+				       &resv_exc,
+				       NULL);
 		if (rc == SLURM_SUCCESS) {
 			last_job_update = now;
 			if (job_ptr->time_limit == INFINITE)
@@ -267,6 +268,7 @@ extern void *builtin_agent(void *args)
 			continue;
 
 		lock_slurmctld(all_locks);
+		validate_all_reservations(true, false);
 		_compute_start_times();
 		last_sched_time = time(NULL);
 		(void) bb_g_job_try_stage_in();

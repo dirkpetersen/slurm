@@ -49,6 +49,7 @@
 #include "src/common/read_config.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_resource_info.h"
+#include "src/common/threadpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 
@@ -60,7 +61,7 @@ typedef struct load_part_req_struct {
 	slurmdb_cluster_rec_t *cluster;
 	int cluster_inx;
 	slurm_msg_t *req_msg;
-	List resp_msg_list;
+	list_t *resp_msg_list;
 	uint16_t show_flags;
 } load_part_req_struct_t;
 
@@ -68,31 +69,6 @@ typedef struct load_part_resp_struct {
 	int cluster_inx;
 	partition_info_msg_t *new_msg;
 } load_part_resp_struct_t;
-
-/*
- * slurm_print_partition_info_msg - output information about all Slurm
- *	partitions based upon message as loaded using slurm_load_partitions
- * IN out - file to write to
- * IN part_info_ptr - partitions information message pointer
- * IN one_liner - print as a single line if true
- */
-void slurm_print_partition_info_msg ( FILE* out,
-		partition_info_msg_t * part_info_ptr, int one_liner )
-{
-	int i ;
-	partition_info_t * part_ptr = part_info_ptr->partition_array ;
-	char time_str[256];
-
-	slurm_make_time_str ((time_t *)&part_info_ptr->last_update, time_str,
-		sizeof(time_str));
-	fprintf( out, "Partition data as of %s, record count %d\n",
-		time_str, part_info_ptr->record_count);
-
-	for (i = 0; i < part_info_ptr->record_count; i++) {
-		slurm_print_partition_info ( out, & part_ptr[i], one_liner ) ;
-	}
-
-}
 
 /*
  * slurm_print_partition_info - output information about a specific Slurm
@@ -173,6 +149,7 @@ char *slurm_sprint_partition_info ( partition_info_t * part_ptr,
 		value = part_ptr->deny_qos;
 	}
 	xstrfmtcat(out, " %sQos=%s", allow_deny, value);
+
 	xstrcat(out, line_end);
 
 	/****** Line 3 ******/
@@ -332,6 +309,12 @@ char *slurm_sprint_partition_info ( partition_info_t * part_ptr,
 	xstrcat(out, line_end);
 
 	/****** Line ******/
+	if (part_ptr->topology_name) {
+		xstrfmtcat(out, "Topology=%s", part_ptr->topology_name);
+		xstrcat(out, line_end);
+	}
+
+	/****** Line ******/
 	if (part_ptr->state_up == PARTITION_UP)
 		xstrcat(out, "State=UP");
 	else if (part_ptr->state_up == PARTITION_DOWN)
@@ -426,7 +409,7 @@ char *slurm_sprint_partition_info ( partition_info_t * part_ptr,
 		else
 			xstrfmtcat(out, " SuspendTime=%d",
 				part_ptr->suspend_time);
-		
+
 		if (part_ptr->flags & PART_FLAG_PDOI)
 			xstrcat(out, " PowerDownOnIdle=YES");
 		else
@@ -529,7 +512,7 @@ static int _load_fed_parts(slurm_msg_t *req_msg,
 	int pthread_count = 0;
 	pthread_t *load_thread = 0;
 	load_part_req_struct_t *load_args;
-	List resp_msg_list;
+	list_t *resp_msg_list;
 
 	*part_info_msg_pptr = NULL;
 

@@ -1259,6 +1259,7 @@ int PMI_KVS_Commit( const char kvsname[] )
 	kvs_set.kvs_host_ptr->task_id  = pmi_rank;
 	kvs_set.kvs_host_ptr->port     = 0;
 	kvs_set.kvs_host_ptr->hostname = NULL;
+	kvs_set.kvs_host_ptr->tls_cert = NULL;
 	kvs_set.kvs_comm_recs = 0;
 	kvs_set.kvs_comm_ptr  = NULL;
 
@@ -1872,7 +1873,7 @@ Return values:
 Notes:
  This function frees the data returned by 'PMI_Args_to_keyval' and 'PMI_Parse_option'.
  Using this routine instead of 'free' allows the PMI package to track
- allocation of storage or to use interal storage as it sees fit.
+ allocation of storage or to use internal storage as it sees fit.
 @*/
 int PMI_Free_keyvals(PMI_keyval_t keyvalp[], int size)
 {

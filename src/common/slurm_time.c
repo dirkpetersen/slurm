@@ -31,8 +31,15 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
 \*****************************************************************************/
 
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <time.h>
+
+#include <src/common/log.h>
+#include <src/common/slurm_protocol_defs.h>
+#include <src/common/slurm_time.h>
+#include <src/common/xassert.h>
 
 extern time_t slurm_mktime(struct tm *tp)
 {
@@ -63,10 +70,307 @@ extern char *slurm_ctime2_r(const time_t *timep, char *time_str)
 	return time_str;
 }
 
+extern int slurm_delta_tv(struct timeval *tv)
+{
+	struct timeval now = { 0, 0 };
+	int delta_t;
+
+	if (gettimeofday(&now, NULL))
+		return 1; /* Some error */
+
+	if (tv->tv_sec == 0) {
+		tv->tv_sec = now.tv_sec;
+		tv->tv_usec = now.tv_usec;
+		return 0;
+	}
+
+	delta_t = (now.tv_sec - tv->tv_sec) * USEC_IN_SEC;
+	delta_t += (now.tv_usec - tv->tv_usec);
+
+	return delta_t;
+}
+
+extern int slurm_nanosleep(time_t sleep_sec, uint32_t sleep_ns)
+{
+	timespec_t ts = { .tv_sec = sleep_sec, .tv_nsec = sleep_ns };
+	timespec_t rem;
+
+	while (nanosleep(&ts, &rem)) {
+		if (errno != EINTR) {
+			return errno;
+		}
+		ts.tv_sec = rem.tv_sec;
+		ts.tv_nsec = rem.tv_nsec;
+	}
+
+	return SLURM_SUCCESS;
+}
+
 extern void print_date(void)
 {
 	time_t now = time(NULL);
 	char time_str[25];
 
 	printf("%s\n", slurm_ctime2_r(&now, time_str));
+}
+
+extern timespec_t timespec_now(void)
+{
+	timespec_t time;
+	int rc;
+
+	if ((rc = clock_gettime(TIMESPEC_CLOCK_TYPE, &time))) {
+		if (rc == -1)
+			rc = errno;
+
+		fatal("%s: clock_gettime() failed: %s",
+		      __func__, slurm_strerror(rc));
+	}
+
+	return time;
+}
+
+extern int timespec_ctime(timespec_t ts, bool abs_time, char *buffer,
+			  size_t buffer_len)
+{
+	uint64_t t, days, hours, minutes, seconds;
+	uint64_t milliseconds, microseconds, nanoseconds;
+	bool negative = false;
+	int wrote = 0;
+
+	xassert(buffer);
+	xassert(buffer_len > 0);
+	if (!buffer || (buffer_len <= 0))
+		return 0;
+
+	if (!ts.tv_nsec && !ts.tv_sec) {
+		buffer[0] = '\0';
+		return 0;
+	}
+
+	if (timespec_is_infinite(ts)) {
+		return snprintf(buffer, buffer_len, "%s",
+				(abs_time ? "now+INFINITE" : "INFINITE"));
+	}
+
+	if (!ts.tv_nsec && !ts.tv_sec) {
+		return snprintf(buffer, buffer_len, "%s",
+				(abs_time ? "NEVER" : "now"));
+	}
+
+	ts = timespec_normalize(ts);
+
+	if (abs_time) {
+		const timespec_diff_ns_t tdiff =
+			timespec_diff_ns(timespec_now(), ts);
+
+		ts = tdiff.diff;
+		negative = tdiff.after;
+
+		if (!ts.tv_nsec && !ts.tv_sec) {
+			return snprintf(buffer, buffer_len, "now");
+		}
+	}
+
+	/* Force positive time */
+	if ((ts.tv_sec < 0) || (ts.tv_nsec < 0)) {
+		negative = true;
+
+		ts.tv_sec *= -1;
+		ts.tv_nsec *= -1;
+	}
+
+	t = ts.tv_sec;
+
+	/* Divide out the orders of magnitude */
+
+	days = t / (DAY_HOURS * HOUR_SECONDS);
+	t = t % (DAY_HOURS * HOUR_SECONDS);
+
+	hours = t / HOUR_SECONDS;
+	t = t % HOUR_SECONDS;
+
+	minutes = t / MINUTE_SECONDS;
+	t = t % MINUTE_SECONDS;
+
+	seconds = t;
+
+	t = ts.tv_nsec;
+
+	milliseconds = t / NSEC_IN_MSEC;
+	t = t % NSEC_IN_MSEC;
+
+	microseconds = t / NSEC_IN_USEC;
+	t = t % NSEC_IN_USEC;
+
+	nanoseconds = t;
+
+	wrote += snprintf(buffer, buffer_len, "%s%s",
+			  (abs_time ? (negative ? "now" : "now+") : ""),
+			  (negative ? "-(" : ""));
+
+	if (wrote >= buffer_len)
+		return wrote;
+
+	if (days) {
+		wrote += snprintf((buffer + wrote), (buffer_len - wrote),
+				  "%"PRIu64"d", days);
+
+		if (wrote >= buffer_len)
+			return wrote;
+	}
+
+	if (hours || minutes || seconds) {
+		wrote += snprintf((buffer + wrote), (buffer_len - wrote),
+				  "%s%"PRIu64"h:%"PRIu64"m:%"PRIu64"s",
+				  (days ? "-" : ""), hours, minutes, seconds);
+
+		if (wrote >= buffer_len)
+			return wrote;
+	}
+
+	if (milliseconds || microseconds || nanoseconds) {
+		wrote += snprintf((buffer + wrote), (buffer_len - wrote),
+				"%s%"PRIu64"ms:%"PRIu64"μs:%"PRIu64"ns",
+				((hours || minutes || seconds) ? ":" :
+				 (days ?  "-" : "")),
+				milliseconds, microseconds, nanoseconds);
+
+		if (wrote >= buffer_len)
+			return wrote;
+	}
+
+	if (negative)
+		wrote += snprintf((buffer + wrote), (buffer_len - wrote), ")");
+
+	return wrote;
+}
+
+/* Normalize nsec to less than a second */
+static timespec_t _normalize(timespec_t ts)
+{
+	return (timespec_t) {
+		.tv_sec = ts.tv_sec + (ts.tv_nsec / NSEC_IN_SEC),
+		.tv_nsec = (ts.tv_nsec % NSEC_IN_SEC),
+	};
+}
+
+/* Force direction of time to be uniform */
+static timespec_t _uniform(timespec_t ts)
+{
+	if ((ts.tv_nsec < 0) && (ts.tv_sec > 0)) {
+		ts.tv_sec--;
+		ts.tv_nsec = (NSEC_IN_SEC + ts.tv_nsec);
+	} else if ((ts.tv_nsec > 0) && (ts.tv_sec < 0)) {
+		ts.tv_sec++;
+		ts.tv_nsec = (NSEC_IN_SEC - ts.tv_nsec);
+	}
+
+	return ts;
+}
+
+extern timespec_t timespec_normalize(timespec_t ts)
+{
+	return _normalize(_uniform(_normalize(ts)));
+}
+
+extern timespec_t timespec_add(timespec_t x, timespec_t y)
+{
+	x = timespec_normalize(x);
+	y = timespec_normalize(y);
+
+	/* Use 64bit accumulators to avoid overflow */
+	return timespec_normalize((timespec_t) {
+		.tv_sec = (((uint64_t) x.tv_sec) + ((uint64_t) y.tv_sec)),
+		.tv_nsec = (((uint64_t) x.tv_nsec) + ((uint64_t) y.tv_nsec)),
+	});
+}
+
+extern timespec_t timespec_rem(timespec_t x, timespec_t y)
+{
+	x = timespec_normalize(x);
+	y = timespec_normalize(y);
+
+	return timespec_normalize((timespec_t) {
+		.tv_sec = (((uint64_t) x.tv_sec) - ((uint64_t) y.tv_sec)),
+		.tv_nsec = (((uint64_t) x.tv_nsec) - ((uint64_t) y.tv_nsec)),
+	});
+}
+
+extern bool timespec_is_after(const timespec_t x, const timespec_t y)
+{
+	if (x.tv_sec < y.tv_sec)
+		return false;
+	if (x.tv_sec > y.tv_sec)
+		return true;
+
+	return (x.tv_nsec > y.tv_nsec);
+}
+
+extern int64_t timespec_diff(const timespec_t x, const timespec_t y)
+{
+	/* Use 64bit signed accumulators to catch underflow */
+	return (((int64_t) x.tv_sec) - ((int64_t) y.tv_sec));
+}
+
+extern timespec_diff_ns_t timespec_diff_ns(const timespec_t x,
+					   const timespec_t y)
+{
+	timespec_t ts = timespec_rem(x, y);
+
+	if ((ts.tv_sec < 0) || (ts.tv_nsec < 0))
+		return (timespec_diff_ns_t) {
+			.after = false,
+			.diff = ((timespec_t) {
+				.tv_sec = (-1 * ts.tv_sec),
+				.tv_nsec = (-1 * ts.tv_nsec),
+			}),
+		};
+	else
+		return (timespec_diff_ns_t) {
+			.after = true,
+			.diff = ts,
+		};
+}
+
+extern double timespec_to_secs(const timespec_t x)
+{
+	double s = x.tv_sec;
+	double ns = x.tv_nsec;
+	return (s + (ns / NSEC_IN_SEC));
+}
+
+extern int timeval_tot_wait(struct timeval *start_time)
+{
+	struct timeval end_time;
+	int msec_delay;
+
+	gettimeofday(&end_time, NULL);
+	msec_delay = (end_time.tv_sec - start_time->tv_sec) * 1000;
+	msec_delay += ((end_time.tv_usec - start_time->tv_usec + 500) / 1000);
+	return msec_delay;
+}
+
+extern bool timespec_is_infinite(timespec_t x)
+{
+	static const timespec_t inf = TIMESPEC_INFINITE;
+
+	if (x.tv_sec == inf.tv_sec)
+		return true;
+
+	/*
+	 * normalize the timespec as tv_nsec may hold a non-negligible number of
+	 * seconds and then check if tv_sec is infinite
+	 */
+	x = timespec_normalize(x);
+
+	return (x.tv_sec == inf.tv_sec);
+}
+
+extern int64_t timespec_after_deadline(const timespec_t deadline)
+{
+	if (timespec_is_infinite(deadline))
+		return INFINITE64;
+
+	return timespec_diff(deadline, timespec_now());
 }

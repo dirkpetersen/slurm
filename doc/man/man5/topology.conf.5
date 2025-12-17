@@ -1,4 +1,4 @@
-.TH "topology.conf" "5" "Slurm Configuration File" "November 2023" "Slurm Configuration File"
+.TH "topology.conf" "5" "Slurm Configuration File" "Slurm 26.05" "Slurm Configuration File"
 
 .SH "NAME"
 topology.conf \-  Slurm configuration file for the topology plugins
@@ -8,6 +8,7 @@ topology.conf \-  Slurm configuration file for the topology plugins
 \fBtopology.conf\fP is an ASCII file which describes the
 cluster's network topology for optimized job resource allocation.
 The file will always be located in the same directory as the \fBslurm.conf\fR.
+\fBNOTE\fR: This file is ignored if \fBtopology.yaml\fR(5) exists.
 .LP
 Parameter names are case insensitive.
 Any text following a "#" in the configuration file is treated
@@ -15,6 +16,9 @@ as a comment through the end of that line.
 Changes to the configuration file take effect upon restart of
 Slurm daemons, daemon receipt of the SIGHUP signal, or execution
 of the command "scontrol reconfigure" unless otherwise noted.
+.LP
+Refer to the topology guide for more details:
+<https://slurm.schedmd.com/topology.html>
 .LP
 
 .SH "topology/tree"
@@ -52,13 +56,11 @@ This field must be specified and cannot be longer than 64 characters.
 .TP
 \fBSwitches\fR
 Child switches of the named switch.
-Either this option or the \fBNodes\fR option must be specified.
 .IP
 
 .TP
 \fBNodes\fR
-Child Nodes of the named leaf switch.
-Either this option or the \fBSwitches\fR option must be specified.
+Child nodes of the named leaf switch.
 .IP
 
 .TP
@@ -79,19 +81,15 @@ names need not be consecutive (e.g. "Nodes=tux[0\-3,12,18\-20]").
 .LP
 This topology plugin places emphasis on reducing fragmentation of the
 cluster, allowing jobs to take advantage of lower\-latency connections
-between smaller "blocks" of node, rather than starting jobs as quickly
+between smaller "blocks" of nodes, rather than starting jobs as quickly
 as possible on the first available resources.
 
 .LP
 Defined blocks of nodes are paired with other contiguous blocks, to create
 a higher level block of nodes. These larger blocks can then be paired with
 other blocks at the same level for bigger and bigger blocks of contiguous
-nodes with optimized communication between them. Levels are defined as
-level 0 being a single defined block, level 1 being a pair of blocks,
-level 2 being a group of 4 blocks, or as many as can be grouped together
-if there are an uneven number of blocks, level 3 being a group of (up to)
-8 blocks, etc. You can define how many levels you want to enforce jobs
-remain contiguous across with \fBBlockLevels\fR.
+nodes with optimized communication between them. The enforced block sizes
+are defined by \fBBlockSizes\fR.
 
 .LP
 The overall configuration parameters available for topology/block include:
@@ -105,8 +103,7 @@ This field must be specified.
 
 .TP
 \fBNodes\fR
-Child Nodes of the named block.
-This must be specified along with the \fBBlockName\fR.
+Child nodes of the named block.
 .IP
 
 .TP
@@ -114,7 +111,7 @@ This must be specified along with the \fBBlockName\fR.
 List of the planning base block size, alongside any
 higher-level block sizes that would be enforced.
 Each block must have at least the planning base block size count of nodes.
-Successive BlockSizes must be a power of two larger than the prior values.
+Successive \fBBlockSizes\fR must be a power of two larger than the prior values.
 .IP
 
 .SH "EXAMPLE"
@@ -162,4 +159,4 @@ details.
 
 .SH "SEE ALSO"
 .LP
-\fBslurm.conf\fR(5)
+\fBslurm.conf\fR(5), \fBtopology.yaml\fR(5)

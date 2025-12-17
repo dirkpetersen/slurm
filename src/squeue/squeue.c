@@ -76,7 +76,7 @@ int max_line_size;
 static int _get_info(bool clear_old, bool log_cluster_name, int argc,
 		     char **argv);
 static int  _get_window_width( void );
-static int _multi_cluster(List clusters, int argc, char **argv);
+static int _multi_cluster(list_t *clusters, int argc, char **argv);
 static int _print_job(bool clear_old, bool log_cluster_name, int argc,
 		      char **argv);
 static int _print_job_steps(bool clear_old, int argc, char **argv);
@@ -123,7 +123,7 @@ main (int argc, char **argv)
 		exit (0);
 }
 
-static int _multi_cluster(List clusters, int argc, char **argv)
+static int _multi_cluster(list_t *clusters, int argc, char **argv)
 {
 	list_itr_t *itr;
 	bool log_cluster_name = false, first = true;
@@ -264,7 +264,7 @@ static int _query_job_states(int argc, char **argv)
 			job_state_response_job_t *src = &jsr->jobs[i];
 			slurm_job_info_t *job = &job_msg->job_array[i];
 
-			job->job_id = src->job_id;
+			job->step_id.job_id = src->job_id;
 
 			if (src->array_job_id) {
 				_populate_array_job_states(src, job);
@@ -334,7 +334,7 @@ static int _print_job(bool clear_old, bool log_cluster_name, int argc,
 		}
 		if (error_code ==  SLURM_SUCCESS)
 			slurm_free_job_info_msg( old_job_ptr );
-		else if (slurm_get_errno () == SLURM_NO_CHANGE_IN_DATA) {
+		else if (errno == SLURM_NO_CHANGE_IN_DATA) {
 			error_code = SLURM_SUCCESS;
 			new_job_ptr = old_job_ptr;
 		}
@@ -430,17 +430,17 @@ static int _print_job_steps(bool clear_old, int argc, char **argv)
 			old_step_ptr->last_update = 0;
 		/* Use a last_update time of 0 so that we can get an updated
 		 * run_time for jobs rather than just its start_time */
-		error_code = slurm_get_job_steps((time_t) 0, NO_VAL, NO_VAL,
-						 &new_step_ptr, show_flags);
+		error_code =
+			slurm_get_job_steps(NULL, &new_step_ptr, show_flags);
 		if (error_code ==  SLURM_SUCCESS)
 			slurm_free_job_step_info_response_msg( old_step_ptr );
-		else if (slurm_get_errno () == SLURM_NO_CHANGE_IN_DATA) {
+		else if (errno == SLURM_NO_CHANGE_IN_DATA) {
 			error_code = SLURM_SUCCESS;
 			new_step_ptr = old_step_ptr;
 		}
 	} else {
-		error_code = slurm_get_job_steps((time_t) 0, NO_VAL, NO_VAL,
-						 &new_step_ptr, show_flags);
+		error_code =
+			slurm_get_job_steps(NULL, &new_step_ptr, show_flags);
 	}
 	if (error_code) {
 		slurm_perror ("slurm_get_job_steps error");

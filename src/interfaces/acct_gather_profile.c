@@ -1,6 +1,5 @@
 /*****************************************************************************\
- *  slurm_acct_gather_profile.c - implementation-independent job profile
- *  accounting plugin definitions
+ *  acct_gather_profile.c - job profile accounting plugin definitions
  *****************************************************************************
  *  Copyright (C) 2013 Bull S. A. S.
  *		Bull, Rue Jean Jaures, B.P.68, 78340, Les Clayes-sous-Bois.
@@ -53,15 +52,17 @@
 #include "src/common/plugin.h"
 #include "src/common/plugrack.h"
 #include "src/common/read_config.h"
-#include "src/interfaces/acct_gather_filesystem.h"
-#include "src/interfaces/acct_gather_interconnect.h"
-#include "src/interfaces/acct_gather_profile.h"
-#include "src/interfaces/acct_gather_energy.h"
-#include "src/interfaces/jobacct_gather.h"
 #include "src/common/slurm_protocol_api.h"
+#include "src/common/threadpool.h"
 #include "src/common/timers.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
+
+#include "src/interfaces/acct_gather_energy.h"
+#include "src/interfaces/acct_gather_filesystem.h"
+#include "src/interfaces/acct_gather_interconnect.h"
+#include "src/interfaces/acct_gather_profile.h"
+#include "src/interfaces/jobacct_gather.h"
 
 /* These 2 should remain the same. */
 #define SLEEP_TIME 1
@@ -82,7 +83,7 @@ typedef struct slurm_acct_gather_profile_ops {
 	int (*create_dataset)   (const char*, int64_t,
 				 acct_gather_profile_dataset_t *);
 	int (*add_sample_data)  (uint32_t, void*, time_t);
-	void (*conf_values)     (List *data);
+	void (*conf_values)     (list_t **data);
 	bool (*is_active)     (uint32_t);
 
 } slurm_acct_gather_profile_ops_t;
@@ -137,7 +138,8 @@ static void _set_freq(int type, char *freq, char *freq_def)
 
 static void *_timer_thread(void *args)
 {
-	int i, now, diff;
+	time_t now;
+	int i, diff;
 	struct timeval tvnow;
 	struct timespec abs;
 

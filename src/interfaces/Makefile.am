@@ -1,7 +1,6 @@
 # Makefile for common/interfaces
 
 AUTOMAKE_OPTIONS = foreign
-CLEANFILES = core.*
 
 AM_CPPFLAGS = -I$(top_srcdir)
 
@@ -32,10 +31,16 @@ libcommon_interfaces_la_SOURCES =    \
 	acct_gather_profile.h			\
 	auth.c					\
 	auth.h					\
+	certgen.c				\
+	certgen.h				\
+	certmgr.c				\
+	certmgr.h				\
 	cgroup.c				\
 	cgroup.h				\
 	cli_filter.c				\
 	cli_filter.h				\
+	conn.c					\
+	conn.h					\
 	cred.h					\
 	cred.c					\
 	data_parser.c				\
@@ -46,14 +51,20 @@ libcommon_interfaces_la_SOURCES =    \
 	gres.h					\
 	hash.c					\
 	hash.h					\
+	http_parser.c				\
+	http_parser.h				\
 	jobacct_gather.c			\
 	jobacct_gather.h			\
 	jobcomp.c				\
 	jobcomp.h				\
 	mcs.c					\
 	mcs.h					\
+	metrics.c				\
+	metrics.h				\
 	mpi.c					\
 	mpi.h					\
+	namespace.c \
+	namespace.h \
 	node_features.c				\
 	node_features.h				\
 	prep.c					\
@@ -68,10 +79,12 @@ libcommon_interfaces_la_SOURCES =    \
 	site_factor.h				\
 	switch.c				\
 	switch.h				\
-	tls.c					\
-	tls.h					\
+	tls.c				        \
+	tls.h				        \
 	topology.c				\
-	topology.h
+	topology.h                              \
+	url_parser.c                            \
+	url_parser.h
 
 libslurmctld_interfaces_la_SOURCES =    \
 	burst_buffer.c	\
@@ -84,8 +97,6 @@ libslurmctld_interfaces_la_SOURCES =    \
 	sched_plugin.h
 
 libslurmd_interfaces_la_SOURCES =    \
-	job_container.c \
-	job_container.h \
 	proctrack.c \
 	proctrack.h \
 	task.c \

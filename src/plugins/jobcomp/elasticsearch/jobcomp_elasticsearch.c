@@ -38,7 +38,6 @@
 
 #include "config.h"
 
-#include <curl/curl.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <grp.h>
@@ -50,52 +49,32 @@
 #include <unistd.h>
 
 #include "src/common/slurm_xlator.h"
+
 #include "src/common/data.h"
 #include "src/common/fd.h"
 #include "src/common/list.h"
 #include "src/common/parse_time.h"
-#include "src/interfaces/jobcomp.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/slurm_time.h"
 #include "src/common/slurmdb_defs.h"
+#include "src/common/state_save.h"
+#include "src/common/threadpool.h"
 #include "src/common/xstring.h"
+
+#include "src/curl/slurm_curl.h"
+
+#include "src/interfaces/jobcomp.h"
 #include "src/interfaces/serializer.h"
-#include "src/plugins/jobcomp/common/jobcomp_common.h"
+
 #include "src/slurmctld/slurmctld.h"
 #include "src/slurmctld/state_save.h"
+
+#include "src/plugins/jobcomp/common/jobcomp_common.h"
 
 #define MAX_STR_LEN 10240	/* 10 KB */
 #define MAX_JOBS 1000000
 
-/*
- * These variables are required by the generic plugin interface. If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin. There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything. Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobcomp" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application. Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobcomp/".
- *
- * plugin_version - an unsigned 32-bit integer giving the version number
- * of the plugin. If major and minor revisions are desired, the major
- * version number may be multiplied by a suitable magnitude constant such
- * as 100 or 1000. Various Slurm versions will likely require a certain
- * minimum version for their plugins as the job completion logging API
- * matures.
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Job completion elasticsearch logging plugin";
 const char plugin_type[] = "jobcomp/elasticsearch";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -133,28 +112,32 @@ static pthread_mutex_t location_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t save_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t pend_jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t job_handler_thread;
-static List jobslist = NULL;
+static list_t *jobslist = NULL;
 static bool thread_shutdown = false;
 
 /* Load jobcomp data from save state file */
 static int _load_pending_jobs(void)
 {
 	int i, rc = SLURM_SUCCESS;
-	char *job_data = NULL;
-	uint32_t job_cnt = 0, tmp32 = 0;
+	char *job_data = NULL, *state_file = NULL;
+	uint32_t job_cnt = 0;
 	buf_t *buffer = NULL;
 	struct job_node *jnode;
 
 	slurm_mutex_lock(&save_lock);
-	if (!(buffer = jobcomp_common_load_state_file(save_state_file))) {
+	if (!(buffer = state_save_open(save_state_file, &state_file))) {
+		error("Could not open jobcomp state file %s: %m", state_file);
+		error("NOTE: Finished jobs may be lost!");
 		slurm_mutex_unlock(&save_lock);
+		xfree(state_file);
 		return SLURM_ERROR;
 	}
 	slurm_mutex_unlock(&save_lock);
+	xfree(state_file);
 
 	safe_unpack32(&job_cnt, buffer);
 	for (i = 0; i < job_cnt; i++) {
-		safe_unpackstr_xmalloc(&job_data, &tmp32, buffer);
+		safe_unpackstr(&job_data, buffer);
 		jnode = xmalloc(sizeof(struct job_node));
 		jnode->serialized_job = job_data;
 		list_enqueue(jobslist, jnode);
@@ -172,31 +155,13 @@ unpack_error:
 	return SLURM_ERROR;
 }
 
-/* Callback to handle the HTTP response */
-static size_t _write_callback(void *contents, size_t size, size_t nmemb,
-			      void *userp)
-{
-	size_t realsize = size * nmemb;
-	struct http_response *mem = (struct http_response *) userp;
-
-	mem->message = xrealloc(mem->message, mem->size + realsize + 1);
-
-	memcpy(&(mem->message[mem->size]), contents, realsize);
-	mem->size += realsize;
-	mem->message[mem->size] = 0;
-
-	return realsize;
-}
-
 /* Try to index job into elasticsearch */
 static int _index_job(const char *jobcomp)
 {
-	CURL *curl_handle = NULL;
-	CURLcode res;
-	struct http_response chunk;
 	struct curl_slist *slist = NULL;
 	int rc = SLURM_SUCCESS;
-	char *token = NULL;
+	long response_code = 0;
+	char *response_str = NULL;
 
 	slurm_mutex_lock(&location_mutex);
 	if (log_url == NULL) {
@@ -205,82 +170,32 @@ static int _index_job(const char *jobcomp)
 		return SLURM_ERROR;
 	}
 
-	if ((curl_handle = curl_easy_init()) == NULL) {
-		error("%s: curl_easy_init: %m", plugin_type);
-		rc = SLURM_ERROR;
-		goto cleanup_easy_init;
-	}
-
 	slist = curl_slist_append(slist, "Content-Type: " MIME_TYPE_JSON);
 
 	if (slist == NULL) {
 		error("%s: curl_slist_append: %m", plugin_type);
-		rc = SLURM_ERROR;
-		goto cleanup_easy_init;
+		slurm_mutex_unlock(&location_mutex);
+		return SLURM_ERROR;
 	}
 
-	chunk.message = xmalloc(1);
-	chunk.size = 0;
-
-	if (curl_easy_setopt(curl_handle, CURLOPT_URL, log_url) ||
-	    curl_easy_setopt(curl_handle, CURLOPT_POST, 1) ||
-	    curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, jobcomp) ||
-	    curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE,
-			     strlen(jobcomp)) ||
-	    curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, slist) ||
-	    curl_easy_setopt(curl_handle, CURLOPT_HEADER, 1) ||
-	    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION,
-			     _write_callback) ||
-	    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *) &chunk)) {
-		error("%s: curl_easy_setopt() failed", plugin_type);
-		rc = SLURM_ERROR;
-		goto cleanup;
-	}
-
-	if ((res = curl_easy_perform(curl_handle)) != CURLE_OK) {
-		log_flag(JOBCOMP, "Could not connect to: %s , reason: %s",
-			 log_url, curl_easy_strerror(res));
-		rc = SLURM_ERROR;
-		goto cleanup;
-	}
-
-	token = strtok(chunk.message, " ");
-	if (token == NULL) {
-		error("%s: Could not receive the HTTP response status code from %s",
-		      plugin_type, log_url);
-		rc = SLURM_ERROR;
-		goto cleanup;
-	}
-	token = strtok(NULL, " ");
-
-	/* HTTP 100 (Continue). */
-	if ((xstrcmp(token, "100") == 0)) {
-		(void)  strtok(NULL, " ");
-		token = strtok(NULL, " ");
-	}
-
+	rc = slurm_curl_request(jobcomp, log_url, NULL, NULL, NULL, NULL, NULL,
+				slist, 0, &response_str, &response_code,
+				HTTP_REQUEST_POST, false, false);
 	/*
 	 * HTTP 200 (OK)	- request succeed.
 	 * HTTP 201 (Created)	- request succeed and resource created.
 	 */
-	if ((xstrcmp(token, "200") != 0) && (xstrcmp(token, "201") != 0)) {
-		log_flag(JOBCOMP, "HTTP status code %s received from %s",
-			 token, log_url);
-		log_flag(JOBCOMP, "HTTP response:\n%s", chunk.message);
+	if ((response_code != 200) && (response_code != 201)) {
+		log_flag(JOBCOMP, "HTTP status code %ld received from %s",
+			 response_code, log_url);
+		log_flag(JOBCOMP, "HTTP response:\n%s", response_str);
 		rc = SLURM_ERROR;
 	} else {
-		token = strtok((char *)jobcomp, ",");
-		(void)  strtok(token, ":");
-		token = strtok(NULL, ":");
-		log_flag(JOBCOMP, "Job with jobid %s indexed into elasticsearch",
-			 token);
+		log_flag(JOBCOMP, "Job indexed into elasticsearch. Response: %s",
+			 response_str);
 	}
 
-cleanup:
-	curl_slist_free_all(slist);
-	xfree(chunk.message);
-cleanup_easy_init:
-	curl_easy_cleanup(curl_handle);
+	xfree(response_str);
 	slurm_mutex_unlock(&location_mutex);
 	return rc;
 }
@@ -290,7 +205,7 @@ static int _save_state(void)
 {
 	int rc = SLURM_SUCCESS;
 	list_itr_t *iter;
-	static int high_buffer_size = (1024 * 1024);
+	static uint32_t high_buffer_size = (1024 * 1024);
 	buf_t *buffer = init_buf(high_buffer_size);
 	uint32_t job_cnt;
 	struct job_node *jnode;
@@ -304,7 +219,7 @@ static int _save_state(void)
 	list_iterator_destroy(iter);
 
 	slurm_mutex_lock(&save_lock);
-	jobcomp_common_write_state_file(buffer, save_state_file);
+	rc = save_buf_to_state(save_state_file, buffer, NULL);
 	slurm_mutex_unlock(&save_lock);
 
 	FREE_NULL_BUFFER(buffer);
@@ -312,7 +227,7 @@ static int _save_state(void)
 	return rc;
 }
 
-extern int jobcomp_p_log_record(job_record_t *job_ptr)
+extern int jobcomp_p_record_job_end(job_record_t *job_ptr, uint32_t event)
 {
 	struct job_node *jnode = NULL;
 	data_t *record = NULL;
@@ -324,7 +239,7 @@ extern int jobcomp_p_log_record(job_record_t *job_ptr)
 		return SLURM_ERROR;
 	}
 
-	record = jobcomp_common_job_record_to_data(job_ptr);
+	record = jobcomp_common_job_record_to_data(job_ptr, event);
 	jnode = xmalloc(sizeof(struct job_node));
 	if ((rc = serialize_g_data_to_string(&jnode->serialized_job, NULL,
 					     record, MIME_TYPE_JSON,
@@ -390,35 +305,24 @@ static void _jobslist_del(void *x)
 	xfree(jnode);
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called. Put global initialization here.
- */
 extern int init(void)
 {
-	int rc;
+	serializer_required(MIME_TYPE_JSON);
 
-	if ((rc = serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))) {
-		error("%s: unable to load JSON serializer: %s",
-		      __func__, slurm_strerror(rc));
-		return rc;
-	}
-
+	jobcomp_common_conf_init();
 	jobslist = list_create(_jobslist_del);
 	slurm_thread_create(&job_handler_thread, _process_jobs, NULL);
 	slurm_mutex_lock(&pend_jobs_lock);
 	(void) _load_pending_jobs();
 	slurm_mutex_unlock(&pend_jobs_lock);
 
-	if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
-		error("%s: curl_global_init: %m", plugin_type);
+	if (slurm_curl_init())
 		return SLURM_ERROR;
-	}
 
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	thread_shutdown = true;
 	slurm_thread_join(job_handler_thread);
@@ -427,9 +331,8 @@ extern int fini(void)
 	FREE_NULL_LIST(jobslist);
 	xfree(log_url);
 
-	curl_global_cleanup();
-
-	return SLURM_SUCCESS;
+	jobcomp_common_conf_fini();
+	slurm_curl_fini();
 }
 
 /*
@@ -458,11 +361,16 @@ extern int jobcomp_p_set_location(void)
 
 /*
  * get info from the database
- * in/out job_list List of job_rec_t *
- * note List needs to be freed when called
+ * in/out job_list list of job_rec_t *
+ * note list needs to be freed when called
  */
-extern List jobcomp_p_get_jobs(slurmdb_job_cond_t *job_cond)
+extern list_t *jobcomp_p_get_jobs(slurmdb_job_cond_t *job_cond)
 {
 	debug("%s function is not implemented", __func__);
 	return NULL;
+}
+
+extern int jobcomp_p_record_job_start(job_record_t *job_ptr, uint32_t event)
+{
+	return SLURM_SUCCESS;
 }

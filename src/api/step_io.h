@@ -27,17 +27,17 @@
 #ifndef _HAVE_STEP_IO_H
 #define _HAVE_STEP_IO_H
 
-#include <stdint.h>
 #include <pthread.h>
+#include <stdint.h>
 
 #include "slurm/slurm.h"
 
+#include "src/common/bitstring.h"
 #include "src/common/eio.h"
 #include "src/common/list.h"
-#include "src/common/bitstring.h"
 #include "src/common/slurm_step_layout.h"
-struct step_launch_state;
 
+struct step_launch_state;
 
 typedef struct {
 	/* input parameters - set (indirectly) by user */
@@ -75,11 +75,11 @@ typedef struct {
 	eio_obj_t *stdin_obj;
 	eio_obj_t *stdout_obj;
 	eio_obj_t *stderr_obj;
-	List free_incoming;     /* List of free struct io_buf * for incoming
+	list_t *free_incoming;  /* List of free struct io_buf * for incoming
 				 * traffic. "incoming" means traffic from the
 				 * client to the tasks.
 				 */
-	List free_outgoing;     /* List of free struct io_buf * for outgoing
+	list_t *free_outgoing;  /* List of free struct io_buf * for outgoing
 				 * traffic "outgoing" means traffic from the
 				 * tasks to the client.
 				 */
@@ -96,16 +96,8 @@ typedef struct {
 				       I/O problem.  */
 } client_io_t;
 
-/*
- * IN cred - cred need not be a real job credential, it may be a "fake"
- *	credential generated with slurm_cred_faker().  The credential is
- *	sent to the slurmstepd (via the slurmd) which generates a signature
- *	string from the credential.  The slurmstepd sends the signature back
- *	back to the client when it establishes the IO connection as a sort
- *	of validity check.
- */
 client_io_t *client_io_handler_create(slurm_step_io_fds_t fds, int num_tasks,
-				      int num_nodes, slurm_cred_t *cred,
+				      int num_nodes, char *io_key,
 				      bool label, uint32_t het_job_offset,
 				      uint32_t het_job_task_offset);
 

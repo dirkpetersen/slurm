@@ -38,18 +38,23 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
 \*****************************************************************************/
 
-#include "src/sacctmgr/sacctmgr.h"
-#include "src/common/macros.h"
-#include "src/common/slurmdbd_defs.h"
-#include "src/interfaces/auth.h"
-#include "src/common/slurm_protocol_defs.h"
-
-#include <unistd.h>
 #include <termios.h>
+#include <unistd.h>
+
+#include "src/common/macros.h"
+#include "src/common/parse_value.h"
+#include "src/common/slurm_protocol_defs.h"
+#include "src/common/slurmdbd_defs.h"
+#include "src/common/threadpool.h"
+
+#include "src/interfaces/auth.h"
+
+#include "src/sacctmgr/sacctmgr.h"
 
 static bool warn_needed = false;
 static pthread_mutex_t warn_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t warn_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t notice_thread_handler = 0;
 
 static void *_print_lock_warn(void *no_data)
 {
@@ -91,26 +96,54 @@ static void _nonblock(int state)
 
 }
 
-extern int parse_option_end(char *option)
+/*
+ * IN option - string to parse as /<command>([-+]=<value>)?/
+ * OUT op_type - Set to the type of operator parsed, '-', '+', or 0.
+ * OUT command_len - The strlen of <command>
+ * returns the offset of <value> if it exists, otherwise 0
+ */
+extern int parse_option_end(char *option, int *op_type, int *command_len)
 {
+	xassert(op_type);
+	xassert(command_len);
+
 	int end = 0;
+	*op_type = 0;
+	*command_len = 0;
 
 	if (!option)
 		return 0;
 
-	while(option[end]) {
-		if ((option[end] == '=')
-		   || (option[end] == '+' && option[end+1] == '=')
-		   || (option[end] == '-' && option[end+1] == '='))
-			break;
+	while (option[end] && option[end] != '=')
 		end++;
-	}
 
-	if (!option[end])
+	*command_len = end; /* before '=' */
+
+	if (!option[end]) /* no <value> */
 		return 0;
 
-	end++;
+	if (end) {
+		char tmp_type = option[end - 1];
+		if (tmp_type == '+' || tmp_type == '-') {
+			*op_type = tmp_type;
+			*command_len = end - 1; /* before "[+-]=" */
+		}
+	}
+
+	end++; /* past '=' */
 	return end;
+}
+
+extern bool common_verify_option_syntax(char *option, int op_type,
+					bool allow_op)
+{
+	if (op_type && !allow_op) {
+		exit_code = 1;
+		fprintf(stderr, " Invalid operator '%c=' in %s\n", op_type,
+			option);
+		return false;
+	}
+	return true;
 }
 
 /* you need to xfree whatever is sent from here */
@@ -131,6 +164,11 @@ extern char *strip_quotes(char *option, int *increased, bool make_lower)
 		quote = 1;
 		i++;
 	}
+
+	/* skip beginning spaces */
+	while (option[i] && isspace(option[i]))
+		i++;
+
 	start = i;
 
 	while(option[i]) {
@@ -147,6 +185,11 @@ extern char *strip_quotes(char *option, int *increased, bool make_lower)
 
 		i++;
 	}
+
+	/* trim end spaces */
+	while ((i - 1) && option[i - 1] && isspace(option[i - 1]))
+		i--;
+
 	end += i;
 
 	meat = xmalloc((i-start)+1);
@@ -723,11 +766,6 @@ static print_field_t *_get_print_field(char *object)
 		field->name = xstrdup("Reason");
 		field->len = 30;
 		field->print_routine = print_fields_str;
-	} else if (!xstrncasecmp("RGT", object, MAX(command_len, 1))) {
-		field->type = PRINT_RGT;
-		field->name = xstrdup("RGT");
-		field->len = 6;
-		field->print_routine = print_fields_uint;
 	} else if (!xstrncasecmp("RPC", object, MAX(command_len, 1))) {
 		field->type = PRINT_RPC_VERSION;
 		field->name = xstrdup("RPC");
@@ -856,7 +894,7 @@ extern void notice_thread_init(void)
 {
 	slurm_mutex_lock(&warn_mutex);
 	warn_needed = true;
-	slurm_thread_create_detached(_print_lock_warn, NULL);
+	slurm_thread_create(&notice_thread_handler, _print_lock_warn, NULL);
 	slurm_mutex_unlock(&warn_mutex);
 }
 
@@ -866,11 +904,15 @@ extern void notice_thread_fini(void)
 	warn_needed = false;
 	slurm_cond_broadcast(&warn_cond);
 	slurm_mutex_unlock(&warn_mutex);
+
+	if (notice_thread_handler)
+		slurm_thread_join(notice_thread_handler);
 }
 
 extern int commit_check(char *warning)
 {
 	int ans = 0;
+	int input = 0;
 	char c = '\0';
 	int fd = fileno(stdin);
 	fd_set rfds;
@@ -897,23 +939,27 @@ extern int commit_check(char *warning)
 		if ((ans = select(fd+1, &rfds, NULL, NULL, &tv)) <= 0)
 			break;
 
-		c = (char) getchar();
 		printf("\n");
+		if ((input = getchar()) == EOF)
+			break;
+		c = (char) input;
 	}
 	_nonblock(0);
-	if (ans <= 0)
+	if (ans == 0)
 		printf("timeout\n");
 	else if (c == 'Y' || c == 'y')
 		return 1;
+	else if ((ans < 0) || (input < 0))
+		printf("error: %s\n", strerror(errno));
 
 	return 0;
 }
 
 extern int sacctmgr_remove_assoc_usage(slurmdb_assoc_cond_t *assoc_cond)
 {
-	List update_list = NULL;
-	List local_assoc_list = NULL;
-	List local_cluster_list = NULL;
+	list_t *update_list = NULL;
+	list_t *local_assoc_list = NULL;
+	list_t *local_cluster_list = NULL;
 	list_itr_t *itr = NULL;
 	list_itr_t *itr2 = NULL;
 	list_itr_t *itr3 = NULL;
@@ -1044,10 +1090,10 @@ end_it:
 extern int sacctmgr_update_qos_usage(slurmdb_qos_cond_t *qos_cond,
 				     long double new_raw_usage)
 {
-	List update_list = NULL;
-	List cluster_list;
-	List local_qos_list = NULL;
-	List local_cluster_list = NULL;
+	list_t *update_list = NULL;
+	list_t *cluster_list;
+	list_t *local_qos_list = NULL;
+	list_t *local_cluster_list = NULL;
 	list_itr_t *itr = NULL, *itr2 = NULL;
 	char *qos_name = NULL, *cluster_name = NULL;
 	slurmdb_qos_rec_t* rec = NULL;
@@ -1141,7 +1187,7 @@ extern slurmdb_assoc_rec_t *sacctmgr_find_account_base_assoc(
 	slurmdb_assoc_rec_t *assoc = NULL;
 	char *temp = "root";
 	slurmdb_assoc_cond_t assoc_cond;
-	List assoc_list = NULL;
+	list_t *assoc_list = NULL;
 
 	if (!cluster)
 		return NULL;
@@ -1181,7 +1227,7 @@ extern slurmdb_user_rec_t *sacctmgr_find_user(char *name)
 	slurmdb_user_rec_t *user = NULL;
 	slurmdb_user_cond_t user_cond;
 	slurmdb_assoc_cond_t assoc_cond;
-	List user_list = NULL;
+	list_t *user_list = NULL;
 
 	if (!name)
 		return NULL;
@@ -1209,7 +1255,7 @@ extern slurmdb_account_rec_t *sacctmgr_find_account(char *name)
 	slurmdb_account_rec_t *account = NULL;
 	slurmdb_account_cond_t account_cond;
 	slurmdb_assoc_cond_t assoc_cond;
-	List account_list = NULL;
+	list_t *account_list = NULL;
 
 	if (!name)
 		return NULL;
@@ -1236,7 +1282,7 @@ extern slurmdb_cluster_rec_t *sacctmgr_find_cluster(char *name)
 {
 	slurmdb_cluster_rec_t *cluster = NULL;
 	slurmdb_cluster_cond_t cluster_cond;
-	List cluster_list = NULL;
+	list_t *cluster_list = NULL;
 
 	if (!name)
 		return NULL;
@@ -1258,7 +1304,7 @@ extern slurmdb_cluster_rec_t *sacctmgr_find_cluster(char *name)
 }
 
 extern slurmdb_assoc_rec_t *sacctmgr_find_assoc_from_list(
-	List assoc_list, char *user, char *account,
+	list_t *assoc_list, char *user, char *account,
 	char *cluster, char *partition)
 {
 	list_itr_t *itr = NULL;
@@ -1295,7 +1341,7 @@ extern slurmdb_assoc_rec_t *sacctmgr_find_assoc_from_list(
 }
 
 extern slurmdb_assoc_rec_t *sacctmgr_find_account_base_assoc_from_list(
-	List assoc_list, char *account, char *cluster)
+	list_t *assoc_list, char *account, char *cluster)
 {
 	list_itr_t *itr = NULL;
 	slurmdb_assoc_rec_t *assoc = NULL;
@@ -1324,7 +1370,7 @@ extern slurmdb_assoc_rec_t *sacctmgr_find_account_base_assoc_from_list(
 }
 
 extern slurmdb_qos_rec_t *sacctmgr_find_qos_from_list(
-	List qos_list, char *name)
+	list_t *qos_list, char *name)
 {
 	list_itr_t *itr = NULL;
 	slurmdb_qos_rec_t *qos = NULL;
@@ -1350,7 +1396,7 @@ extern slurmdb_qos_rec_t *sacctmgr_find_qos_from_list(
 }
 
 extern slurmdb_res_rec_t *sacctmgr_find_res_from_list(
-	List res_list, uint32_t id, char *name, char *server)
+	list_t *res_list, uint32_t id, char *name, char *server)
 {
 	list_itr_t *itr = NULL;
 	slurmdb_res_rec_t *res = NULL;
@@ -1372,7 +1418,7 @@ extern slurmdb_res_rec_t *sacctmgr_find_res_from_list(
 }
 
 extern slurmdb_user_rec_t *sacctmgr_find_user_from_list(
-	List user_list, char *name)
+	list_t *user_list, char *name)
 {
 	list_itr_t *itr = NULL;
 	slurmdb_user_rec_t *user = NULL;
@@ -1392,7 +1438,7 @@ extern slurmdb_user_rec_t *sacctmgr_find_user_from_list(
 }
 
 extern slurmdb_account_rec_t *sacctmgr_find_account_from_list(
-	List acct_list, char *name)
+	list_t *acct_list, char *name)
 {
 	list_itr_t *itr = NULL;
 	slurmdb_account_rec_t *account = NULL;
@@ -1412,7 +1458,7 @@ extern slurmdb_account_rec_t *sacctmgr_find_account_from_list(
 }
 
 extern slurmdb_cluster_rec_t *sacctmgr_find_cluster_from_list(
-	List cluster_list, char *name)
+	list_t *cluster_list, char *name)
 {
 	list_itr_t *itr = NULL;
 	slurmdb_cluster_rec_t *cluster = NULL;
@@ -1431,7 +1477,7 @@ extern slurmdb_cluster_rec_t *sacctmgr_find_cluster_from_list(
 }
 
 extern slurmdb_wckey_rec_t *sacctmgr_find_wckey_from_list(
-	List wckey_list, char *user, char *name, char *cluster)
+	list_t *wckey_list, char *user, char *name, char *cluster)
 {
 	list_itr_t *itr = NULL;
 	slurmdb_wckey_rec_t * wckey = NULL;
@@ -1534,16 +1580,15 @@ extern int get_uint64(char *in_value, uint64_t *out_value, char *type)
 
 extern int get_double(char *in_value, double *out_value, char *type)
 {
-	char *ptr = NULL, *meat = NULL;
+	char *meat = NULL;
 	double num;
 
 	if (!(meat = strip_quotes(in_value, NULL, 1))) {
 		error("Problem with strip_quotes");
 		return SLURM_ERROR;
 	}
-	num = strtod(meat, &ptr);
-	if ((num == 0) && ptr && ptr[0]) {
-		error("Invalid value for %s (%s)", type, meat);
+
+	if (s_p_handle_double(&num, type, meat)) {
 		xfree(meat);
 		return SLURM_ERROR;
 	}
@@ -1556,7 +1601,8 @@ extern int get_double(char *in_value, double *out_value, char *type)
 	return SLURM_SUCCESS;
 }
 
-static int _addto_action_char_list_internal(List char_list, char *name, void *x)
+static int _addto_action_char_list_internal(list_t *char_list, char *name,
+					    void *x)
 {
 	uint32_t id = 0;
 	char *tmp_name = NULL;
@@ -1579,7 +1625,7 @@ static int _addto_action_char_list_internal(List char_list, char *name, void *x)
 	}
 }
 
-extern int addto_action_char_list(List char_list, char *names)
+extern int addto_action_char_list(list_t *char_list, char *names)
 {
 	if (!char_list) {
 		error("No list was given to fill in");
@@ -1596,11 +1642,11 @@ extern void sacctmgr_print_coord_list(
 	int abs_len = abs(field->len);
 	list_itr_t *itr = NULL;
 	char *print_this = NULL;
-	List value = NULL;
+	list_t *value = NULL;
 	slurmdb_coord_rec_t *object = NULL;
 
 	if (input)
-		value = *(List *)input;
+		value = *(list_t **)input;
 
 	if (!value || !list_count(value)) {
 		if (print_fields_parsable_print)
@@ -1706,7 +1752,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->grp_tres, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  GrpTRES       = %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1714,7 +1761,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->grp_tres_mins, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);;
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  GrpTRESMins   = %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1722,7 +1770,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->grp_tres_run_mins, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  GrpTRESRunMins= %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1756,7 +1805,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->max_tres_pj, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  MaxTRES       = %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1764,7 +1814,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->max_tres_pn, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  MaxTRESPerNode= %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1772,7 +1823,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->max_tres_mins_pj, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  MaxTRESMins   = %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1780,7 +1832,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->max_tres_run_mins, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  MaxTRESRUNMins= %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -2159,9 +2212,9 @@ extern int sort_coord_list(void *a, void *b)
 	return 0;
 }
 
-extern List sacctmgr_process_format_list(List format_list)
+extern list_t *sacctmgr_process_format_list(list_t *format_list)
 {
-	List print_fields_list = list_create(destroy_print_field);
+	list_t *print_fields_list = list_create(destroy_print_field);
 	list_itr_t *itr = list_iterator_create(format_list);
 	print_field_t *field = NULL;
 	char *object = NULL;
@@ -2177,9 +2230,9 @@ extern List sacctmgr_process_format_list(List format_list)
 	return print_fields_list;
 }
 
-extern int sacctmgr_validate_cluster_list(List cluster_list)
+extern int sacctmgr_validate_cluster_list(list_t *cluster_list)
 {
-	List temp_list = NULL;
+	list_t *temp_list = NULL;
 	char *cluster = NULL;
 	int rc = SLURM_SUCCESS;
 	list_itr_t *itr = NULL, *itr_c = NULL;

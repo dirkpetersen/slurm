@@ -38,8 +38,13 @@
 #include "src/common/fd.h"
 #include "src/common/id_util.h"
 #include "src/common/parse_time.h"
+#include "src/interfaces/jobcomp.h"
 #include "src/plugins/jobcomp/common/jobcomp_common.h"
 #include "src/slurmctld/slurmctld.h"
+
+#define JOBCOMP_CONF_DEFAULT_EVENTS JOBCOMP_CONF_JOB_FINISH
+
+static bool send_script = false;
 
 static bool _valid_date_format(char *date_str)
 {
@@ -51,108 +56,65 @@ static bool _valid_date_format(char *date_str)
 	return true;
 }
 
+extern void jobcomp_common_conf_init(void)
+{
+	if (xstrcasestr(slurm_conf.job_comp_params, "send_script"))
+		send_script = true;
+}
+
+extern void jobcomp_common_conf_fini(void)
+{
+	/* not currently used */
+}
+
 /*
- * Open jobcomp state file, or backup if necessary.
+ * Return an string associated with a jobcomp_event_t.
+ * Caller should NOT free it.
  *
- * IN: char pointer to state file name.
- * RET: buffer with the loaded file or NULL.
+ * IN: event
+ * OUT: associated event string
  */
-extern buf_t *jobcomp_common_load_state_file(char *state_file)
+extern char *jobcomp_common_get_event_name(uint32_t event)
 {
-	char *absolute_file = NULL;
-	buf_t *buf;
-
-	xassert(state_file);
-
-	xstrfmtcat(absolute_file, "%s/%s",
-		   slurm_conf.state_save_location, state_file);
-
-	if ((buf = create_mmap_buf(absolute_file))) {
-		xfree(absolute_file);
-		return buf;
+	switch (event) {
+	case JOBCOMP_EVENT_JOB_FINISH:
+		return "job finish";
+	case JOBCOMP_EVENT_JOB_START:
+		return "job start";
+	case JOBCOMP_EVENT_INVALID:
+	default:
+		return "invalid";
 	}
-
-	error("Could not open jobcomp state file %s: %m", absolute_file);
-	error("NOTE: Trying backup jobcomp state save file. Finished jobs may be lost!");
-
-	xstrcat(absolute_file, ".old");
-
-	if (!(buf = create_mmap_buf(absolute_file)))
-		error("Could not open backup jobcomp state file %s: %m", absolute_file);
-
-	xfree(absolute_file);
-
-	return buf;
 }
 
-extern void jobcomp_common_write_state_file(buf_t *buffer, char *state_file)
+extern data_t *jobcomp_common_job_record_to_data(job_record_t *job_ptr,
+						 uint32_t event)
 {
-	int fd;
-	bool do_close = true;
-	char *reg_file = NULL, *new_file = NULL, *old_file = NULL;
-	char *tmp_str = NULL;
-
-	xstrfmtcat(reg_file, "%s/%s", slurm_conf.state_save_location,
-		   state_file);
-	xstrfmtcat(old_file, "%s.old", reg_file);
-	xstrfmtcat(new_file, "%s.new", reg_file);
-
-	if ((fd = creat(new_file, 0600)) < 0) {
-		xstrfmtcat(tmp_str, "creating");
-		goto rwfail;
-	}
-
-	xstrfmtcat(tmp_str, "writing");
-	safe_write(fd, get_buf_data(buffer), get_buf_offset(buffer));
-	xfree(tmp_str);
-
-	do_close = false;
-	if (fsync_and_close(fd, state_file))
-		goto rwfail;
-
-	(void) unlink(old_file);
-	if (link(reg_file, old_file))
-		debug2("unable to create link for %s -> %s: %m",
-		       reg_file, old_file);
-
-	(void) unlink(reg_file);
-	if (link(new_file, reg_file))
-		debug2("unable to create link for %s -> %s: %m",
-		       new_file, reg_file);
-
-rwfail:
-	if (tmp_str)
-		error("Can't save state, error %s file %s: %m",
-		      tmp_str, new_file);
-	if (do_close && fsync_and_close(fd, state_file))
-		;
-	(void) unlink(new_file);
-	xfree(old_file);
-	xfree(reg_file);
-	xfree(new_file);
-	xfree(tmp_str);
-}
-
-extern data_t *jobcomp_common_job_record_to_data(job_record_t *job_ptr) {
 	char start_str[32], end_str[32], time_str[32];
 	char *usr_str = NULL, *grp_str = NULL, *state_string = NULL;
-	char *exit_code_str = NULL, *derived_ec_str = NULL;
+	char *exit_code_str = NULL, *derived_ec_str = NULL, *partition = NULL;
 	buf_t *script = NULL;
 	enum job_states job_state;
 	int i, tmp_int, tmp_int2;
-	time_t elapsed_time;
+	time_t elapsed_time = 0;
 	uint32_t time_limit;
 	data_t *record = NULL;
+	bool event_job_finish = (event & JOBCOMP_EVENT_JOB_FINISH);
 
 	usr_str = user_from_job(job_ptr);
 	grp_str = group_from_job(job_ptr);
+	partition = job_ptr->part_ptr ? job_ptr->part_ptr->name :
+					job_ptr->partition;
 
 	if ((job_ptr->time_limit == NO_VAL) && job_ptr->part_ptr)
 		time_limit = job_ptr->part_ptr->max_time;
 	else
 		time_limit = job_ptr->time_limit;
 
-	if (job_ptr->job_state & JOB_RESIZING) {
+	if (!event_job_finish) {
+		parse_time_make_str_utc(&job_ptr->start_time, start_str,
+					sizeof(start_str));
+	} else if (job_ptr->job_state & JOB_RESIZING) {
 		time_t now = time(NULL);
 		state_string = job_state_string(job_ptr->job_state);
 		if (job_ptr->resize_time) {
@@ -184,29 +146,31 @@ extern data_t *jobcomp_common_job_record_to_data(job_record_t *job_ptr) {
 					sizeof(end_str));
 	}
 
-	if (job_ptr->end_time && job_ptr->start_time &&
-	    job_ptr->start_time < job_ptr->end_time)
-		elapsed_time = job_ptr->end_time - job_ptr->start_time;
-	else
-		elapsed_time = 0;
+	if (event_job_finish) {
+		if (job_ptr->end_time && job_ptr->start_time &&
+		    job_ptr->start_time < job_ptr->end_time)
+			elapsed_time = job_ptr->end_time - job_ptr->start_time;
+		else
+			elapsed_time = 0;
 
-	tmp_int = tmp_int2 = 0;
-	if (job_ptr->derived_ec == NO_VAL)
-		;
-	else if (WIFSIGNALED(job_ptr->derived_ec))
-		tmp_int2 = WTERMSIG(job_ptr->derived_ec);
-	else if (WIFEXITED(job_ptr->derived_ec))
-		tmp_int = WEXITSTATUS(job_ptr->derived_ec);
-	xstrfmtcat(derived_ec_str, "%d:%d", tmp_int, tmp_int2);
+		tmp_int = tmp_int2 = 0;
+		if (job_ptr->derived_ec == NO_VAL)
+			;
+		else if (WIFSIGNALED(job_ptr->derived_ec))
+			tmp_int2 = WTERMSIG(job_ptr->derived_ec);
+		else if (WIFEXITED(job_ptr->derived_ec))
+			tmp_int = WEXITSTATUS(job_ptr->derived_ec);
+		xstrfmtcat(derived_ec_str, "%d:%d", tmp_int, tmp_int2);
 
-	tmp_int = tmp_int2 = 0;
-	if (job_ptr->exit_code == NO_VAL)
-		;
-	else if (WIFSIGNALED(job_ptr->exit_code))
-		tmp_int2 = WTERMSIG(job_ptr->exit_code);
-	else if (WIFEXITED(job_ptr->exit_code))
-		tmp_int = WEXITSTATUS(job_ptr->exit_code);
-	xstrfmtcat(exit_code_str, "%d:%d", tmp_int, tmp_int2);
+		tmp_int = tmp_int2 = 0;
+		if (job_ptr->exit_code == NO_VAL)
+			;
+		else if (WIFSIGNALED(job_ptr->exit_code))
+			tmp_int2 = WTERMSIG(job_ptr->exit_code);
+		else if (WIFEXITED(job_ptr->exit_code))
+			tmp_int = WEXITSTATUS(job_ptr->exit_code);
+		xstrfmtcat(exit_code_str, "%d:%d", tmp_int, tmp_int2);
+	}
 
 	record = data_set_dict(data_new());
 
@@ -218,24 +182,32 @@ extern data_t *jobcomp_common_job_record_to_data(job_record_t *job_ptr) {
 	data_set_int(data_key_set(record, "group_id"), job_ptr->group_id);
 	if (_valid_date_format(start_str))
 		data_set_string(data_key_set(record, "@start"), start_str);
-	if (_valid_date_format(end_str))
+	if (event_job_finish && _valid_date_format(end_str))
 		data_set_string(data_key_set(record, "@end"), end_str);
-	data_set_int(data_key_set(record, "elapsed"), elapsed_time);
-	data_set_string(data_key_set(record, "partition"), job_ptr->partition);
+	if (event_job_finish)
+		data_set_int(data_key_set(record, "elapsed"), elapsed_time);
+	data_set_string(data_key_set(record, "partition"), partition);
 	data_set_string(data_key_set(record, "alloc_node"),
 			job_ptr->alloc_node);
 	data_set_string(data_key_set(record, "nodes"), job_ptr->nodes);
 	data_set_int(data_key_set(record, "total_cpus"), job_ptr->total_cpus);
 	data_set_int(data_key_set(record, "total_nodes"), job_ptr->total_nodes);
-	data_set_string_own(data_key_set(record, "derived_ec"), derived_ec_str);
-	derived_ec_str = NULL;
-	data_set_string_own(data_key_set(record, "exit_code"), exit_code_str);
-	exit_code_str = NULL;
+	if (event_job_finish) {
+		data_set_string_own(data_key_set(record, "derived_ec"),
+				    derived_ec_str);
+		derived_ec_str = NULL;
+		data_set_string_own(data_key_set(record, "exit_code"),
+				    exit_code_str);
+		exit_code_str = NULL;
+	}
 	data_set_string(data_key_set(record, "state"), state_string);
-	data_set_string(data_key_set(record, "failed_node"),
-			job_ptr->failed_node);
-	data_set_float(data_key_set(record, "cpu_hours"),
-		       ((elapsed_time * job_ptr->total_cpus) / 3600.0f));
+	if (event_job_finish) {
+		data_set_string(data_key_set(record, "failed_node"),
+				job_ptr->failed_node);
+		data_set_float(data_key_set(record, "cpu_hours"),
+			       ((elapsed_time * job_ptr->total_cpus) /
+				3600.0f));
+	}
 
 	if (job_ptr->array_task_id != NO_VAL) {
 		data_set_int(data_key_set(record, "array_job_id"),
@@ -245,11 +217,13 @@ extern data_t *jobcomp_common_job_record_to_data(job_record_t *job_ptr) {
 	}
 
 	if (job_ptr->het_job_id != NO_VAL) {
-		/* Continue supporting the old terms. */
-		data_set_int(data_key_set(record, "pack_job_id"),
-			     job_ptr->het_job_id);
-		data_set_int(data_key_set(record, "pack_job_offset"),
-			     job_ptr->het_job_offset);
+		if (event_job_finish) {
+			/* Continue supporting the old terms. */
+			data_set_int(data_key_set(record, "pack_job_id"),
+				     job_ptr->het_job_id);
+			data_set_int(data_key_set(record, "pack_job_offset"),
+				     job_ptr->het_job_offset);
+		}
 		data_set_int(data_key_set(record, "het_job_id"),
 			     job_ptr->het_job_id);
 		data_set_int(data_key_set(record, "het_job_offset"),
@@ -372,10 +346,11 @@ extern data_t *jobcomp_common_job_record_to_data(job_record_t *job_ptr) {
 		data_set_string(data_key_set(record, "account"),
 				job_ptr->account);
 
-	if ((script = get_job_script(job_ptr)))
+	if (send_script && (script = get_job_script(job_ptr))) {
 		data_set_string(data_key_set(record, "script"),
 				get_buf_data(script));
-	FREE_NULL_BUFFER(script);
+		FREE_NULL_BUFFER(script);
+	}
 
 	if (job_ptr->assoc_ptr) {
 		assoc_mgr_lock_t locks = { READ_LOCK, NO_LOCK, NO_LOCK, NO_LOCK,
@@ -418,4 +393,16 @@ extern data_t *jobcomp_common_job_record_to_data(job_record_t *job_ptr) {
 	xfree(grp_str);
 
 	return record;
+}
+
+extern uint32_t jobcomp_common_parse_enabled_events(void)
+{
+	uint32_t enabled_events = 0;
+
+	enabled_events |= JOBCOMP_CONF_DEFAULT_EVENTS;
+
+	if (xstrcasestr(slurm_conf.job_comp_params, "enable_job_start"))
+		enabled_events |= JOBCOMP_CONF_JOB_START;
+
+	return enabled_events;
 }

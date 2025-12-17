@@ -86,7 +86,7 @@ typedef struct _plugrack_entry {
  * entries is the list of plugrack_entry_t.
  */
 struct _plugrack {
-	List entries;
+	list_t *entries;
 	const char *major_type;
 };
 
@@ -345,7 +345,7 @@ plugin_handle_t plugrack_use_by_type(plugrack_t *rack, const char *full_type)
 
 		/* See if plugin is loaded. */
 		if (e->plug == PLUGIN_INVALID_HANDLE  &&
-		    (err = plugin_load_from_file(&e->plug, e->fq_path)))
+		    (err = plugin_load_from_file(&e->plug, e->fq_path, true)))
 			error("%s: %s", e->fq_path, slurm_strerror(err));
 
 		/* If load was successful, increment the reference count. */

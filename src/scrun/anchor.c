@@ -73,6 +73,8 @@
 
 #include "src/scrun/scrun.h"
 
+#define THREAD_COUNT 3
+
 static void _open_pty();
 static int _kill_job(conmgr_fd_t *con, int signal);
 static void _notify_started(void);
@@ -141,10 +143,9 @@ static int _queue_delete_request(conmgr_fd_t *con, slurm_msg_t *req_msg)
 	return SLURM_SUCCESS;
 }
 
-static void _on_pty_reply_sent(conmgr_fd_t *con, conmgr_work_type_t type,
-			       conmgr_work_status_t status, const char *tag,
-			       void *arg)
+static void _on_pty_reply_sent(conmgr_callback_args_t conmgr_args, void *arg)
 {
+	conmgr_fd_t *con = conmgr_args.con;
 	int fd;
 
 	read_lock_state();
@@ -154,7 +155,7 @@ static void _on_pty_reply_sent(conmgr_fd_t *con, conmgr_work_type_t type,
 	debug("%s: [%s] sending fd:%u", __func__, conmgr_fd_get_name(con), fd);
 
 	/* this is a blocking operation */
-	send_fd_over_pipe(conmgr_fd_get_output_fd(con), fd);
+	send_fd_over_socket(conmgr_fd_get_output_fd(con), fd);
 }
 
 static int _send_pty(conmgr_fd_t *con, slurm_msg_t *req_msg)
@@ -176,9 +177,7 @@ static int _send_pty(conmgr_fd_t *con, slurm_msg_t *req_msg)
 
 	debug("%s: [%s] requested pty", __func__, conmgr_fd_get_name(con));
 
-	conmgr_add_work(con, _on_pty_reply_sent,
-			 CONMGR_WORK_TYPE_CONNECTION_WRITE_COMPLETE, NULL,
-			 __func__);
+	conmgr_add_work_con_write_complete_fifo(con, _on_pty_reply_sent, NULL);
 
 	return rc;
 }
@@ -223,8 +222,7 @@ static void _daemonize_logs()
 	update_logging();
 }
 
-static void _tear_down(conmgr_fd_t *con, conmgr_work_type_t type,
-		       conmgr_work_status_t status, const char *tag, void *arg)
+static void _tear_down(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	bool need_kill = false, need_stop = false;
 	int rc = SLURM_SUCCESS;
@@ -285,9 +283,7 @@ static int _send_delete_confirmation(void *x, void *arg)
 }
 
 /* stopping job is async: this is the final say if the job has stopped */
-static void _check_if_stopped(conmgr_fd_t *con, conmgr_work_type_t type,
-			      conmgr_work_status_t status, const char *tag,
-			      void *arg)
+static void _check_if_stopped(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	int ptm = -1;
 	bool stopped = false;
@@ -378,11 +374,10 @@ static void _check_if_stopped(conmgr_fd_t *con, conmgr_work_type_t type,
 	conmgr_request_shutdown();
 }
 
-static void _finish_job(conmgr_fd_t *con, conmgr_work_type_t type,
-			conmgr_work_status_t status, const char *tag,
-			void *arg)
+static void _finish_job(conmgr_callback_args_t conmgr_args, void *arg)
 {
-	int jobid, rc;
+	int rc;
+	slurm_step_id_t step_id;
 	bool existing_allocation;
 
 	xassert(!arg);
@@ -391,31 +386,31 @@ static void _finish_job(conmgr_fd_t *con, conmgr_work_type_t type,
 	xassert(state.status >= CONTAINER_ST_STOPPING);
 	xassert(!state.job_completed);
 
-	jobid = state.jobid;
+	step_id = state.step_id;
 	rc = state.srun_rc;
 	existing_allocation = state.existing_allocation;
 	unlock_state();
 
 	if (existing_allocation) {
-		debug("%s: skipping slurm_complete_job(jobId=%u)",
-		      __func__, jobid);
+		debug("%s: skipping slurm_complete_job(%pI)",
+		      __func__, &step_id);
 		goto done;
-	} else if (!jobid) {
+	} else if (step_id.job_id == NO_VAL) {
 		debug("%s: no Job to complete", __func__);
 		return;
 	}
 
-	rc = slurm_complete_job(jobid, rc);
+	rc = slurm_complete_job(&step_id, rc);
 	if ((rc == SLURM_ERROR) && errno)
 		rc = errno;
 
 	if (rc == ESLURM_ALREADY_DONE) {
-		debug("%s: jobId=%u already complete", __func__, jobid);
+		debug("%s: %pI already complete", __func__, &step_id);
 	} else if (rc) {
-		error("%s: slurm_complete_job(jobId=%u) failed: %s",
-		      __func__, jobid, slurm_strerror(rc));
+		error("%s: slurm_complete_job(%pI) failed: %s",
+		      __func__, &step_id, slurm_strerror(rc));
 	} else {
-		debug("%s: jobId=%u released successfully", __func__, jobid);
+		debug("%s: %pI released successfully", __func__, &step_id);
 	}
 
 done:
@@ -424,12 +419,10 @@ done:
 	state.job_completed = true;
 	unlock_state();
 
-	conmgr_add_work(NULL, _check_if_stopped, CONMGR_WORK_TYPE_FIFO, NULL,
-			 __func__);
+	conmgr_add_work_fifo(_check_if_stopped, NULL);
 }
 
-static void _stage_out(conmgr_fd_t *con, conmgr_work_type_t type,
-		       conmgr_work_status_t status, const char *tag, void *arg)
+static void _stage_out(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	int rc;
 	bool staged_in;
@@ -463,8 +456,7 @@ static void _stage_out(conmgr_fd_t *con, conmgr_work_type_t type,
 	state.staged_out = true;
 	unlock_state();
 
-	conmgr_add_work(NULL, _finish_job, CONMGR_WORK_TYPE_FIFO, NULL,
-			 __func__);
+	conmgr_add_work_fifo(_finish_job, NULL);
 }
 
 /* cleanup anchor and shutdown */
@@ -498,12 +490,13 @@ extern void stop_anchor(int status)
 	if (state.startup_con) {
 		int rc;
 
-		debug("%s: sending pid to parent due to container stopped before running",
-		      __func__);
+		debug4("%s: sending pid %"PRIu64" to parent due to container stopped in state %s",
+		      __func__, (uint64_t) state.pid,
+		      slurm_container_status_to_str(state.status));
 
 		/* send the pid now since due to failure */
-		if ((rc = conmgr_queue_write_fd(state.startup_con, &state.pid,
-						sizeof(state.pid))))
+		if ((rc = conmgr_queue_write_data(state.startup_con, &state.pid,
+						  sizeof(state.pid))))
 			fatal("%s: unable to send pid: %s",
 			      __func__, slurm_strerror(rc));
 
@@ -511,15 +504,12 @@ extern void stop_anchor(int status)
 	}
 	unlock_state();
 
-	conmgr_add_work(NULL, _stage_out, CONMGR_WORK_TYPE_FIFO, NULL,
-			 __func__);
+	conmgr_add_work_fifo(_stage_out, NULL);
 
 	debug2("%s: end", __func__);
 }
 
-static void _catch_sigchld(conmgr_fd_t *con, conmgr_work_type_t type,
-			   conmgr_work_status_t status, const char *tag,
-			   void *arg)
+static void _catch_sigchld(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	pid_t pid;
 	pid_t srun_pid;
@@ -590,8 +580,9 @@ static void _catch_sigchld(conmgr_fd_t *con, conmgr_work_type_t type,
 	} while (pid > 0);
 }
 
-static void *_on_cs_connection(conmgr_fd_t *con, void *arg)
+static void *_on_cs_connection(conmgr_callback_args_t conmgr_args, void *arg)
 {
+	conmgr_fd_t *con = conmgr_args.con;
 	int tty;
 	xassert(!arg);
 
@@ -618,7 +609,7 @@ static void *_on_cs_connection(conmgr_fd_t *con, void *arg)
 	/* hand over pty to console_socket */
 	/* WARNING: blocking call */
 	errno = 0;
-	send_fd_over_pipe(conmgr_fd_get_output_fd(con), tty);
+	send_fd_over_socket(conmgr_fd_get_output_fd(con), tty);
 	debug2("%s: [%s] sent fd:%d rc:%m",
 	       __func__, conmgr_fd_get_name(con), tty);
 
@@ -628,7 +619,7 @@ static void *_on_cs_connection(conmgr_fd_t *con, void *arg)
 	return &state;
 }
 
-static int _on_cs_data(conmgr_fd_t *con, void *arg)
+static int _on_cs_data(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	xassert(!arg);
 
@@ -643,7 +634,7 @@ static int _on_cs_data(conmgr_fd_t *con, void *arg)
 	return EINVAL;
 }
 
-static void _on_cs_finish(void *arg)
+static void _on_cs_finish(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	xassert(arg == &state);
 	check_state();
@@ -676,9 +667,9 @@ static void _queue_send_console_socket(void)
 		fatal("%s: [%s] Unable to connect() to console socket: %m",
 		      __func__, addr.sun_path);
 
-	if ((rc = conmgr_process_fd(CON_TYPE_RAW, fd, fd, events,
+	if ((rc = conmgr_process_fd(CON_TYPE_RAW, fd, fd, &events, CON_FLAG_NONE,
 				    (slurm_addr_t *) &addr, sizeof(addr),
-				    NULL)))
+				    NULL, NULL)))
 		fatal("%s: [%s] unable to initialize console socket: %s",
 		      __func__, addr.sun_path, slurm_strerror(rc));
 
@@ -702,13 +693,14 @@ static int _send_start_response(conmgr_fd_t *con, slurm_msg_t *req_msg, int rc)
 	st_msg->rc = rc;
 
 	read_lock_state();
-	st_msg->step.job_id = state.jobid;
+	st_msg->step_id = state.step_id;
 	unlock_state();
 
-	st_msg->step.step_id = 0;
-	st_msg->step.step_het_comp = NO_VAL;
+	st_msg->step_id.step_id = 0;
+	st_msg->step_id.step_het_comp = NO_VAL;
 	rc = conmgr_queue_write_msg(con, msg);
 	slurm_free_msg(msg);
+	FREE_NULL_MSG(req_msg);
 
 	conmgr_queue_close_fd(con);
 	return rc;
@@ -843,20 +835,21 @@ static int _start(conmgr_fd_t *con, slurm_msg_t *req_msg)
 
 static int _kill_job(conmgr_fd_t *con, int signal)
 {
-	int rc = SLURM_SUCCESS, jobid;
+	int rc = SLURM_SUCCESS;
+	slurm_step_id_t step_id;
 	container_state_msg_status_t status;
 
 	read_lock_state();
-	jobid = state.jobid;
+	step_id = state.step_id;
 	status = state.status;
 	unlock_state();
 
-	if (jobid && (status <= CONTAINER_ST_STOPPING)) {
-		rc = slurm_kill_job(jobid, signal, KILL_FULL_JOB);
+	if ((step_id.job_id != NO_VAL) && (status <= CONTAINER_ST_STOPPING)) {
+		rc = slurm_kill_job(step_id.job_id, signal, KILL_FULL_JOB);
 
-		debug("%s: [%s] slurm_kill_job(JobID=%d, Signal[%d]=%s, 0) = %s",
+		debug("%s: [%s] slurm_kill_job(%pI, Signal[%d]=%s, 0) = %s",
 		      __func__, (con ? conmgr_fd_get_name(con) : "self"),
-		      jobid, signal, strsignal(signal), slurm_strerror(rc));
+		      &step_id, signal, strsignal(signal), slurm_strerror(rc));
 	} else {
 		debug("%s: [%s] job already dead",
 		      __func__, conmgr_fd_get_name(con));
@@ -905,8 +898,7 @@ static int _delete(conmgr_fd_t *con, slurm_msg_t *req_msg)
 
 	rc = _queue_delete_request(con, req_msg);
 
-	conmgr_add_work(NULL, _tear_down, CONMGR_WORK_TYPE_FIFO, NULL,
-			__func__);
+	conmgr_add_work_fifo(_tear_down, NULL);
 
 	return rc;
 }
@@ -1017,7 +1009,7 @@ static void _cleanup_pidfile()
 
 /*
  * Based on create_pidfile() but does not place newline at end of file
- * to be compatible with docker pidfile parsing. Defers actually writting the
+ * to be compatible with docker pidfile parsing. Defers actually writing the
  * pidfile too.
  */
 static void _open_pidfile()
@@ -1095,9 +1087,7 @@ rwfail:
 	      __func__, state.pid_file, slurm_strerror(rc));
 }
 
-extern void on_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
-			  conmgr_work_status_t status, const char *tag,
-			  void *arg)
+extern void on_allocation(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	bool queue_try_start = false;
 	int rc;
@@ -1106,7 +1096,7 @@ extern void on_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
 	xassert(!arg);
 
 	write_lock_state();
-	if (state.jobid <= 0) {
+	if (state.step_id.job_id == NO_VAL) {
 		unlock_state();
 		debug("%s: waiting for job allocation", __func__);
 		return;
@@ -1138,7 +1128,8 @@ extern void on_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
 
 	/* notify command_create() that container is now CREATED */
 	xassert(state.startup_con);
-	if ((rc = conmgr_queue_write_fd(state.startup_con, &pid, sizeof(pid))))
+	if ((rc = conmgr_queue_write_data(state.startup_con, &pid,
+					  sizeof(pid))))
 		fatal("%s: unable to send pid: %s",
 		      __func__, slurm_strerror(rc));
 
@@ -1149,8 +1140,10 @@ extern void on_allocation(conmgr_fd_t *con, conmgr_work_type_t type,
 		_try_start();
 }
 
-static void *_on_connection(conmgr_fd_t *con, void *arg)
+static void *_on_connection(conmgr_callback_args_t conmgr_args, void *arg)
 {
+	conmgr_fd_t *con = conmgr_args.con;
+
 	/* may or may not need to be locked for this one */
 	check_state();
 	xassert(!arg);
@@ -1160,7 +1153,7 @@ static void *_on_connection(conmgr_fd_t *con, void *arg)
 	return &state;
 }
 
-static void _on_connection_finish(void *arg)
+static void _on_connection_finish(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	xassert(arg == &state);
 	check_state();
@@ -1204,12 +1197,22 @@ static int _send_state(conmgr_fd_t *con, slurm_msg_t *req_msg)
 	return rc;
 }
 
-static int _on_connection_msg(conmgr_fd_t *con, slurm_msg_t *msg, void *arg)
+static int _on_connection_msg(conmgr_callback_args_t conmgr_args,
+			      slurm_msg_t *msg, int unpack_rc, void *arg)
 {
+	conmgr_fd_t *con = conmgr_args.con;
 	int rc;
 	uid_t user_id;
 
 	xassert(arg == &state);
+
+	if (unpack_rc || !msg->auth_ids_set) {
+		error("%s: [%s] rejecting malformed RPC and closing connection: %s",
+		      __func__, conmgr_fd_get_name(con),
+		      slurm_strerror(unpack_rc));
+		slurm_free_msg(msg);
+		return unpack_rc;
+	}
 
 	read_lock_state();
 	user_id = state.user_id;
@@ -1227,11 +1230,13 @@ static int _on_connection_msg(conmgr_fd_t *con, slurm_msg_t *msg, void *arg)
 		error("%s: [%s] rejecting %s RPC with missing user auth",
 		      __func__, conmgr_fd_get_name(con),
 		      rpc_num2string(msg->msg_type));
+		FREE_NULL_MSG(msg);
 		return SLURM_PROTOCOL_AUTHENTICATION_ERROR;
 	} else if (msg->auth_uid != user_id) {
 		error("%s: [%s] rejecting %s RPC with user:%u != owner:%u",
 		      __func__, conmgr_fd_get_name(con),
 		      rpc_num2string(msg->msg_type), msg->auth_uid, user_id);
+		FREE_NULL_MSG(msg);
 		return SLURM_PROTOCOL_AUTHENTICATION_ERROR;
 	}
 
@@ -1311,7 +1316,7 @@ static void _open_pty(void)
 	state.pts = pts;
 }
 
-static int _on_startup_con_data(conmgr_fd_t *con, void *arg)
+static int _on_startup_con_data(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	xassert(arg == &state);
 	check_state();
@@ -1319,8 +1324,9 @@ static int _on_startup_con_data(conmgr_fd_t *con, void *arg)
 	fatal("%s: unexpected data", __func__);
 }
 
-static void *_on_startup_con(conmgr_fd_t *con, void *arg)
+static void *_on_startup_con(conmgr_callback_args_t conmgr_args, void *arg)
 {
+	conmgr_fd_t *con = conmgr_args.con;
 	bool queue = false;
 
 	xassert(!arg);
@@ -1336,24 +1342,24 @@ static void *_on_startup_con(conmgr_fd_t *con, void *arg)
 	 * job may already be allocated at this point so see if we need to mark
 	 * as created
 	 */
-	if ((state.status == CONTAINER_ST_CREATING) && (state.jobid > 0) &&
-	    !state.existing_allocation)
+	if ((state.status == CONTAINER_ST_CREATING) &&
+	    (state.step_id.job_id != NO_VAL) && !state.existing_allocation)
 		queue = true;
 	unlock_state();
 
 	if (queue) {
-		conmgr_add_work(NULL, on_allocation, CONMGR_WORK_TYPE_FIFO,
-				NULL, __func__);
+		conmgr_add_work_fifo(on_allocation, NULL);
 	}
 
 	return &state;
 }
 
-static void _on_startup_con_fin(void *arg)
+static void _on_startup_con_fin(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	xassert(arg == &state);
 
 	write_lock_state();
+	xassert(state.startup_con == conmgr_args.con);
 	debug4("%s: [%s] create command parent notified of start",
 	       __func__, conmgr_fd_get_name(state.startup_con));
 	xassert(state.startup_con);
@@ -1376,34 +1382,49 @@ static int _wait_create_pid(int fd, pid_t child)
 	if (close(fd))
 		fatal("close(%u) failed: %m", fd);
 
-	debug("%s: anchor pid %"PRIu64" ready", __func__, (uint64_t) pid);
 	debug4("%s: goodbye cruel lamp", __func__);
 
-	if (pid > 0)
+	if (pid > 0) {
+		debug("%s: anchor pid %"PRIu64" ready",
+		      __func__, (uint64_t) pid);
 		return SLURM_SUCCESS;
-	else
+	} else {
+		debug("%s: received failure signal pid %"PRIi64,
+		      __func__, (int64_t) pid);
 		goto check_pid;
+	}
 rwfail:
 	rc = errno;
 	debug("%s: pipe read(%d) error while waiting for pid from child process %"PRIu64" failed: %s",
 	      __func__, fd, (uint64_t) child, slurm_strerror(rc));
 check_pid:
 	/* check what happened to the child process */
-	while ((rc = waitpid(child, &status, WNOHANG)) == EINTR)
-	       debug("%s: waitpid(%"PRIu64") interrupted",
-		     __func__, (uint64_t) child);
+	debug("%s: waiting for anchor process %u to terminate",
+	      __func__, child);
 
-	if (rc == -1)
+	while (((rc = waitpid(child, &status, 0)) < 0) && (errno == EINTR))
+		debug("%s: waitpid(%" PRIu64 ") interrupted",
+		      __func__, (uint64_t) child);
+
+	if (rc == -1) {
 		rc = errno;
+		debug("%s: waitpid(%"PRIu64") failed[%d]: %s",
+		      __func__, (uint64_t) child, rc, slurm_strerror(rc));
+		return rc;
+	}
 
-	if (!rc) {
-		debug("anchor %d successfully left session", child);
-	} else if (!WIFEXITED(status)) {
-		debug("anchor %d already exited", child);
+	xassert(child == rc);
+	rc = SLURM_SUCCESS;
+
+	debug("anchor %d successfully left session", child);
+
+	if (WIFEXITED(status)) {
 		rc = WEXITSTATUS(status);
+		debug("%s: anchor %"PRIu64" exited[%d]=%s",
+		      __func__, (uint64_t) child, rc, slurm_strerror(rc));
 	} else if (WIFSIGNALED(status)) {
-		fatal("anchor %d killed by signal %d",
-		      child, WTERMSIG(status));
+		fatal("%s: anchor %"PRIu64" killed by signal %d",
+		      __func__, (uint64_t) child, WTERMSIG(status));
 	}
 
 	return rc;
@@ -1428,7 +1449,7 @@ static int _anchor_child(int pipe_fd[2])
 	_populate_pidfile();
 
 	/* must init conmgr after calling fork() in _daemonize() */
-	conmgr_init(0, 0, (conmgr_callbacks_t) { NULL, NULL } );
+	conmgr_init(0, THREAD_COUNT, 0);
 
 	change_status_force(CONTAINER_ST_CREATING);
 
@@ -1457,22 +1478,22 @@ static int _anchor_child(int pipe_fd[2])
 	/* TODO: only 1 unix socket for now */
 	list_append(socket_listen,
 		    xstrdup_printf("unix:%s", state.anchor_socket));
-	if ((rc = conmgr_create_sockets(CON_TYPE_RPC, socket_listen,
-					conmgr_events, NULL)))
+	if ((rc = conmgr_create_listen_sockets(CON_TYPE_RPC, CON_FLAG_NONE,
+					       socket_listen, &conmgr_events,
+					       NULL)))
 		fatal("%s: unable to initialize listeners: %s",
 		      __func__, slurm_strerror(rc));
 	debug("%s: listening on unix:%s", __func__, state.anchor_socket);
 
-	conmgr_add_signal_work(SIGCHLD, _catch_sigchld, &state,
-			       "_catch_sigchld");
+	conmgr_add_work_signal(SIGCHLD, _catch_sigchld, &state);
 
 	if ((rc = conmgr_process_fd(CON_TYPE_RAW, pipe_fd[1], pipe_fd[1],
-				    conmgr_startup_events, NULL, 0, NULL)))
+				    &conmgr_startup_events, CON_FLAG_NONE, NULL,
+				    0, NULL, NULL)))
 		fatal("%s: unable to initialize RPC listener: %s",
 		      __func__, slurm_strerror(rc));
 
-	conmgr_add_work(NULL, get_allocation, CONMGR_WORK_TYPE_FIFO, NULL,
-			__func__);
+	conmgr_add_work_fifo(get_allocation, NULL);
 
 	if ((spank_rc = spank_init_post_opt())) {
 		fatal("%s: plugin stack post-option processing failed: %s",
@@ -1495,7 +1516,6 @@ static int _anchor_child(int pipe_fd[2])
 	slurm_mutex_lock(&state.debug_lock);
 	xassert(!state.locked);
 	xassert(state.needs_lock);
-	state.needs_lock = false;
 	debug4("%s: END conmgr_run()", __func__);
 	slurm_mutex_unlock(&state.debug_lock);
 #endif
@@ -1536,11 +1556,21 @@ extern int spawn_anchor(void)
 		rc = _anchor_child(pipe_fd);
 
 done:
-	debug("%s: anchor exiting: %s", __func__, slurm_strerror(rc));
-	debug("%s: exit[%d]: %s", __func__, rc, slurm_strerror(rc));
-
 	spank_rc = spank_fini(NULL);
 	destroy_lua();
 
-	return rc ? rc : spank_rc;
+	debug2("%s: rc[%d]=%s spank_rc[%d]=%s srun_rc[%d]=%s",
+	      __func__,
+	      rc, slurm_strerror(rc),
+	      spank_rc, slurm_strerror(spank_rc),
+	      state.srun_rc, slurm_strerror(state.srun_rc));
+
+	if (rc)
+		return rc;
+	else if (spank_rc)
+		return spank_rc;
+	else if (state.srun_rc)
+		return state.srun_rc;
+
+	return SLURM_SUCCESS;
 }

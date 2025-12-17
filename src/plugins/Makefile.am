@@ -6,18 +6,22 @@ SUBDIRS = \
 	acct_gather_filesystem  \
 	auth			\
 	burst_buffer		\
+	certgen			\
+	certmgr			\
 	cli_filter		\
 	cred			\
 	data_parser		\
 	gpu			\
 	gres			\
 	hash			\
+	http_parser		\
 	jobacct_gather		\
 	jobcomp			\
-	job_container		\
 	job_submit		\
+	metrics			\
 	mcs			\
 	mpi			\
+	namespace		\
 	node_features		\
 	preempt			\
 	prep			\

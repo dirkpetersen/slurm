@@ -39,7 +39,6 @@
 
 #include <ctype.h>
 #include <inttypes.h>
-#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,36 +62,12 @@
 #include "../common/gres_common.h"
 #include "../common/gres_c_s.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - A string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - A string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Gres SHARD plugin";
-const char	plugin_type[]		= "gres/shard";
-const uint32_t	plugin_version		= SLURM_VERSION_NUMBER;
+const char plugin_type[] = "gres/shard";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
-static List	gres_devices		= NULL;
+static list_t *gres_devices = NULL;
 static uint32_t	node_flags		= 0;
 
 typedef struct shard_dev_info {
@@ -106,13 +81,12 @@ extern int init(void)
 
 	return SLURM_SUCCESS;
 }
-extern int fini(void)
+
+extern void fini(void)
 {
 	debug("unloading");
 	FREE_NULL_LIST(gres_devices);
 	gres_c_s_fini();
-
-	return SLURM_SUCCESS;
 }
 
 /*
@@ -120,7 +94,7 @@ extern int fini(void)
  * This only validates that the configuration was specified in gres.conf.
  * In the general case, no code would need to be changed.
  */
-extern int gres_p_node_config_load(List gres_conf_list,
+extern int gres_p_node_config_load(list_t *gres_conf_list,
 				   node_config_load_t *config)
 {
 	int rc = gres_c_s_init_share_devices(
@@ -253,45 +227,10 @@ unpack_error:
 }
 
 /*
- * get data from a job's GRES data structure
- * IN job_gres_data  - job's GRES data structure
- * IN node_inx - zero-origin index of the node within the job's allocation
- *	for which data is desired
- * IN data_type - type of data to get from the job's data
- * OUT data - pointer to the data from job's GRES data structure
- *            DO NOT FREE: This is a pointer into the job's data structure
- * RET - SLURM_SUCCESS or error code
- */
-extern int gres_p_get_job_info(gres_job_state_t *gres_js,
-			       uint32_t node_inx,
-			       enum gres_job_data_type data_type, void *data)
-{
-	return EINVAL;
-}
-
-/*
- * get data from a step's GRES data structure
- * IN gres_ss  - step's GRES data structure
- * IN node_inx - zero-origin index of the node within the job's allocation
- *	for which data is desired. Note this can differ from the step's
- *	node allocation index.
- * IN data_type - type of data to get from the step's data
- * OUT data - pointer to the data from step's GRES data structure
- *            DO NOT FREE: This is a pointer into the step's data structure
- * RET - SLURM_SUCCESS or error code
- */
-extern int gres_p_get_step_info(gres_step_state_t *gres_ss,
-				uint32_t node_inx,
-				enum gres_step_data_type data_type, void *data)
-{
-	return EINVAL;
-}
-
-/*
  * Return a list of devices of this type. The list elements are of type
  * "gres_device_t" and the list should be freed using FREE_NULL_LIST().
  */
-extern List gres_p_get_devices(void)
+extern list_t *gres_p_get_devices(void)
 {
 	return gres_devices;
 }

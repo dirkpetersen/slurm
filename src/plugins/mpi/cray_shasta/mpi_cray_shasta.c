@@ -61,34 +61,13 @@
 
 #include "apinfo.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *      <application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "switch" for Slurm switch) and <method> is a description
- * of how this plugin satisfies that application.  Slurm will only load
- * a switch plugin if the plugin_type string has a prefix of "switch/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "mpi Cray Shasta plugin";
 const char plugin_type[] = "mpi/cray_shasta";
-const uint32_t plugin_id = MPI_PLUGIN_CRAY_SHASTA;
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
+/* Required for mpi plugins: */
+const uint32_t plugin_id = MPI_PLUGIN_CRAY_SHASTA;
 
 /* Environment variables available for applications */
 #define PALS_APID_ENV "PALS_APID"
@@ -285,7 +264,7 @@ extern int init(void)
 /*
  * Clean up the application
  */
-extern int fini(void)
+extern void fini(void)
 {
 	// Remove application spool directory
 	if (appdir)
@@ -294,8 +273,6 @@ extern int fini(void)
 	// Free allocated storage
 	xfree(appdir);
 	xfree(apinfo);
-
-	return SLURM_SUCCESS;
 }
 
 extern void mpi_p_conf_options(s_p_options_t **full_options, int *full_opt_cnt)
@@ -311,7 +288,7 @@ extern s_p_hashtbl_t *mpi_p_conf_get(void)
 	return NULL;
 }
 
-extern List mpi_p_conf_get_printable(void)
+extern list_t *mpi_p_conf_get_printable(void)
 {
 	return NULL;
 }

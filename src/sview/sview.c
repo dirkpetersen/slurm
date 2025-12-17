@@ -41,8 +41,6 @@
 
 #include "sview.h"
 
-#define _DEBUG 0
-
 typedef struct {
 	GtkTable *table;
 	int page_num;
@@ -81,14 +79,12 @@ GtkTable *main_grid_table = NULL;
 GMutex *sview_mutex = NULL;
 GMutex *grid_mutex = NULL;
 GCond *grid_cond = NULL;
-int cluster_dims;
 uint32_t cluster_flags;
 list_t *cluster_list = NULL;
 switch_record_bitmaps_t *g_switch_nodes_maps = NULL;
 popup_pos_t popup_pos;
 char *federation_name = NULL;
 
-front_end_info_msg_t *g_front_end_info_ptr;
 job_info_msg_t *g_job_info_ptr = NULL;
 node_info_msg_t *g_node_info_ptr = NULL;
 partition_info_msg_t *g_part_info_ptr = NULL;
@@ -97,6 +93,7 @@ burst_buffer_info_msg_t *g_bb_info_ptr = NULL;
 slurm_ctl_conf_info_msg_t *g_ctl_info_ptr = NULL;
 job_step_info_response_msg_t *g_step_info_ptr = NULL;
 topo_info_response_msg_t *g_topo_info_msg_ptr = NULL;
+int g_switch_nodes_maps_count = 0;
 
 static GtkActionGroup *admin_action_group = NULL;
 static GtkActionGroup *menu_action_group = NULL;
@@ -135,10 +132,6 @@ display_data_t main_display_data[] = {
 	 refresh_main, NULL, NULL,
 	 get_info_node, specific_info_node,
 	 set_menus_node, NULL},
-	{G_TYPE_NONE, FRONT_END_PAGE, "Front End Nodes", false, -1,
-	 refresh_main, create_model_front_end, admin_edit_front_end,
-	 get_info_front_end, specific_info_front_end,
-	 set_menus_front_end, NULL},
 	{G_TYPE_NONE, SUBMIT_PAGE, NULL, false, -1,
 	 refresh_main, NULL, NULL, NULL,
 	 NULL, NULL, NULL},
@@ -186,22 +179,11 @@ void *_page_thr(void *arg)
 	thread_count++;
 	g_mutex_unlock(sview_mutex);
 	while (page_running == num) {
-#if _DEBUG
-		DEF_TIMERS;
-		START_TIMER;
-#endif
-//		g_mutex_lock(sview_mutex);
 		gdk_threads_enter();
 		sview_init_grid(reset_highlight);
 		reset_highlight=false;
 		(display_data->get_info)(table, display_data);
-		//gdk_flush();
 		gdk_threads_leave();
-//		g_mutex_unlock(sview_mutex);
-#if _DEBUG
-		END_TIMER;
-		g_print("got for iteration: %s\n", TIME_STR);
-#endif
 		sleep(working_sview_config.refresh_delay);
 		g_mutex_lock(sview_mutex);
 		if (thread_count > 1) {
@@ -402,34 +384,6 @@ static void _set_page_opts(GtkToggleAction *action)
 	return;
 }
 
-#ifdef WANT_TOPO_ON_MAIN_OPTIONS
-static void _set_topogrid(GtkToggleAction *action)
-{
-	char *tmp;
-	int rc = SLURM_SUCCESS;
-
-	if (action) {
-		working_sview_config.grid_topological
-			= gtk_toggle_action_get_active(action);
-	}
-	apply_hidden_change = false;
-	if (working_sview_config.grid_topological) {
-		if (!g_switch_nodes_maps)
-			rc = get_topo_conf();
-		if (rc != SLURM_SUCCESS)
-			/*denied*/
-			tmp = g_strdup_printf("Valid topology not detected");
-		else
-			tmp = g_strdup_printf("Grid changed to topology order");
-
-	}
-	refresh_main(NULL, NULL);
-	display_edit_note(tmp);
-	g_free(tmp);
-	return;
-}
-#endif
-
 static void _set_ruled(GtkToggleAction *action)
 {
 	char *tmp;
@@ -444,7 +398,6 @@ static void _set_ruled(GtkToggleAction *action)
 			"Tables ruled");
 
 	/* get rid of each existing table */
-	cluster_change_front_end();
 	cluster_change_resv();
 	cluster_change_part();
 	cluster_change_job();
@@ -695,15 +648,8 @@ static char *_get_ui_description()
 		"      <menuitem action='grid'/>"
 		"      <menuitem action='hidden'/>"
 		"      <menuitem action='page_opts'/>"
-#ifdef WANT_TOPO_ON_MAIN_OPTIONS
-		"      <menuitem action='topoorder'/>"
-#endif
-		"      <menuitem action='ruled'/>");
-	if (cluster_dims == 1)
-		xstrcat(ui_description,
-			"      <menuitem action='grid_specs'/>");
-
-	xstrcat(ui_description,
+		"      <menuitem action='ruled'/>"
+		"      <menuitem action='grid_specs'/>"
 		"      <menuitem action='interval'/>"
 		"      <separator/>"
 		"      <menuitem action='admin'/>"
@@ -861,12 +807,6 @@ static GtkWidget *_get_menubar_menu(GtkWidget *window, GtkWidget *notebook)
 		 "<control>w", "Save Page Options",
 		 G_CALLBACK(_set_page_opts),
 		 working_sview_config.save_page_opts},
-#ifdef WANT_TOPO_ON_MAIN_OPTIONS
-		{"topoorder", GTK_STOCK_SELECT_COLOR, "Set Topology Grid",
-		 "<control>t", "Set Topology Grid",
-		 G_CALLBACK(_set_topogrid),
-		 working_sview_config.grid_topological},
-#endif
 		{"ruled", GTK_STOCK_SELECT_COLOR, "R_uled Tables",
 		 "<control>u", "Have ruled tables or not",
 		 G_CALLBACK(_set_ruled), working_sview_config.ruled_treeview},
@@ -1092,8 +1032,6 @@ static void _change_cluster_main(GtkComboBox *combo, gpointer extra)
 	/* } */
 
 	/* free old info under last cluster */
-	slurm_free_front_end_info_msg(g_front_end_info_ptr);
-	g_front_end_info_ptr = NULL;
 	slurm_free_burst_buffer_info_msg(g_bb_info_ptr);
 	g_bb_info_ptr = NULL;
 	slurm_free_job_info_msg(g_job_info_ptr);
@@ -1112,13 +1050,6 @@ static void _change_cluster_main(GtkComboBox *combo, gpointer extra)
 	g_topo_info_msg_ptr = NULL;
 
 	/* set up working_cluster_rec */
-	if (cluster_dims > 1) {
-		/* reset from a multi-dim cluster */
-		working_sview_config.grid_x_width =
-			default_sview_config.grid_x_width;
-		working_sview_config.grid_hori = default_sview_config.grid_hori;
-		working_sview_config.grid_vert = default_sview_config.grid_vert;
-	}
 	gtk_table_set_col_spacings(main_grid_table, 0);
 	gtk_table_set_row_spacings(main_grid_table, 0);
 
@@ -1126,7 +1057,6 @@ static void _change_cluster_main(GtkComboBox *combo, gpointer extra)
 		working_cluster_rec = NULL;
 	else
 		working_cluster_rec = cluster_rec;
-	cluster_dims = slurmdb_setup_cluster_dims();
 	cluster_flags = slurmdb_setup_cluster_flags();
 
 	gtk_tree_model_get(model, &iter, 0, &selected_name, -1);
@@ -1153,7 +1083,6 @@ static void _change_cluster_main(GtkComboBox *combo, gpointer extra)
 	xfree(ui_description);
 
 	/* make changes for each object */
-	cluster_change_front_end();
 	cluster_change_resv();
 	cluster_change_part();
 	cluster_change_job();
@@ -1440,7 +1369,6 @@ int main(int argc, char **argv)
 
 	load_defaults();
 	cluster_flags = slurmdb_setup_cluster_flags();
-	cluster_dims = slurmdb_setup_cluster_dims();
 
 	_init_pages();
 	sview_thread_init(NULL);

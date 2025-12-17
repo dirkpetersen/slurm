@@ -49,7 +49,8 @@ extern void scontrol_getaddrs(char *node_list)
 		hostlist_t *host_list = NULL;
 		int i = 0;
 
-		if (!(host_list = hostlist_create(alias_addrs->node_list))) {
+		if (!(host_list =
+			      hostlist_create_client(alias_addrs->node_list))) {
 			error("hostlist_create error for %s: %m",
 			      node_list);
 			return;
@@ -95,7 +96,7 @@ scontrol_load_nodes (node_info_msg_t ** node_buffer_pptr, uint16_t show_flags)
 					      &node_info_ptr, show_flags);
 		if (error_code == SLURM_SUCCESS)
 			slurm_free_node_info_msg (old_node_info_ptr);
-		else if (slurm_get_errno () == SLURM_NO_CHANGE_IN_DATA) {
+		else if (errno == SLURM_NO_CHANGE_IN_DATA) {
 			node_info_ptr = old_node_info_ptr;
 			error_code = SLURM_SUCCESS;
 			if (quiet_flag == -1)
@@ -226,7 +227,7 @@ extern void scontrol_print_node_list(char *node_list, int argc, char **argv)
 			scontrol_print_node(NULL, node_info_ptr);
 		}
 	} else {
-		if (!(host_list = hostlist_create(node_list))) {
+		if (!(host_list = hostlist_create_client(node_list))) {
 			exit_code = 1;
 			if (quiet_flag != 1) {
 				if (errno == EINVAL) {
@@ -301,159 +302,60 @@ extern void scontrol_print_node_list(char *node_list, int argc, char **argv)
 
 /*
  * scontrol_print_topo - print the switch topology above the specified node
- * IN node_name - NULL to print all topology information
  */
-extern void	scontrol_print_topo (char *node_list)
+extern void scontrol_print_topo(int argc, char **argv)
 {
 	static topo_info_response_msg_t *topo_info_msg = NULL;
+	char *name = NULL, *unit = NULL, *node_list = NULL;
 
-	if ((topo_info_msg == NULL) &&
-	    slurm_load_topo(&topo_info_msg)) {
+	for (int i = 0; i < argc; ++i) {
+		char *tag = argv[i];
+		int tag_len = strlen(tag);
+		char *val = strchr(argv[i], '=');
+
+		if (val) {
+			tag_len = val - argv[i];
+			val++;
+		} else if (i == 0) {
+			name = tag;
+			continue;
+		}
+
+		if (!val) {
+			if (name) {
+				fprintf(stderr,
+					"Too many arguments (%s), the topology name (%s) is already defined\n",
+					tag, name);
+				return;
+			}
+			name = tag;
+		} else if (!xstrncasecmp(tag, "node", MAX(tag_len, 1)) ||
+			   !xstrncasecmp(tag, "nodes", MAX(tag_len, 1))) {
+			node_list = val;
+		} else if (!xstrncasecmp(tag, "switch", MAX(tag_len, 1)) ||
+			   !xstrncasecmp(tag, "block", MAX(tag_len, 1)) ||
+			   !xstrncasecmp(tag, "unit", MAX(tag_len, 1))) {
+			unit = val;
+		} else {
+			fprintf(stderr, "Unknown argument %s\n", tag);
+			return;
+		}
+	}
+	if ((topo_info_msg == NULL) && slurm_load_topo(&topo_info_msg, name)) {
 		slurm_perror ("slurm_load_topo error");
 		return;
 	}
-	slurm_print_topo_info_msg(stdout, topo_info_msg, node_list, one_liner);
+	slurm_print_topo_info_msg(stdout, topo_info_msg, node_list, unit,
+				  one_liner);
 }
 
-/*
- * Load current front_end table information into *node_buffer_pptr
- */
-extern int
-scontrol_load_front_end(front_end_info_msg_t ** front_end_buffer_pptr)
+extern void scontrol_print_topo_conf(void)
 {
-	int error_code;
-	front_end_info_msg_t *front_end_info_ptr = NULL;
+	topo_config_response_msg_t *topo_config_msg = NULL;
 
-	if (old_front_end_info_ptr) {
-		error_code = slurm_load_front_end (
-				old_front_end_info_ptr->last_update,
-				&front_end_info_ptr);
-		if (error_code == SLURM_SUCCESS)
-			slurm_free_front_end_info_msg (old_front_end_info_ptr);
-		else if (slurm_get_errno () == SLURM_NO_CHANGE_IN_DATA) {
-			front_end_info_ptr = old_front_end_info_ptr;
-			error_code = SLURM_SUCCESS;
-			if (quiet_flag == -1) {
-				printf("slurm_load_front_end no change in "
-				       "data\n");
-			}
-		}
+	slurm_load_topo_config(&topo_config_msg);
+	if (topo_config_msg && topo_config_msg->config) {
+		printf("%s", topo_config_msg->config);
 	}
-	else
-		error_code = slurm_load_front_end((time_t) NULL,
-						  &front_end_info_ptr);
-
-	if (error_code == SLURM_SUCCESS) {
-		old_front_end_info_ptr = front_end_info_ptr;
-		*front_end_buffer_pptr = front_end_info_ptr;
-	}
-
-	return error_code;
-}
-
-/*
- * scontrol_print_front_end - print the specified front_end node's information
- * IN node_name - NULL to print all front_end node information
- * IN node_ptr - pointer to front_end node table of information
- * NOTE: call this only after executing load_front_end, called from
- *	scontrol_print_front_end_list
- * NOTE: To avoid linear searches, we remember the location of the
- *	last name match
- */
-extern void
-scontrol_print_front_end(char *node_name,
-			 front_end_info_msg_t  *front_end_buffer_ptr)
-{
-	int i, j, print_cnt = 0;
-	static int last_inx = 0;
-
-	for (j = 0; j < front_end_buffer_ptr->record_count; j++) {
-		if (node_name) {
-			i = (j + last_inx) % front_end_buffer_ptr->record_count;
-			if (!front_end_buffer_ptr->front_end_array[i].name ||
-			    xstrcmp(node_name, front_end_buffer_ptr->
-				    front_end_array[i].name))
-				continue;
-		} else if (front_end_buffer_ptr->front_end_array[j].name == NULL)
-			continue;
-		else
-			i = j;
-		print_cnt++;
-		slurm_print_front_end_table(stdout,
-					    &front_end_buffer_ptr->
-					    front_end_array[i],
-					    one_liner);
-
-		if (node_name) {
-			last_inx = i;
-			break;
-		}
-	}
-
-	if (print_cnt == 0) {
-		if (node_name) {
-			exit_code = 1;
-			if (quiet_flag != 1)
-				printf ("Node %s not found\n", node_name);
-		} else if (quiet_flag != 1)
-				printf ("No nodes in the system\n");
-	}
-}
-
-/*
- * scontrol_print_front_end_list - print information about all front_end nodes
- */
-extern void
-scontrol_print_front_end_list(char *node_list)
-{
-	front_end_info_msg_t *front_end_info_ptr = NULL;
-	int error_code;
-	hostlist_t *host_list;
-	char *this_node_name;
-
-	error_code = scontrol_load_front_end(&front_end_info_ptr);
-	if (error_code) {
-		exit_code = 1;
-		if (quiet_flag != 1)
-			slurm_perror ("slurm_load_front_end error");
-		return;
-	}
-
-	if (quiet_flag == -1) {
-		char time_str[256];
-		slurm_make_time_str((time_t *)&front_end_info_ptr->last_update,
-			            time_str, sizeof(time_str));
-		printf ("last_update_time=%s, records=%d\n",
-			time_str, front_end_info_ptr->record_count);
-	}
-
-	if (node_list == NULL) {
-		scontrol_print_front_end(NULL, front_end_info_ptr);
-	} else {
-		if ((host_list = hostlist_create (node_list))) {
-			while ((this_node_name = hostlist_shift (host_list))) {
-				scontrol_print_front_end(this_node_name,
-							 front_end_info_ptr);
-				free(this_node_name);
-			}
-
-			hostlist_destroy(host_list);
-		} else {
-			exit_code = 1;
-			if (quiet_flag != 1) {
-				if (errno == EINVAL) {
-					fprintf(stderr,
-					        "unable to parse node list %s\n",
-					        node_list);
-				 } else if (errno == ERANGE) {
-					fprintf(stderr,
-					        "too many nodes in supplied range %s\n",
-					        node_list);
-				} else
-					perror("error parsing node list");
-			}
-		}
-	}
-
-	return;
+	slurm_free_topo_config_msg(topo_config_msg);
 }

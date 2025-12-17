@@ -51,34 +51,10 @@
 
 #define MAX_ACCTG_FREQUENCY 30
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting t#include <time.h>he type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-const char plugin_name[]       	= "Job submit throttle plugin";
-const char plugin_type[]       	= "job_submit/throttle";
-const uint32_t plugin_version   = SLURM_VERSION_NUMBER;
+/* Required Slurm plugin symbols: */
+const char plugin_name[] = "Job submit throttle plugin";
+const char plugin_type[] = "job_submit/throttle";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
 typedef struct thru_put {
 	uint32_t    uid;
@@ -138,12 +114,11 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	slurm_mutex_lock(&throttle_mutex);
 	xfree(thru_put_array);
 	slurm_mutex_unlock(&throttle_mutex);
-	return SLURM_SUCCESS;
 }
 
 extern int job_submit(job_desc_msg_t *job_desc, uint32_t submit_uid,

@@ -110,6 +110,17 @@ static void _init_opts(void)
 	opts.join_container = true;
 }
 
+static int _join_ns_helper(void *object, void *arg)
+{
+	ns_fd_map_t *entry = (ns_fd_map_t *) object;
+
+	if (setns(entry->fd, entry->type)) {
+		error("setns(%d, %d) failed: %m", entry->fd, entry->type);
+		return SLURM_ERROR;
+	}
+	return SLURM_SUCCESS;
+}
+
 /* Adopts a process into the given step. Returns SLURM_SUCCESS if
  * opts.action_adopt_failure == CALLERID_ACTION_ALLOW or if the process was
  * successfully adopted.
@@ -165,22 +176,18 @@ static int _adopt_process(pam_handle_t *pamh, pid_t pid, step_loc_t *stepd)
 	}
 
 	if (opts.join_container) {
-		int ns_fd = stepd_get_namespace_fd(fd, protocol_version);
-		if (ns_fd == -1) {
-			error("stepd_get_ns_fd failed");
+		list_t *fd_map = list_create(NULL);
+		int rc = stepd_get_namespace_fds(fd, fd_map, protocol_version);
+		if (rc == -1) {
+			error("stepd_get_ns_fds failed");
 			rc = SLURM_ERROR;
-		} else if (ns_fd == 0) {
+		} else if (rc == 0) {
 			debug2("No ns_fd given back, expected if not running with a job_container plugin that supports namespace mounting");
 		} else {
-			/*
-			 * No need to specify the type of namespace, rely on
-			 * slurm to give us the right one
-			 */
-			if (setns(ns_fd, 0)) {
-				error("setns() failed: %m");
+			if (list_for_each(fd_map, _join_ns_helper, NULL))
 				rc = SLURM_ERROR;
-			}
 		}
+		list_destroy(fd_map);
 	}
 
 	close(fd);
@@ -617,11 +624,29 @@ static void _parse_opts(pam_handle_t *pamh, int argc, const char **argv)
 	char *v;
 
 	for (; argc-- > 0; ++argv) {
-		if (!xstrncasecmp(*argv, "single_job_skip_rpc=0", 21))
-			opts.single_job_skip_rpc = 0;
-		else if (!xstrncasecmp(*argv, "ignore_root=0", 13))
-			opts.ignore_root = 0;
-		else if (!xstrncasecmp(*argv,"action_no_jobs=",15)) {
+		if (!xstrncasecmp(*argv, "single_job_skip_rpc=", 20)) {
+			v = (char *) (20 + *argv);
+			if (!xstrncasecmp(v, "1", 1))
+				opts.single_job_skip_rpc = true;
+			else if (!xstrncasecmp(v, "0", 1))
+				opts.single_job_skip_rpc = false;
+			else
+				pam_syslog(
+					pamh, LOG_ERR,
+					"unrecognized single_job_skip_rpc=%s, setting to '1'",
+					v);
+		} else if (!xstrncasecmp(*argv, "ignore_root=", 12)) {
+			v = (char *) (12 + *argv);
+			if (!xstrncasecmp(v, "1", 1))
+				opts.ignore_root = true;
+			else if (!xstrncasecmp(v, "0", 1))
+				opts.ignore_root = false;
+			else
+				pam_syslog(
+					pamh, LOG_ERR,
+					"unrecognized ignore_root=%s, setting to '1'",
+					v);
+		} else if (!xstrncasecmp(*argv, "action_no_jobs=", 15)) {
 			v = (char *)(15 + *argv);
 			if (!xstrncasecmp(v, "deny", 4))
 				opts.action_no_jobs = CALLERID_ACTION_DENY;
@@ -680,13 +705,31 @@ static void _parse_opts(pam_handle_t *pamh, int argc, const char **argv)
 		} else if (!xstrncasecmp(*argv, "nodename=", 9)) {
 			v = (char *)(9 + *argv);
 			opts.node_name = xstrdup(v);
-		} else if (!xstrncasecmp(*argv, "disable_x11=1", 13)) {
-			opts.disable_x11 = true;
+		} else if (!xstrncasecmp(*argv, "disable_x11=", 12)) {
+			v = (char *) (12 + *argv);
+			if (!xstrncasecmp(v, "1", 1))
+				opts.disable_x11 = true;
+			else if (!xstrncasecmp(v, "0", 1))
+				opts.disable_x11 = false;
+			else
+				pam_syslog(
+					pamh, LOG_ERR,
+					"unrecognized disable_x11=%s, setting to '0'",
+					v);
 		} else if (!xstrncasecmp(*argv, "service=", 8)) {
 			v = (char *)(8 + *argv);
 			opts.pam_service = xstrdup(v);
-		} else if (!xstrncasecmp(*argv, "join_container=false", 19)) {
-			opts.join_container = false;
+		} else if (!xstrncasecmp(*argv, "join_container=", 15)) {
+			v = (char *) (15 + *argv);
+			if (!xstrncasecmp(v, "true", 4))
+				opts.join_container = true;
+			else if (!xstrncasecmp(v, "false", 5))
+				opts.join_container = false;
+			else
+				pam_syslog(
+					pamh, LOG_ERR,
+					"unrecognized join_container=%s, setting to 'true'",
+					v);
 		} else {
 			pam_syslog(pamh, LOG_ERR,
 				   "ignoring unrecognized option '%s'", *argv);

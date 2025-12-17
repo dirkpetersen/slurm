@@ -1,4 +1,4 @@
-.TH "slurmdbd.conf" "5" "Slurm Configuration File" "May 2024" "Slurm Configuration File"
+.TH "slurmdbd.conf" "5" "Slurm Configuration File" "Slurm 26.05" "Slurm Configuration File"
 
 .SH "NAME"
 slurmdbd.conf \- Slurm Database Daemon (SlurmDBD) configuration file
@@ -14,8 +14,8 @@ as a comment through the end of that line.
 Changes to the configuration file take effect upon restart of
 SlurmDBD or daemon receipt of the SIGHUP signal unless otherwise noted.
 .LP
-This file should be only on the computer where SlurmDBD executes and
-should only be readable by the user which executes SlurmDBD (e.g. "slurm").
+This file should be only on the machine where SlurmDBD executes, owned by the
+SlurmUser or root, and have permissions set to 600 or 640.
 If the slurmdbd daemon is started as user root and changes to another
 user ID, the configuration file will initially be read as user root, but will
 be read as the other user ID in response to a SIGHUP signal.
@@ -45,7 +45,7 @@ element is set to true. Default is /tmp. The format for this files name is
 .na
 $ArchiveDir/$ClusterName_$ArchiveObject_archive_$BeginTimeStamp_$endTimeStamp
 .ad
-We limit archive files to 50000 records per file. If more than 50000 records
+We limit archive files to \fBMaxPurgeLimit\fR records per file. If more records
 exist during that time period, they will be written to a new file. Subsequent
 archive files during the same time period will have ".<number>" appended
 to the file, for example .2, with the number increasing by one for each file in
@@ -157,8 +157,17 @@ Boolean, yes to archive transaction data, no otherwise. Default is no.
 
 .TP
 \fBAuthAltTypes\fR
-Command separated list of alternative authentication plugins that the slurmdbd
-will permit for communication.
+Comma\-separated list of alternative authentication plugins that the slurmdbd
+will permit for communication. Acceptable values at present include
+\fBauth/jwt\fR.
+
+\fBNOTE\fR: The path to the required jwt_hs256.key must be
+specified with \fBAuthAltParameters\fR. The jwt_hs256.key should only be visible
+to the SlurmUser and root. It is not suggested to place the jwt_hs256.key on any
+nodes other than the machine running \fBslurmctld\fR and the machine running
+\fBslurmdbd\fR.
+\fBauth/jwt\fR can be activated by the presence of the \fISLURM_JWT\fR
+environment variable. When activated, it will override the default
 .IP
 
 .TP
@@ -168,7 +177,7 @@ be comma separated.
 .IP
 .RS
 .TP
-\fBjwks=\fR
+\fBjwks\fR=
 Absolute path to JWKS file. Key should be owned by SlurmUser or root, must be
 readable by SlurmUser, with suggested permissions of 0400. It must not be
 writable by 'other'.
@@ -179,7 +188,7 @@ HS256 key use (and token generation).
 .IP
 
 .TP
-\fBjwt_key=\fR
+\fBjwt_key\fR=
 Absolute path to JWT key file. Key must be HS256. Key should be owned by
 SlurmUser or root, must be readable by SlurmUser, with suggested permissions of
 0400. It must not be accessible by 'other'.
@@ -196,15 +205,6 @@ If not specified, the default authentication information will be used.
 .IP
 .RS
 .TP 14
-\fBcred_expire\fR
-Default job step credential lifetime, in seconds (e.g. "cred_expire=1200").
-It must be sufficiently long enough to load user environment, run prolog,
-deal with the slurmd getting paged out of memory, etc.
-This also controls how long a requeued job must wait before starting again.
-The default value is 120 seconds.
-.IP
-
-.TP
 \fBsocket\fR
 Path name to a MUNGE daemon socket to use
 (e.g. "socket=/var/run/munge/munge.socket.2").
@@ -279,7 +279,7 @@ should also be set in your \fBslurm.conf\fR file.
 .IP
 
 .TP
-\fBkeepaliveinterval=#\fR
+\fBkeepaliveinterval\fR=\#
 Specifies the interval, in seconds, between keepalive probes on idle
 connections.
 This affects most outgoing connections from the slurmdbd (e.g. between the
@@ -288,7 +288,7 @@ The default value is 30 seconds.
 .IP
 
 .TP
-\fBkeepaliveprobes=#\fR
+\fBkeepaliveprobes\fR=\#
 Specifies the number of unacknowledged keepalive probes sent before considering
 a connection broken.
 This affects most outgoing connections from the slurmdbd (e.g. between the
@@ -297,7 +297,7 @@ The default value is 3.
 .IP
 
 .TP
-\fBkeepalivetime=#\fR
+\fBkeepalivetime\fR=\#
 Specifies how long, in seconds, a connection must be idle before starting to
 send keepalive probes as well as how long to delay closing a connection to
 process messages still in the queue.
@@ -434,6 +434,11 @@ Dump raw hex values of key Network communications.
 .IP
 
 .TP
+\fBthread\fR
+Thread and work management.
+.IP
+
+.TP
 \fBTLS\fR
 TLS plugin
 .RE
@@ -557,8 +562,8 @@ Log errors and verbose informational messages and even more debugging messages
 Log errors and verbose informational messages and even more debugging messages
 .RE
 .IP
-\fBNOTE\fR: By default, Slurm's systemd service files start daemons in the
-foreground with the -D option. This means that systemd will capture
+\fBNOTE\fR: By default, Slurm's systemd service file starts the slurmdbd daemon
+in the foreground with the \-D option. This means that systemd will capture
 stdout/stderr output and print that to syslog, independent of Slurm printing to
 syslog directly. To prevent systemd from doing this, add "StandardOutput=null"
 and "StandardError=null" to the respective service files or override files.
@@ -568,6 +573,11 @@ and "StandardError=null" to the respective service files or override files.
 \fBDefaultQOS\fR
 When adding a new cluster this will be used as the qos for the cluster
 unless something is explicitly set by the admin with the create.
+.IP
+
+.TP
+\fBDisableArchiveCommands\fR
+Disable the ability to run sacctmgr archive commands.
 .IP
 
 .TP
@@ -635,10 +645,18 @@ date and time format. The "thread_id" format shows the timestamp
 in the C standard ctime() function form without the year but
 including the microseconds, the daemon's process ID and the current thread name
 and ID.
-A special option "format_stderr" can be added to the format as a comma separated
-value (e.g. "LogTimeFormat=iso8601_ms,format_stderr"). It will change the
-default format of the logs on stderr stream by prepending the timestamp as
-specified by \fBLogTimeFormat\fR.
+.IP
+
+.TP
+\fBMaxPurgeLimit\fR
+When archiving and purging records, limit each individual operation to this many
+rows. The operations will then repeat until all targeted rows are processed.
+This limit ensures that locks will periodically be released, allowing other
+database operations to occur. A lower limit will release locks more frequently,
+which may improve system responsiveness while purging records from large tables.
+However, a lower limit will also increase the total amount of time required to
+complete the purge. In most cases it is not recommended to set a higher limit
+than default. Default value is 50000.
 .IP
 
 .TP
@@ -827,8 +845,9 @@ If not set (default), then transaction records are never purged.
 
 .TP
 \fBPurgeUsageAfter\fR
-Usage records (Cluster, Association and WCKey) are purged from the database
+Usage records (Cluster, Association, QOS and WCKey) are purged from the database
 after this amount of time has passed since they were created or last modified.
+These tables are the source for reports generated by the sreport(1) command.
 The time is a numeric value and is a number of months. If you want to purge
 more often you can include "hours", or "days" behind the numeric value to get
 those more frequent purges (i.e. a value of "12hours" would purge
@@ -868,7 +887,8 @@ Default is none.
 \fBStorageHost\fR
 Define the name of the host the database is running where we are going
 to store the data.
-Ideally this should be the host on which slurmdbd executes.
+This can be the host on which slurmdbd executes, but for larger systems, we
+recommend keeping the database on a separate machine.
 .IP
 
 .TP
@@ -879,9 +899,7 @@ records are written. Defaults to "slurm_acct_db".
 
 .TP
 \fBStorageParameters\fR
-Comma separated list of key\-value pair parameters. Currently
-supported values include options to establish a secure connection to the
-database:
+Comma separated list of key\-value pair parameters.
 .IP
 .RS
 .TP 2
@@ -907,13 +925,56 @@ The path name of the client private key file.
 .TP
 \fBSSL_CIPHER\fR
 The list of permissible ciphers for SSL encryption.
+.IP
+
+.TP
+\fBtoken_duration\fR
+Duration in seconds to cache generated database passwords before requesting a
+new one from the StoragePassScript. Typically the token should refresh prior
+to actual expiration; upon token generation failure the cached token will
+continue to be used to avoid transient generation failures from causing
+connection failures.
+Default value is 300 seconds (5 minutes).
 .RE
 .IP
+
 
 .TP
 \fBStoragePass\fR
 Define the password used to gain access to the database to store
 the job accounting data. The '#' character is not permitted in a password.
+.IP
+
+.TP
+\fBStoragePassScript\fR
+Absolute path to an executable script that generates ephemeral authentication
+tokens for database connections which are used instead of \fBStoragePass\fR.
+The script must output the password/token to stdout and exit with status 0 on
+success. This allows dynamic password generation, instead of storing static
+credentials in configuration files.
+The script must be owned and executable by SlurmUser.
+.IP
+Environment variables provided to the script:
+.RS
+.TP
+\fBSLURM_STORAGE_HOSTNAME\fR
+Database hostname
+.TP
+\fBSLURM_STORAGE_PORT\fR
+Database port number
+.TP
+\fBSLURM_STORAGE_USER\fR
+Database username
+.RE
+.IP
+Expected output format:
+.br
+\fBTOKEN=\fR\fI<authentication_token>\fR
+.IP
+The script must exit with status 0 on success, non-zero on failure.
+Any output to stderr will be logged as an error. If there is a backup
+host specified, the script will still be provided the main hostname and
+the same token is used for both hosts.
 .IP
 
 .TP
@@ -935,12 +996,72 @@ This value must be specified.
 .TP
 \fBStorageUser\fR
 Define the name of the user we are going to connect to the database
-with to store the job accounting data.
+with to store the job accounting data. If no value is specified, the user that
+started the slurmdbd will be used.
 .IP
 
 .TP
 \fBTCPTimeout\fR
 Time permitted for TCP connection to be established. Default value is 2 seconds.
+.IP
+
+.TP
+\fBTLSParameters\fR
+Comma\-separated options identifying TLS options.
+Supported values include:
+.IP
+.RS
+.TP
+\fBca_cert_file=\fR
+Path of certificate authority (CA) certificate. Must exist on all hosts and be
+accessible by all Slurm components. File permissions must be 644, and owned by
+SlurmUser/root.
+
+Default path is "ca_cert.pem" in the Slurm configuration directory
+.IP
+
+.TP
+\fBdbd_cert_file=\fR
+Path of certificate used by slurmdbd. Must chain to \fBca_cert_file\fR. Should
+only exist on host running slurmdbd.  File permissions must be 600, and owned
+by SlurmUser.
+
+Default path is "dbd_cert.pem" in the Slurm configuration directory
+.IP
+
+.TP
+\fBdbd_cert_key_file=\fR
+Path of private key that accompanies \fBdbd_cert_file\fR. Should only exist on
+host running slurmdbd. File permissions must be 600, and owned by SlurmUser.
+
+Default path is "dbd_cert_key.pem" in the Slurm configuration directory
+.IP
+
+.TP
+\fBload_system_certificates\fR
+Load certificates found in default system locations (e.g. /etc/ssl) into trust store.
+
+Default is to not load system certificates, and to rely solely on
+\fBca_cert_file\fR to establish trust.
+.IP
+
+.TP
+\fBsecurity_policy_version=\fR
+Security policy version used by s2n. See s2n documentation for more details.
+Default security policy is "20230317", which is FIPS compliant and includes TLS 1.3.
+.RE
+.IP
+
+.TP
+\fBTLSType\fR
+Specify the TLS implementation that will be used.
+Acceptable values at present:
+.IP
+.RS
+.TP
+\fBtls/s2n\fR
+Use the s2n TLS plugin.
+.RE
 .IP
 
 .TP

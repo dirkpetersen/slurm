@@ -68,7 +68,7 @@ for SlurmDBD execution.</p>
 
 <p>Both accounting and scheduling policies are configured based upon
 an <i>association</i>. An <i>association</i> is a 4-tuple consisting
-of the cluster name, bank account, user and (optionally) the Slurm
+of the cluster name, account, user and (optionally) the Slurm
 partition.
 In order to enforce scheduling policy, set the value of
 <b>AccountingStorageEnforce</b>.
@@ -117,7 +117,7 @@ cluster.
 <h2 id="tools">Tools<a class="slurm_link" href="#tools"></a></h2>
 
 <p>The tool used to manage accounting policy is <i>sacctmgr</i>.
-It can be used to create and delete cluster, user, bank account,
+It can be used to create and delete cluster, user, account,
 and partition records plus their combined <i>association</i> record.
 See <i>man sacctmgr</i> for details on this tools and examples of
 its use.</p>
@@ -547,7 +547,7 @@ individually for each partition.  For example, if a QOS has a
 unique partitions, users will be limited to 20 CPUs for the QOS
 rather than being allowed 20 CPUs for each partition.</p>
 
-<p>Fair-share scheduling is based upon the hierarchical bank account
+<p>Fair-share scheduling is based upon the hierarchical account
 data maintained in the Slurm database.  More information can be found
 in the <a href="priority_multifactor.html">priority/multifactor</a>
 plugin description.</p>
@@ -573,11 +573,19 @@ plugin description.</p>
 </p>
 <pre>
 function slurm_job_submit(job_desc, part_list, submit_uid)
-   if (job_desc.gres ~= nil)
+   gres_request = ""
+   t = {job_desc.tres_per_job,
+	job_desc.tres_per_socket,
+	job_desc.tres_per_task,
+	job_desc.tres_per_node}
+   for k in pairs(t) do
+	gres_request = gres_request .. t[k] .. ","
+   end
+   if (gres_request ~= nil)
    then
-      for g in job_desc.gres:gmatch("[^,]+")
+      for g in gres_request:gmatch("[^,]+")
       do
-	 bad = string.match(g,'^gpu[:]*[0-9]*$')
+	 bad = string.match(g,'^gres/gpu[:=]*[0-9]*$')
 	 if (bad ~= nil)
 	 then
 	    slurm.log_info("User specified gpu GRES without type: %s", bad)
@@ -620,7 +628,5 @@ configured resource limit, a corresponding reason will be assigned to the job.
 More details can be found on the <a href="job_reason_codes.html">Job Reason
 Codes</a> page. More details about scheduling can be found in the
 <a href="sched_config.html"> Scheduling Configuration Guide</a>.</p>
-
-<p style="text-align: center;">Last modified 04 June 2024</li>
 
 <!--#include virtual="footer.txt"-->

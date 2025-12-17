@@ -60,6 +60,11 @@
 #define PMIX_TDIR_RMCLEAN "pmix.tdir.rmclean"
 #endif
 
+/* Some older PMIx (2.x) do not have this, let them compile. */
+#ifndef PMIX_APP_ARGV
+#define PMIX_APP_ARGV "pmix.app.argv"
+#endif
+
 #define PMIXP_INFO_ARRAY_SET_ARRAY(kvp, _array) \
 	{ (kvp)->value.data.array.array = (pmix_info_t *)_array; }
 
@@ -106,7 +111,7 @@ static void _release_cb(pmix_status_t status, void *cbdata)
 /*
  * general proc-level attributes
  */
-static void _general_proc_info(List lresp)
+static void _general_proc_info(list_t *lresp)
 {
 	pmix_info_t *kvp;
 	bool flag = 0;
@@ -130,7 +135,7 @@ static void _general_proc_info(List lresp)
 /*
  * scratch directory locations for use by applications
  */
-static void _set_tmpdirs(List lresp)
+static void _set_tmpdirs(list_t *lresp)
 {
 	pmix_info_t *kvp;
 	char *p = NULL;
@@ -168,7 +173,7 @@ static void _set_euid(list_t *lresp)
 /*
  * information about relative ranks as assigned by the RM
  */
-static void _set_procdatas(List lresp)
+static void _set_procdatas(list_t *lresp)
 {
 	pmixp_namespace_t *nsptr = pmixp_nspaces_local();
 	pmix_info_t *kvp, *tkvp;
@@ -181,12 +186,32 @@ static void _set_procdatas(List lresp)
 	xfree(p);
 	list_append(lresp, kvp);
 
-	PMIXP_KVP_CREATE(kvp, PMIX_NODEID, &nsptr->node_id, PMIX_UINT32);
+	/*
+	 * The leader program (appldr) is the lowest global rank in the
+	 * specified application.
+	 */
+	i = pmixp_info_appldr();
+	PMIXP_KVP_CREATE(kvp, PMIX_APPLDR, &i, PMIX_INT);
+	list_append(lresp, kvp);
+
+	/*
+	 * Consolidated argv passed to the spawn command for the given
+	 * application (e.g., "./myapp arg1 arg2 arg3").
+	 */
+	p = pmixp_info_cmd();
+	PMIXP_KVP_CREATE(kvp, PMIX_APP_ARGV, p, PMIX_STRING);
+	list_append(lresp, kvp);
+
+	/*
+	 * Type of mapping used to layout the application (e.g., cyclic).
+	 */
+	p = pmixp_info_task_dist();
+	PMIXP_KVP_CREATE(kvp, PMIX_APP_MAP_TYPE, p, PMIX_STRING);
 	list_append(lresp, kvp);
 
 	/* store information about local processes */
 	for (i = 0; i < pmixp_info_tasks(); i++) {
-		List rankinfo;
+		list_t *rankinfo;
 		list_itr_t *it;
 		int count, j, localid, nodeid;
 		char *nodename;
@@ -199,35 +224,42 @@ static void _set_procdatas(List lresp)
 		PMIXP_VAL_SET_RANK(&kvp->value, i);
 		list_append(rankinfo, kvp);
 
-		/* TODO: always use 0 for now. This is not the general case
-		 * though (see Slurm MIMD: man srun, section MULTIPLE PROGRAM
-		 * CONFIGURATION)
+		/*
+		 * The application number within the job in which the specified
+		 * process is a member. In Slurm terminology this number
+		 * identifies the heterogeneous component (step->het_job_offset)
+		 * from this step.
 		 */
-		tmp = 0;
+		tmp = pmixp_info_job_offset(i);
 		PMIXP_KVP_CREATE(kvp, PMIX_APPNUM, &tmp, PMIX_INT);
 		list_append(rankinfo, kvp);
 
-		/* TODO: the same as for previous here */
-		tmp = 0;
-		PMIXP_KVP_CREATE(kvp, PMIX_APPLDR, &tmp, PMIX_INT);
-		list_append(rankinfo, kvp);
-
-		/* TODO: fix when several apps will appear */
+		/*
+		 * Global task id in the heterogeneous job.
+		 */
 		PMIXP_KVP_CREATE(kvp, PMIX_GLOBAL_RANK, &i, PMIX_UINT32);
 		list_append(rankinfo, kvp);
 
-		/* TODO: fix when several apps will appear */
-		PMIXP_KVP_CREATE(kvp, PMIX_APP_RANK, &i, PMIX_UINT32);
-		list_append(rankinfo, kvp);
-
+		/* localid is the task id in this node */
 		localid = pmixp_info_taskid2localid(i);
-		/* this rank is local, store local info ab't it! */
-		if (0 <= localid) {
+		if (localid >= 0) {
 			PMIXP_KVP_CREATE(kvp, PMIX_LOCAL_RANK,
 					 &localid, PMIX_UINT16);
 			list_append(rankinfo, kvp);
 
-			/* TODO: fix when several apps will appear */
+			/*
+			 * This is the rank local to each heterogeneous
+			 * component within its app, starting from 0.
+			 */
+			PMIXP_KVP_CREATE(kvp, PMIX_APP_RANK, &localid,
+					 PMIX_UINT32);
+			list_append(rankinfo, kvp);
+
+			/*
+			 * Rank of the specified process on its node spanning
+			 * all jobs. For Slurm this is just the rank local to
+			 * this node, so the same as PMIX_LOCAL_RANK.
+			 */
 			PMIXP_KVP_CREATE(kvp, PMIX_NODE_RANK,
 					 &localid, PMIX_UINT16);
 			list_append(rankinfo, kvp);
@@ -239,8 +271,7 @@ static void _set_procdatas(List lresp)
 		list_append(rankinfo, kvp);
 		free(nodename);
 
-		PMIXP_KVP_CREATE(kvp, PMIX_NODEID, &nsptr->node_id,
-				 PMIX_UINT32);
+		PMIXP_KVP_CREATE(kvp, PMIX_NODEID, &nodeid, PMIX_UINT32);
 		list_append(rankinfo, kvp);
 
 		/* merge rankinfo into one PMIX_PROC_DATA key */
@@ -266,7 +297,7 @@ static void _set_procdatas(List lresp)
 	}
 }
 
-static void _set_sizeinfo(List lresp)
+static void _set_sizeinfo(list_t *lresp)
 {
 	pmix_info_t *kvp;
 	uint32_t tmp_val;
@@ -283,7 +314,6 @@ static void _set_sizeinfo(List lresp)
 	PMIXP_KVP_CREATE(kvp, PMIX_LOCAL_SIZE, &tmp_val, PMIX_UINT32);
 	list_append(lresp, kvp);
 
-	/* TODO: fix it in future */
 	tmp_val = pmixp_info_tasks_loc();
 	PMIXP_KVP_CREATE(kvp, PMIX_NODE_SIZE, &tmp_val, PMIX_UINT32);
 	list_append(lresp, kvp);
@@ -291,60 +321,15 @@ static void _set_sizeinfo(List lresp)
 	tmp_val = pmixp_info_tasks_uni();
 	PMIXP_KVP_CREATE(kvp, PMIX_MAX_PROCS, &tmp_val, PMIX_UINT32);
 	list_append(lresp, kvp);
-}
 
-/*
- * provide topology information if hwloc is available
- */
-static void _set_topology(List lresp)
-{
-#ifdef HAVE_HWLOC
-	hwloc_topology_t topology;
-	unsigned long flags;
-	pmix_info_t *kvp;
-	char *p = NULL;
-	int len;
-
-	if (0 != hwloc_topology_init(&topology)) {
-		/* error in initialize hwloc library */
-		error("%s: hwloc_topology_init() failed", __func__);
-		goto err_exit;
-	}
-
-#if HWLOC_API_VERSION < 0x00020000
-	flags = (HWLOC_TOPOLOGY_FLAG_WHOLE_SYSTEM |
-		 HWLOC_TOPOLOGY_FLAG_IO_DEVICES);
-	hwloc_topology_set_flags(topology, flags);
-#else
-	flags = HWLOC_TOPOLOGY_FLAG_WHOLE_SYSTEM;
-	hwloc_topology_set_flags(topology, flags);
-	hwloc_topology_set_io_types_filter(topology,
-					   HWLOC_TYPE_FILTER_KEEP_ALL);
-#endif
-
-	if (hwloc_topology_load(topology)) {
-		error("%s: hwloc_topology_load() failed", __func__);
-		goto err_release_topo;
-	}
-
-#if HWLOC_API_VERSION < 0x00020000
-	if (0 != hwloc_topology_export_xmlbuffer(topology, &p, &len)) {
-#else
-	if (0 != hwloc_topology_export_xmlbuffer(topology, &p, &len, 0)) {
-#endif
-		error("%s: hwloc_topology_load() failed", __func__);
-		goto err_release_topo;
-	}
-
-	PMIXP_KVP_CREATE(kvp, PMIX_LOCAL_TOPO, p, PMIX_STRING);
+	/*
+	 * When using MULTIPLE PROGRAM this is the number of tasks of
+	 * this specific program. In Slurm terminology, number of tasks
+	 * of this heterogeneous component (a.k.a step).
+	 */
+	tmp_val = pmixp_info_tasks_loc();
+	PMIXP_KVP_CREATE(kvp, PMIX_APP_SIZE, &tmp_val, PMIX_UINT32);
 	list_append(lresp, kvp);
-
-	/* successful exit - fallthru */
-err_release_topo:
-	hwloc_topology_destroy(topology);
-err_exit:
-#endif
-	return;
 }
 
 /*
@@ -402,7 +387,7 @@ static void _build_node2task_map(pmixp_namespace_t *nsptr, uint32_t *node2tasks)
 	xfree(node_tasks);
 }
 
-static int _set_mapsinfo(List lresp)
+static int _set_mapsinfo(list_t *lresp)
 {
 	pmix_info_t *kvp;
 	char *regexp, *input, *map = NULL, *pos = NULL;
@@ -415,7 +400,7 @@ static int _set_mapsinfo(List lresp)
 	input = hostlist_deranged_string_xmalloc(hl);
 	rc = PMIx_generate_regex(input, &regexp);
 	xfree(input);
-	if (PMIX_SUCCESS != rc) {
+	if (rc != PMIX_SUCCESS) {
 		return SLURM_ERROR;
 	}
 	PMIXP_KVP_CREATE(kvp, PMIX_NODE_MAP, regexp, PMIX_STRING);
@@ -445,7 +430,7 @@ static int _set_mapsinfo(List lresp)
 	xfree(map);
 	xfree(node2tasks);
 
-	if (PMIX_SUCCESS != rc) {
+	if (rc != PMIX_SUCCESS) {
 		return SLURM_ERROR;
 	}
 
@@ -459,7 +444,7 @@ static int _set_mapsinfo(List lresp)
 	return SLURM_SUCCESS;
 }
 
-static void _set_localinfo(List lresp)
+static void _set_localinfo(list_t *lresp)
 {
 	pmix_info_t *kvp;
 	uint32_t tmp;
@@ -487,21 +472,24 @@ static void _set_localinfo(List lresp)
 extern int pmixp_libpmix_init(void)
 {
 	int rc;
+	bool trusted;
 
-	if (0 != (rc = pmixp_mkdir(pmixp_info_tmpdir_lib()))) {
+	trusted = (pmixp_info_flags() & PMIXP_FLAG_TRUSTED_LIB_TMPDIR);
+	if ((rc = pmixp_mkdir(pmixp_info_tmpdir_lib(), trusted))) {
 		PMIXP_ERROR_STD("Cannot create server lib tmpdir: \"%s\"",
 				pmixp_info_tmpdir_lib());
 		return errno;
 	}
 
-	if (0 != (rc = pmixp_mkdir(pmixp_info_tmpdir_cli()))) {
+	trusted = (pmixp_info_flags() & PMIXP_FLAG_TRUSTED_CLI_TMPDIR);
+	if ((rc = pmixp_mkdir(pmixp_info_tmpdir_cli(), trusted))) {
 		PMIXP_ERROR_STD("Cannot create client cli tmpdir: \"%s\"",
 				pmixp_info_tmpdir_cli());
 		return errno;
 	}
 
 	rc = pmixp_lib_init();
-	if (SLURM_SUCCESS != rc) {
+	if (rc != SLURM_SUCCESS) {
 		PMIXP_ERROR_STD("PMIx_server_init failed with error %d\n", rc);
 		return SLURM_ERROR;
 	}
@@ -519,14 +507,14 @@ extern int pmixp_libpmix_finalize(void)
 	rc = pmixp_lib_finalize();
 
 	rc1 = rmdir_recursive(pmixp_info_tmpdir_lib(), true);
-	if (0 != rc1) {
+	if (rc1) {
 		PMIXP_ERROR_STD("Failed to remove %s\n",
 				pmixp_info_tmpdir_lib());
 		/* Not considering this as fatal error */
 	}
 
 	rc1 = rmdir_recursive(pmixp_info_tmpdir_cli(), true);
-	if (0 != rc1) {
+	if (rc1) {
 		PMIXP_ERROR_STD("Failed to remove %s\n",
 				pmixp_info_tmpdir_cli());
 		/* Not considering this as fatal error */
@@ -580,7 +568,7 @@ extern int pmixp_lib_dmodex_request(
 	strlcpy(proc_v1.nspace, proc->nspace, PMIX_MAX_NSLEN);
 
 	rc = PMIx_server_dmodex_request(&proc_v1, cbfunc, caddy);
-	if (PMIX_SUCCESS != rc) {
+	if (rc != PMIX_SUCCESS) {
 		return SLURM_ERROR;
 	}
 	return SLURM_SUCCESS;
@@ -594,7 +582,7 @@ extern int pmixp_lib_setup_fork(uint32_t rank, const char *nspace, char ***env)
 	proc.rank = rank;
 	strlcpy(proc.nspace, nspace, PMIX_MAX_NSLEN);
 	rc = PMIx_server_setup_fork(&proc, env);
-	if (PMIX_SUCCESS != rc) {
+	if (rc != PMIX_SUCCESS) {
 		return SLURM_ERROR;
 	}
 	return SLURM_SUCCESS;
@@ -618,7 +606,7 @@ extern uint32_t pmixp_lib_get_version(void)
 
 extern int pmixp_libpmix_job_set(void)
 {
-	List lresp;
+	list_t *lresp;
 	pmix_info_t *info;
 	int ninfo;
 	list_itr_t *it;
@@ -643,11 +631,9 @@ extern int pmixp_libpmix_job_set(void)
 
 	_set_sizeinfo(lresp);
 
-	_set_topology(lresp);
-
 	_set_euid(lresp);
 
-	if (SLURM_SUCCESS != _set_mapsinfo(lresp)) {
+	if (_set_mapsinfo(lresp) != SLURM_SUCCESS) {
 		FREE_NULL_LIST(lresp);
 		PMIXP_ERROR("Can't build nodemap");
 		return SLURM_ERROR;
@@ -671,7 +657,7 @@ extern int pmixp_libpmix_job_set(void)
 					 ninfo, _release_cb,
 					 &register_caddy[0]);
 
-	if (PMIX_SUCCESS != rc) {
+	if (rc != PMIX_SUCCESS) {
 		PMIXP_ERROR("Cannot register namespace %s, nlocalproc=%d, ninfo = %d",
 			    pmixp_info_namespace(), pmixp_info_tasks_loc(),
 			    ninfo);
@@ -687,7 +673,7 @@ extern int pmixp_libpmix_job_set(void)
 		rc = PMIx_server_register_client(&proc, uid, gid, NULL,
 						 _release_cb,
 						 &register_caddy[i + 1]);
-		if (PMIX_SUCCESS != rc) {
+		if (rc != PMIX_SUCCESS) {
 			PMIXP_ERROR("Cannot register client %d(%d) in namespace %s",
 				    pmixp_info_taskid(i), i,
 				    pmixp_info_namespace());
@@ -717,7 +703,7 @@ extern int pmixp_libpmix_job_set(void)
 					exit_flag = 0;
 				}
 				// An error may occur during registration
-				if (PMIX_SUCCESS != register_caddy[i].rc) {
+				if (register_caddy[i].rc != PMIX_SUCCESS) {
 					PMIXP_ERROR("Failed to complete registration #%d, error: %d", i, register_caddy[i].rc);
 					ret = SLURM_ERROR;
 				}
@@ -768,7 +754,7 @@ extern int pmixp_lib_fence(const pmix_proc_t procs[], size_t nprocs,
 		goto error;
 	}
 	ret = pmixp_coll_contrib_local(coll, type, data, ndata, cbfunc, cbdata);
-	if (SLURM_SUCCESS != ret) {
+	if (ret != SLURM_SUCCESS) {
 		status = PMIX_ERROR;
 		goto error;
 	}
@@ -793,8 +779,7 @@ extern int pmixp_lib_abort(int status, void *cbfunc, void *cbdata)
 	if (!status)
 		flags |= KILL_NO_SIG_FAIL;
 
-	slurm_kill_job_step(pmixp_info_jobid(), pmixp_info_stepid(), SIGKILL,
-			    flags);
+	slurm_kill_job_step(pmixp_info_step_id(), SIGKILL, flags);
 
 	if (abort_cbfunc)
 		abort_cbfunc(PMIX_SUCCESS, cbdata);

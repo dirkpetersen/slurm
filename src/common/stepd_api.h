@@ -52,7 +52,7 @@
 
 typedef enum {
 	REQUEST_CONNECT = 0,
-	REQUEST_STEP_DEFUNCT_1,
+	REQUEST_SLUID,
 	REQUEST_STEP_DEFUNCT_2,
 	REQUEST_STEP_DEFUNCT_3,
 	REQUEST_SIGNAL_CONTAINER,
@@ -79,6 +79,8 @@ typedef enum {
 	REQUEST_GETGR,
 	REQUEST_GET_NS_FD,
 	REQUEST_GETHOST,
+	REQUEST_GET_NS_FDS,
+	REQUEST_GET_BPF_TOKEN,
 } step_msg_t;
 
 typedef enum {
@@ -140,7 +142,7 @@ int stepd_cleanup_sockets(const char *directory, const char *nodename);
 int stepd_terminate(int fd, uint16_t protocol_version);
 
 /*
- * Connect to a slurmstepd proccess by way of its unix domain socket.
+ * Connect to a slurmstepd process by way of its unix domain socket.
  *
  * Both "directory" and "nodename" may be null, in which case stepd_connect
  * will attempt to determine them on its own.  If you are using multiple
@@ -154,6 +156,11 @@ int stepd_terminate(int fd, uint16_t protocol_version);
 extern int stepd_connect(const char *directory, const char *nodename,
 			 slurm_step_id_t *step_id,
 			 uint16_t *protocol_version);
+
+/*
+ * Returns SLUID for running step, or 0 on failure.
+ */
+extern sluid_t stepd_sluid(int fd, uint16_t protocol_version);
 
 /*
  * Retrieve a job step's current state.
@@ -182,8 +189,8 @@ int stepd_signal_container(int fd, uint16_t protocol_version, int signal,
  *         this header does not need to include slurm_protocol_defs.h.
  */
 extern int stepd_attach(int fd, uint16_t protocol_version, slurm_addr_t *ioaddr,
-			slurm_addr_t *respaddr, char *io_key, uid_t uid,
-			reattach_tasks_response_msg_t *resp);
+			slurm_addr_t *respaddr, char *cert, char *io_key,
+			uid_t uid, reattach_tasks_response_msg_t *resp);
 
 /*
  * Scan for available running slurm step daemons by checking
@@ -309,10 +316,9 @@ int stepd_list_pids(int fd, uint16_t protocol_version,
 
 /*
  * Get the memory limits of the step
- * Returns uid of the running step if successful.  On error returns -1.
  */
-extern int stepd_get_mem_limits(int fd, uint16_t protocol_version,
-				slurmstepd_mem_info_t *stepd_mem_info);
+extern int stepd_get_mem_limit(int fd, uint16_t protocol_version,
+			       uint64_t *job_mem_limit);
 
 /*
  * Get the uid of the step
@@ -334,6 +340,25 @@ extern uint32_t stepd_get_nodeid(int fd, uint16_t protocol_version);
  * On error returns -1.
  */
 extern int stepd_get_namespace_fd(int fd, uint16_t protocol_version);
+
+/*
+ * Request to get required information to enter the namespace of a job.
+ *
+ * On success returns number of elements in the fd_map list and populates the
+ * list.
+ * Returns SLURM_ERROR on failure
+ */
+extern int stepd_get_namespace_fds(int fd, list_t *fd_map,
+				   uint16_t protocol_version);
+
+/*
+ * Request to get the BPF token for a step in a user namespace.
+ *
+ * fd needs to be a connection to the socket of the extern slurmstepd.
+ * On success returns the bpf token fd.
+ * Returns SLURM_ERROR on failure.
+ */
+extern int stepd_get_bpf_token(int fd, uint16_t protocol_version);
 
 /*
  * Relay message to stepd.

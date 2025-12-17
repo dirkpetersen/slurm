@@ -41,8 +41,27 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
-#include "src/slurmctld/slurmctld.h"
+
 #include "slurm/slurm_errno.h"
+
+#include "src/common/data.h"
+
+#include "src/slurmctld/slurmctld.h"
+
+#ifndef LUA_OK
+/* Define LUA_OK if Lua is <5.2 */
+#define LUA_OK 0
+#endif
+
+/* Using typedef as Lua status codes are distinct from POSIX return codes */
+typedef int lua_status_code_t;
+
+/* Get string description of Lua status code */
+extern const char *slurm_lua_status_code_string(lua_status_code_t sc);
+/* Get stringified form of status codes macro from lua.h */
+extern const char *slurm_lua_status_code_stringify(lua_status_code_t sc);
+/* Get slurm_err_t of status codes macro from lua.h */
+extern slurm_err_t slurm_lua_status_error(lua_status_code_t sc);
 
 /* Generic stack dump function for debugging purposes */
 extern void slurm_lua_stack_dump(const char *plugin,
@@ -52,7 +71,7 @@ extern void slurm_lua_stack_dump(const char *plugin,
  * This function loads a new lua state object.
  *
  * The new lua state object will be initialized and assigned to *L depending
- * on its mtime vs *load_time and whether the new script is succesfully loaded.
+ * on its mtime vs *load_time and whether the new script is successfully loaded.
  * If it cannot load *L won't be touched and SLURM_ERROR or SUCCESS will be
  * returned depending on if *L was NULL or the old script can still be in use.
  *
@@ -63,6 +82,7 @@ extern void slurm_lua_stack_dump(const char *plugin,
  * req_fxns (in) - NULL terminated array of functions that must exist in the
  *                 script
  * load_time (in/out) - mtime of script from the curr lua state object
+ * err_msg (in/out) - If non-NULL, set this to a descriptive message on error
  *
  * Returns:
  * SLURM_SUCCESS - if a correct Lua object is set.
@@ -72,7 +92,8 @@ extern int slurm_lua_loadscript(lua_State **L, const char *plugin,
 				const char *script_path,
 				const char **req_fxns,
 				time_t *load_time,
-				void (*local_options)(lua_State *L));
+				void (*local_options)(lua_State *L),
+				char **err_msg);
 
 extern void slurm_lua_table_register(lua_State *L, const char *libname,
 				     const luaL_Reg *l);
@@ -86,7 +107,40 @@ extern void slurm_lua_table_register(lua_State *L, const char *libname,
 extern int slurm_lua_job_record_field(lua_State *L, const job_record_t *job_ptr,
 				      const char *name);
 
-extern int slurm_lua_isinteger(lua_State *L, int index);
+/*
+ * Check if a function is present in script
+ * IN L - lua state table pointer
+ * IN func_name - name of function to check
+ * RET true if function is present or false is function not found
+ */
+extern bool slurm_lua_is_function_defined(lua_State *L, const char *func_name);
+
+/*
+ * Call lua_pcall() and catch error
+ * IN L - lua state table pointer
+ * IN nargs - number of arguments to function already pushed
+ * IN nresults - number of returns expected from function
+ * IN/OUT err_ptr - Populate error string on failure. Must xfree(*err_ptr)
+ * IN caller - __func__ from caller
+ * RET SLURM_SUCCESS or error
+ */
+extern int slurm_lua_pcall(lua_State *L, int nargs, int nresults,
+			   char **err_ptr, const char *caller);
+
+/*
+ * Push Lua value representing src onto stack
+ * IN l - lua state table pointer
+ * IN src - data_t pointer to convert to lua table and push on stack
+ * RET SLURM_SUCCESS or error
+ */
+extern int slurm_lua_from_data(lua_State *L, const data_t *src);
+/*
+ * Convert top of stack into data_t
+ * IN l - lua state table pointer
+ * IN dst - data_t pointer be populated with value on top of stack
+ * RET SLURM_SUCCESS or error
+ */
+extern int slurm_lua_to_data(lua_State *L, data_t *dst);
 
 #else
 # define LUA_VERSION_NUM 0

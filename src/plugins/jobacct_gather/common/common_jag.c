@@ -72,7 +72,7 @@ char **assoc_mgr_tres_name_array;
 
 static int cpunfo_frequency = 0;
 static long conv_units = 0;
-List prec_list = NULL;
+list_t *prec_list = NULL;
 
 static int my_pagesize = 0;
 static int energy_profile = ENERGY_DATA_NODE_ENERGY_UP;
@@ -376,7 +376,7 @@ static int _get_process_data_line(int in, jag_prec_t *prec) {
 
 	/*
 	 * Store unnormalized times, we will normalize in when
-	 * transfering to a struct jobacctinfo in job_common_poll_data()
+	 * transferring to a struct jobacctinfo in job_common_poll_data()
 	 */
 	prec->usec = (double)utime;
 	prec->ssec = (double)stime;
@@ -647,8 +647,8 @@ static int _mark_as_completed(void *x, void *empty)
 	return SLURM_SUCCESS;
 }
 
-static List _get_precs(List task_list, uint64_t cont_id,
-		       jag_callbacks_t *callbacks)
+static list_t *_get_precs(list_t *task_list, uint64_t cont_id,
+			  jag_callbacks_t *callbacks)
 {
 	int npids = 0;
 	struct jobacctinfo *jobacct = NULL;
@@ -998,12 +998,12 @@ static void _aggregate_prec(jag_prec_t *prec, jag_prec_t *ancestor)
  *
  * THREADSAFE! Only one thread ever gets here.
  */
-static void _get_offspring_data(List prec_list, jag_prec_t *ancestor, pid_t pid,
-				jag_prec_t *permanent_anc)
+static void _get_offspring_data(list_t *prec_list, jag_prec_t *ancestor,
+				pid_t pid, jag_prec_t *permanent_anc)
 {
 	jag_prec_t *prec = NULL;
 	jag_prec_t *prec_tmp = NULL;
-	List tmp_list = NULL;
+	list_t *tmp_list = NULL;
 
 	/* reset all precs to be not visited */
 	(void)list_for_each(prec_list, (ListForF)_reset_visited, NULL);
@@ -1042,7 +1042,7 @@ static void _get_offspring_data(List prec_list, jag_prec_t *ancestor, pid_t pid,
 	return;
 }
 
-extern void jag_common_poll_data(List task_list, uint64_t cont_id,
+extern void jag_common_poll_data(list_t *task_list, uint64_t cont_id,
 				 jag_callbacks_t *callbacks, bool profile)
 {
 	/* Update the data */
@@ -1089,70 +1089,87 @@ extern void jag_common_poll_data(List task_list, uint64_t cont_id,
 		double cpu_calc;
 		double last_total_cputime;
 		jag_prec_t *permanent_anc;
-		if (!(prec = list_find_first(prec_list, _find_prec,
-					     &jobacct->pid)))
-			continue;
-		/*
-		 * We can't use the prec from the list as we need to keep it in
-		 * the original state without offspring since we reuse this list
-		 * keeping around precs after they end.
-		 */
-		memcpy(&tmp_prec, prec, sizeof(*prec));
-		permanent_anc = prec;
-		prec = &tmp_prec;
-
-		if (acct_gather_filesystem_g_get_data(prec->tres_data) < 0) {
-			log_flag(JAG, "problem retrieving filesystem data");
-		}
-
-		if (acct_gather_interconnect_g_get_data(prec->tres_data) < 0) {
-			log_flag(JAG, "problem retrieving interconnect data");
-		}
-		/* find all my descendents */
-		if (callbacks->get_offspring_data)
-			(*(callbacks->get_offspring_data))
-				(prec_list, prec, prec->pid, permanent_anc);
-
-		/*
-		 * Only jobacct_gather/cgroup uses prec_extra, and we want to
-		 * make sure we call it once per task, so call it here as we
-		 * iterate through the tasks instead of in get_precs.
-		 */
-		if (callbacks->prec_extra) {
-			if (last_taskid == jobacct->id.taskid) {
-				log_flag(JAG, "skipping prec_extra() call against nodeid:%u taskid:%u",
-					 jobacct->id.nodeid,
-					 jobacct->id.taskid);
+		if (jobacct->pid) {
+			if (!(prec = list_find_first(prec_list, _find_prec,
+						     &jobacct->pid)))
 				continue;
-			} else {
-				log_flag(JAG, "calling prec_extra() call against nodeid:%u taskid:%u",
-					 jobacct->id.nodeid,
-					 jobacct->id.taskid);
+			/*
+			 * We can't use the prec from the list as we need to
+			 * keep it in the original state without offspring since
+			 * we reuse this list keeping around precs after they
+			 * end.
+			 */
+			memcpy(&tmp_prec, prec, sizeof(*prec));
+			permanent_anc = prec;
+			prec = &tmp_prec;
+
+			if (acct_gather_filesystem_g_get_data(prec->tres_data) <
+			    0) {
+				log_flag(JAG, "problem retrieving filesystem data");
 			}
 
-			last_taskid = jobacct->id.taskid;
-			(*(callbacks->prec_extra))(prec, jobacct->id.taskid);
+			if (acct_gather_interconnect_g_get_data(
+				    prec->tres_data) < 0) {
+				log_flag(JAG, "problem retrieving interconnect data");
+			}
+			/* find all my descendents */
+			if (callbacks->get_offspring_data)
+				(*(callbacks->get_offspring_data))(
+					prec_list, prec, prec->pid,
+					permanent_anc);
+
+			/*
+			 * Only jobacct_gather/cgroup uses prec_extra, and we
+			 * want to make sure we call it once per task, so call
+			 * it here as we iterate through the tasks instead of
+			 * in get_precs.
+			 */
+			if (callbacks->prec_extra) {
+				if (last_taskid == jobacct->id.taskid) {
+					log_flag(JAG, "skipping prec_extra() call against nodeid:%u taskid:%u",
+						 jobacct->id.nodeid,
+						 jobacct->id.taskid);
+					continue;
+				} else {
+					log_flag(JAG, "calling prec_extra() call against nodeid:%u taskid:%u",
+						 jobacct->id.nodeid,
+						 jobacct->id.taskid);
+				}
+
+				last_taskid = jobacct->id.taskid;
+				(*(callbacks->prec_extra))(prec,
+							   jobacct->id.taskid);
+			}
+
+			log_flag(JAG, "pid:%u ppid:%u %s:%" PRIu64 " B",
+				 prec->pid, prec->ppid,
+				 (xstrcasestr(slurm_conf.job_acct_gather_params,
+					      "UsePss") ?  "pss" : "rss"),
+				 prec->tres_data[TRES_ARRAY_MEM].size_read);
+
+			last_total_cputime =
+				(double) jobacct->
+				tres_usage_in_tot[TRES_ARRAY_CPU];
+
+			cpu_calc =
+				(prec->ssec + prec->usec) / (double) conv_units;
+
+			/*
+			 * Since we are not storing things as a double anymor
+			 * make it bigger so we don't loose precision.
+			 */
+			cpu_calc *= CPU_TIME_ADJ;
+
+			prec->tres_data[TRES_ARRAY_CPU].size_read =
+				(uint64_t) cpu_calc;
+		} else {
+			prec = xmalloc(sizeof(jag_prec_t));
+			prec->tres_count = jobacct->tres_count;
+			prec->tres_data = xcalloc(prec->tres_count,
+						  sizeof(acct_gather_data_t));
+			_init_tres(prec, NULL);
+			cpu_calc = last_total_cputime = 0;
 		}
-
-		log_flag(JAG, "pid:%u ppid:%u %s:%" PRIu64 " B",
-			 prec->pid, prec->ppid,
-			 (xstrcasestr(slurm_conf.job_acct_gather_params,
-				      "UsePss") ?  "pss" : "rss"),
-			 prec->tres_data[TRES_ARRAY_MEM].size_read);
-
-
-		last_total_cputime =
-			(double)jobacct->tres_usage_in_tot[TRES_ARRAY_CPU];
-
-		cpu_calc = (prec->ssec + prec->usec) / (double) conv_units;
-
-		/*
-		 * Since we are not storing things as a double anymore make it
-		 * bigger so we don't loose precision.
-		 */
-		cpu_calc *= CPU_TIME_ADJ;
-
-		prec->tres_data[TRES_ARRAY_CPU].size_read = (uint64_t)cpu_calc;
 
 		/* get energy consumption
 		 * only once is enough since we
@@ -1181,6 +1198,32 @@ extern void jag_common_poll_data(List task_list, uint64_t cont_id,
 		for (i = 0; i < jobacct->tres_count; i++) {
 			if (prec->tres_data[i].size_read == INFINITE64)
 				continue;
+
+			/* Do this before the max for polling/profiling */
+			jobacct->tres_usage_in_tot[i] =
+				prec->tres_data[i].size_read;
+
+			/*
+			 * Check for support of MaxRSS direct reading.
+			 *
+			 * In cgroup/v1 and cgroup/v2 we can get the value
+			 * directly in the memory.peak or
+			 * memory.max_usage_in_bytes interfaces.
+			 *
+			 * If available it will be in size_write.
+			 *
+			 * If it is not available then the MaxRSS will be the
+			 * one gathered and calculated through memory.current,
+			 * memory.usage_in_bytes or linux /proc.
+			 */
+			if ((i == TRES_ARRAY_MEM) &&
+			    (prec->tres_data[i].size_write != INFINITE64)) {
+				prec->tres_data[i].size_read =
+					prec->tres_data[i].size_write;
+				prec->tres_data[i].size_write =
+					INFINITE64;
+			}
+
 			if (jobacct->tres_usage_in_max[i] == INFINITE64)
 				jobacct->tres_usage_in_max[i] =
 					prec->tres_data[i].size_read;
@@ -1199,8 +1242,6 @@ extern void jag_common_poll_data(List task_list, uint64_t cont_id,
 			 */
 			jobacct->tres_usage_in_min[i] =
 				jobacct->tres_usage_in_max[i];
-			jobacct->tres_usage_in_tot[i] =
-				prec->tres_data[i].size_read;
 
 			if (jobacct->tres_usage_out_max[i] == INFINITE64)
 				jobacct->tres_usage_out_max[i] =
@@ -1215,8 +1256,12 @@ extern void jag_common_poll_data(List task_list, uint64_t cont_id,
 				prec->tres_data[i].size_write;
 		}
 
-		total_job_mem += jobacct->tres_usage_in_tot[TRES_ARRAY_MEM];
-		total_job_vsize += jobacct->tres_usage_in_tot[TRES_ARRAY_VMEM];
+		if (jobacct->pid) {
+			total_job_mem +=
+				jobacct->tres_usage_in_tot[TRES_ARRAY_MEM];
+			total_job_vsize +=
+				jobacct->tres_usage_in_tot[TRES_ARRAY_VMEM];
+		}
 
 		/* Update the cpu times */
 		jobacct->user_cpu_sec = (uint64_t)(prec->usec /
@@ -1270,6 +1315,8 @@ extern void jag_common_poll_data(List task_list, uint64_t cont_id,
 
 			jobacct->last_time = jobacct->cur_time;
 		}
+		if (!jobacct->pid)
+			destroy_jag_prec(prec);
 	}
 	list_iterator_destroy(itr);
 

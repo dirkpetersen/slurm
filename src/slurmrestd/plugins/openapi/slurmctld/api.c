@@ -51,35 +51,13 @@
 
 #include "api.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "select" for Slurm node selection) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load select plugins if the plugin_type string has a
- * prefix of "select/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Slurm OpenAPI slurmctld";
 const char plugin_type[] = "openapi/slurmctld";
-const uint32_t plugin_id = 110;
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
+/* Required for openapi plugins: */
+const uint32_t plugin_id = 110;
 
 const openapi_resp_meta_t plugin_meta = {
 	.plugin = {
@@ -101,7 +79,8 @@ static const char *tags[] = {
 	NULL
 };
 
-#define OP_FLAGS (OP_BIND_DATA_PARSER | OP_BIND_OPENAPI_RESP_FMT)
+#define OP_FLAGS (OP_BIND_DATA_PARSER | OP_BIND_OPENAPI_RESP_FMT | \
+		  OP_BIND_NO_SLURMDBD)
 
 const openapi_path_binding_t openapi_paths[] = {
 	{
@@ -254,7 +233,10 @@ const openapi_path_binding_t openapi_paths[] = {
 					.type = DATA_PARSER_OPENAPI_KILL_JOBS_RESP,
 					.description = "description of jobs to signal",
 				},
-				.query = DATA_PARSER_KILL_JOBS_MSG,
+				.body = {
+					.type = DATA_PARSER_KILL_JOBS_MSG,
+					.description = "Signal or cancel jobs",
+				},
 			},
 			{0}
 		},
@@ -272,7 +254,7 @@ const openapi_path_binding_t openapi_paths[] = {
 					.type = DATA_PARSER_OPENAPI_JOB_INFO_RESP,
 					.description = "job(s) state information",
 				},
-				.query = DATA_PARSER_OPENAPI_JOB_INFO_QUERY,
+				.query = DATA_PARSER_OPENAPI_JOB_STATE_QUERY,
 			},
 			{0}
 		},
@@ -312,7 +294,7 @@ const openapi_path_binding_t openapi_paths[] = {
 				.tags = tags,
 				.summary = "cancel or signal job",
 				.response = {
-					.type = DATA_PARSER_OPENAPI_RESP,
+					.type = DATA_PARSER_OPENAPI_KILL_JOB_RESP,
 					.description = "job signal result",
 				},
 				.parameters = DATA_PARSER_OPENAPI_JOB_INFO_PARAM,
@@ -447,6 +429,19 @@ const openapi_path_binding_t openapi_paths[] = {
 				},
 				.query = DATA_PARSER_OPENAPI_RESERVATION_QUERY,
 			},
+			{
+				.method = HTTP_REQUEST_POST,
+				.tags = tags,
+				.summary = "create or update reservations",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_RESERVATION_MOD_RESP,
+					.description = "reservation descriptions",
+				},
+				.body = {
+					.type = DATA_PARSER_RESERVATION_MOD_REQ,
+					.description = "reservation descriptions",
+				},
+			},
 			{0}
 		},
 		.flags = OP_FLAGS,
@@ -465,6 +460,76 @@ const openapi_path_binding_t openapi_paths[] = {
 				},
 				.parameters = DATA_PARSER_OPENAPI_RESERVATION_PARAM,
 				.query = DATA_PARSER_OPENAPI_RESERVATION_QUERY,
+			},
+			{
+				.method = HTTP_REQUEST_DELETE,
+				.tags = tags,
+				.summary = "delete a reservation",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_RESP,
+					.description = "reservation delete request result",
+				},
+				.parameters = DATA_PARSER_OPENAPI_RESERVATION_PARAM,
+			},
+			{0}
+		},
+		.flags = OP_FLAGS,
+	},
+	{
+		.path = "/slurm/{data_parser}/reservation",
+		.callback = op_handler_reservation,
+		.methods = (openapi_path_binding_method_t[]) {
+			{
+				.method = HTTP_REQUEST_POST,
+				.tags = tags,
+				.summary = "create or update a reservation",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_RESERVATION_MOD_RESP,
+					.description = "reservation description",
+				},
+				.body = {
+					.type = DATA_PARSER_RESERVATION_DESC_MSG,
+					.description = "reservation description",
+				},
+			},
+			{0}
+		},
+		.flags = OP_FLAGS,
+	},
+	{
+		.path = "/slurm/{data_parser}/new/node/",
+		.callback = op_handler_create_node,
+		.methods = (openapi_path_binding_method_t[]) {
+			{
+				.method = HTTP_REQUEST_POST,
+				.tags = tags,
+				.summary = "create node",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_RESP,
+					.description = "node create request result",
+				},
+				.body = {
+					.type = DATA_PARSER_OPENAPI_CREATE_NODE_REQ,
+					.description = "node create request",
+				}
+			},
+			{0}
+		},
+		.flags = OP_FLAGS,
+	},
+	{
+		.path = "/slurm/{data_parser}/resources/{job_id}",
+		.callback = op_handler_resources,
+		.methods = (openapi_path_binding_method_t[]) {
+			{
+				.method = HTTP_REQUEST_GET,
+				.tags = tags,
+				.summary = "get resource layout info",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_RESOURCE_LAYOUT_RESP,
+					.description = "resource layout information",
+				},
+				.parameters = DATA_PARSER_OPENAPI_JOB_INFO_PARAM,
 			},
 			{0}
 		},

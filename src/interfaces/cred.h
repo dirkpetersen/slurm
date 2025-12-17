@@ -1,5 +1,5 @@
 /*****************************************************************************\
- *  src/interfaces/cred.h - Slurm job and sbcast credential functions
+ *  cred.h - Slurm job and sbcast credential functions
  *****************************************************************************
  *  Copyright (C) 2002-2007 The Regents of the University of California.
  *  Copyright (C) 2008-2010 Lawrence Livermore National Security.
@@ -118,6 +118,7 @@ typedef struct {
 	uint16_t job_oversubscribe;	/* shared/oversubscribe status */
 	list_t *job_gres_list;		/* Generic resources allocated to JOB */
 	char *job_partition;		/* partition */
+	char *job_qos;
 	char *job_reservation;		/* Reservation, if applicable */
 	uint16_t job_restart_cnt;	/* restart count */
 	char *job_selinux_context;
@@ -134,6 +135,8 @@ typedef struct {
 	uint32_t *step_mem_alloc_rep_count;
 	uint32_t step_mem_alloc_size;	/* Size of memory arrays above */
 	list_t *step_gres_list;		/* GRES allocated to STEP */
+
+	void *switch_step;
 } slurm_cred_arg_t;
 
 #define CRED_MAGIC 0x0b0b0b
@@ -152,9 +155,8 @@ typedef struct {
 } slurm_cred_t;
 
 typedef struct {
-	uint32_t job_id;
+	slurm_step_id_t step_id;
 	uint32_t het_job_id;
-	uint32_t step_id;
 	identity_t *id;
 
 	time_t expiration;

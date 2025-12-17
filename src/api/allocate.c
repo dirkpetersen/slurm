@@ -1,5 +1,5 @@
 /*****************************************************************************\
- *  allocate.c - allocate nodes for a job or step with supplied contraints
+ *  allocate.c - allocate nodes for a job or step with supplied constraints
  *****************************************************************************
  *  Copyright (C) 2002-2007 The Regents of the University of California.
  *  Copyright (C) 2008-2009 Lawrence Livermore National Security.
@@ -53,16 +53,22 @@ extern pid_t getsid(pid_t pid);		/* missing from <unistd.h> */
 #endif
 
 #include "slurm/slurm.h"
+
 #include "src/common/fd.h"
 #include "src/common/forward.h"
 #include "src/common/hostlist.h"
 #include "src/common/parse_time.h"
 #include "src/common/read_config.h"
-#include "src/interfaces/auth.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
+#include "src/common/threadpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
+
+#include "src/interfaces/auth.h"
+#include "src/interfaces/certgen.h"
+#include "src/interfaces/certmgr.h"
+#include "src/interfaces/conn.h"
 
 #define BUFFER_SIZE 1024
 #define MAX_ALLOC_WAIT 60	/* seconds */
@@ -78,18 +84,14 @@ typedef struct {
 typedef struct {
 	slurmdb_cluster_rec_t *cluster;
 	job_desc_msg_t        *req;
-	List                   resp_msg_list;
+	int *will_run_rc;
+	list_t *resp_msg_list;
 } load_willrun_req_struct_t;
-
-typedef struct {
-	int                      rc;
-	will_run_response_msg_t *willrun_resp_msg;
-} load_willrun_resp_struct_t;
 
 static int _handle_rc_msg(slurm_msg_t *msg);
 static listen_t *_create_allocation_response_socket(void);
 static void _destroy_allocation_response_socket(listen_t *listen);
-static void _wait_for_allocation_response(uint32_t job_id,
+static void _wait_for_allocation_response(slurm_step_id_t *step_id,
 					  const listen_t *listen,
 					  uint16_t msg_type, int timeout,
 					  void **resp);
@@ -163,16 +165,14 @@ slurm_allocate_resources (job_desc_msg_t *req,
  *      with no allocation granted)
  * NOTE: free the response using slurm_free_resource_allocation_response_msg()
  */
-resource_allocation_response_msg_t *
-slurm_allocate_resources_blocking (const job_desc_msg_t *user_req,
-				   time_t timeout,
-				   void(*pending_callback)(uint32_t job_id))
+resource_allocation_response_msg_t *slurm_allocate_resources_blocking(
+	const job_desc_msg_t *user_req, time_t timeout,
+	void (*pending_callback)(slurm_step_id_t *step_id))
 {
 	int rc;
 	slurm_msg_t req_msg;
 	slurm_msg_t resp_msg;
 	resource_allocation_response_msg_t *resp = NULL;
-	uint32_t job_id;
 	job_desc_msg_t *req;
 	listen_t *listen = NULL;
 	int errnum = SLURM_SUCCESS;
@@ -201,11 +201,19 @@ slurm_allocate_resources_blocking (const job_desc_msg_t *user_req,
 		req->alloc_resp_port = listen->port;
 	}
 
+	if (conn_tls_enabled()) {
+		if (!(req->alloc_tls_cert = conn_g_get_own_public_cert())) {
+			error("Could not get self signed certificate for allocation response");
+			return NULL;
+		}
+	}
+
 	req_msg.msg_type = REQUEST_RESOURCE_ALLOCATION;
 	req_msg.data     = req;
 
 	rc = slurm_send_recv_controller_msg(&req_msg, &resp_msg,
 					    working_cluster_rec);
+	xfree(req->alloc_tls_cert);
 
 	if (rc == SLURM_ERROR) {
 		int errnum = errno;
@@ -232,10 +240,12 @@ slurm_allocate_resources_blocking (const job_desc_msg_t *user_req,
 		/* Yay, the controller has acknowledged our request!
 		 * Test if we have an allocation yet? */
 		resp = (resource_allocation_response_msg_t *) resp_msg.data;
+		verbose("JobId=%u returned by the controller", resp->step_id.job_id);
 		if (resp->node_cnt > 0) {
 			/* yes, allocation has been granted */
 			errno = SLURM_SUCCESS;
 		} else if (!req->immediate) {
+			slurm_step_id_t step_id = resp->step_id;
 			if (resp->error_code != SLURM_SUCCESS)
 				info("%s", slurm_strerror(resp->error_code));
 			/* no, we need to wait for a response */
@@ -244,18 +254,19 @@ slurm_allocate_resources_blocking (const job_desc_msg_t *user_req,
 			print_multi_line_string(resp->job_submit_user_msg,
 						-1, LOG_LEVEL_INFO);
 
-			job_id = resp->job_id;
 			slurm_free_resource_allocation_response_msg(resp);
+			resp = NULL;
+
 			if (pending_callback != NULL)
-				pending_callback(job_id);
-			_wait_for_allocation_response(job_id, listen,
-						RESPONSE_RESOURCE_ALLOCATION,
-						timeout, (void **) &resp);
+				pending_callback(&step_id);
+			_wait_for_allocation_response(
+				&step_id, listen, RESPONSE_RESOURCE_ALLOCATION,
+				timeout, (void **) &resp);
 			/* If NULL, we didn't get the allocation in
 			   the time desired, so just free the job id */
 			if ((resp == NULL) && (errno != ESLURM_ALREADY_DONE)) {
 				errnum = errno;
-				slurm_complete_job(job_id, -1);
+				slurm_complete_job(&step_id, -1);
 			}
 			if ((resp == NULL) && (errno == ESLURM_ALREADY_DONE))
 				already_done = true;
@@ -277,38 +288,97 @@ slurm_allocate_resources_blocking (const job_desc_msg_t *user_req,
 	return resp;
 }
 
+static int _foreach_log_will_run_resp(void *x, void *key)
+{
+	will_run_response_msg_t *will_run_resp = x;
+	char buf[256];
+	slurm_make_time_str(&will_run_resp->start_time, buf, sizeof(buf));
+	debug("%pI to start at %s on cluster %s using %u processors on nodes %s in partition %s",
+	      &will_run_resp->step_id, buf, will_run_resp->cluster_name,
+	      will_run_resp->proc_cnt, will_run_resp->node_list,
+	      will_run_resp->part_name);
+
+	if (will_run_resp->preemptee_job_id) {
+		list_itr_t *itr;
+		uint32_t *job_id_ptr;
+		char *job_list = NULL, *sep = "";
+		itr = list_iterator_create(will_run_resp->preemptee_job_id);
+		while ((job_id_ptr = list_next(itr))) {
+			if (job_list)
+				sep = ",";
+			xstrfmtcat(job_list, "%s%u", sep, *job_id_ptr);
+		}
+		list_iterator_destroy(itr);
+		debug("  Preempts: %s", job_list);
+		xfree(job_list);
+	}
+
+	return 0;
+}
+
+static void log_will_run_resps(list_t *list)
+{
+	if (get_log_level() < LOG_LEVEL_DEBUG)
+		return;
+
+	list_for_each(list, _foreach_log_will_run_resp, NULL);
+}
+
 static void *_load_willrun_thread(void *args)
 {
 	load_willrun_req_struct_t *load_args =
 		(load_willrun_req_struct_t *)args;
 	slurmdb_cluster_rec_t *cluster       = load_args->cluster;
 	will_run_response_msg_t *new_msg = NULL;
-	load_willrun_resp_struct_t *resp;
 
-	_job_will_run_cluster(load_args->req, &new_msg, cluster);
-
-	resp = xmalloc(sizeof(load_willrun_resp_struct_t));
-	resp->rc               = errno;
-	resp->willrun_resp_msg = new_msg;
-	list_append(load_args->resp_msg_list, resp);
+	if (!_job_will_run_cluster(load_args->req, &new_msg, cluster)) {
+		list_append(load_args->resp_msg_list, new_msg);
+		new_msg->cluster_name = xstrdup(cluster->name);
+	} else {
+		debug("Problem with submit to cluster %s: %m", cluster->name);
+		*(load_args->will_run_rc) = errno;
+	}
 	xfree(args);
 
 	return NULL;
+}
+
+extern int slurm_sort_will_run_resp(void *a, void *b)
+{
+	will_run_response_msg_t *resp_a = *(will_run_response_msg_t **) a;
+	will_run_response_msg_t *resp_b = *(will_run_response_msg_t **) b;
+
+	if (resp_a->start_time < resp_b->start_time)
+		return -1;
+	else if (resp_a->start_time > resp_b->start_time)
+		return 1;
+
+	if (list_count(resp_a->preemptee_job_id) <
+	    list_count(resp_b->preemptee_job_id))
+		return -1;
+	else if (list_count(resp_a->preemptee_job_id) >
+		 list_count(resp_b->preemptee_job_id))
+		return 1;
+
+	if (!xstrcmp(slurm_conf.cluster_name, resp_a->cluster_name))
+		return -1;
+	else if (!xstrcmp(slurm_conf.cluster_name, resp_b->cluster_name))
+		return 1;
+
+	return 0;
 }
 
 static int _fed_job_will_run(job_desc_msg_t *req,
 			     will_run_response_msg_t **will_run_resp,
 			     slurmdb_federation_rec_t *fed)
 {
-	List resp_msg_list;
-	int pthread_count = 0, i;
+	list_t *resp_msg_list;
+	int pthread_count = 0, i, will_run_rc = SLURM_SUCCESS;
 	pthread_t *load_thread = 0;
 	load_willrun_req_struct_t *load_args;
 	list_itr_t *iter;
-	will_run_response_msg_t *earliest_resp = NULL;
-	load_willrun_resp_struct_t *tmp_resp;
 	slurmdb_cluster_rec_t *cluster;
-	List req_clusters = NULL;
+	list_t *req_clusters = NULL;
 
 	xassert(req);
 	xassert(will_run_resp);
@@ -325,7 +395,8 @@ static int _fed_job_will_run(job_desc_msg_t *req,
 	}
 
 	/* Spawn one pthread per cluster to collect job information */
-	resp_msg_list = list_create(NULL);
+	resp_msg_list =
+		list_create((ListDelF) slurm_free_will_run_response_msg);
 	load_thread = xcalloc(list_count(fed->cluster_list), sizeof(pthread_t));
 	iter = list_iterator_create(fed->cluster_list);
 	while ((cluster = (slurmdb_cluster_rec_t *)list_next(iter))) {
@@ -342,6 +413,7 @@ static int _fed_job_will_run(job_desc_msg_t *req,
 		load_args->cluster       = cluster;
 		load_args->req           = req;
 		load_args->resp_msg_list = resp_msg_list;
+		load_args->will_run_rc = &will_run_rc;
 		slurm_thread_create(&load_thread[pthread_count],
 				    _load_willrun_thread, load_args);
 		pthread_count++;
@@ -354,52 +426,39 @@ static int _fed_job_will_run(job_desc_msg_t *req,
 		slurm_thread_join(load_thread[i]);
 	xfree(load_thread);
 
-	iter = list_iterator_create(resp_msg_list);
-	while ((tmp_resp = (load_willrun_resp_struct_t *)list_next(iter))) {
-		if (!tmp_resp->willrun_resp_msg)
-			slurm_seterrno(tmp_resp->rc);
-		else if ((!earliest_resp) ||
-			 (tmp_resp->willrun_resp_msg->start_time <
-			  earliest_resp->start_time)) {
-			slurm_free_will_run_response_msg(earliest_resp);
-			earliest_resp = tmp_resp->willrun_resp_msg;
-			tmp_resp->willrun_resp_msg = NULL;
-		}
-
-		slurm_free_will_run_response_msg(tmp_resp->willrun_resp_msg);
-		xfree(tmp_resp);
-	}
-	list_iterator_destroy(iter);
+	list_sort(resp_msg_list, slurm_sort_will_run_resp);
+	log_will_run_resps(resp_msg_list);
+	*will_run_resp = list_pop(resp_msg_list);
 	FREE_NULL_LIST(resp_msg_list);
 
-	*will_run_resp = earliest_resp;
-
-	if (!earliest_resp)
+	if (!*will_run_resp) {
+		errno = will_run_rc;
 		return SLURM_ERROR;
+	}
 
 	return SLURM_SUCCESS;
 }
 
 /* Get total node count and lead job ID from RESPONSE_HET_JOB_ALLOCATION */
-static void _het_job_alloc_test(List resp, uint32_t *node_cnt, uint32_t *job_id)
+static void _het_job_alloc_test(list_t *resp, uint32_t *node_cnt,
+				slurm_step_id_t *step_id)
 {
 	resource_allocation_response_msg_t *alloc;
-	uint32_t inx = 0, het_job_node_cnt = 0, het_job_id = 0;
+	uint32_t inx = 0, het_job_node_cnt = 0;
 	list_itr_t *iter;
 
 	xassert(resp);
 	iter = list_iterator_create(resp);
 	while ((alloc = (resource_allocation_response_msg_t *)list_next(iter))){
 		het_job_node_cnt += alloc->node_cnt;
-		if (het_job_id == 0)
-			het_job_id = alloc->job_id;
+		if (step_id->job_id == NO_VAL)
+			*step_id = alloc->step_id;
 		print_multi_line_string(alloc->job_submit_user_msg,
 					inx, LOG_LEVEL_INFO);
 		inx++;
 	}
 	list_iterator_destroy(iter);
 
-	*job_id   = het_job_id;
 	*node_cnt = het_job_node_cnt;
 }
 
@@ -422,20 +481,23 @@ static void _het_job_alloc_test(List resp, uint32_t *node_cnt, uint32_t *job_id)
  *      with no allocation granted)
  * NOTE: free the response using list_destroy()
  */
-List slurm_allocate_het_job_blocking(List job_req_list, time_t timeout,
-				     void(*pending_callback)(uint32_t job_id))
+list_t *slurm_allocate_het_job_blocking(
+	list_t *job_req_list, time_t timeout,
+	void (*pending_callback)(slurm_step_id_t *step_id))
 {
 	int rc;
 	slurm_msg_t req_msg;
 	slurm_msg_t resp_msg;
-	List resp = NULL;
+	list_t *resp = NULL;
 	job_desc_msg_t *req;
 	listen_t *listen = NULL;
 	int errnum = SLURM_SUCCESS;
 	list_itr_t *iter;
 	bool immediate_flag = false;
-	uint32_t node_cnt = 0, job_id = 0;
+	uint32_t node_cnt = 0;
 	bool already_done = false;
+	char *alloc_tls_cert = NULL;
+	slurm_step_id_t step_id = SLURM_STEP_ID_INITIALIZER;
 
 	slurm_msg_t_init(&req_msg);
 	slurm_msg_t_init(&resp_msg);
@@ -450,6 +512,13 @@ List slurm_allocate_het_job_blocking(List job_req_list, time_t timeout,
 			return NULL;
 	}
 
+	if (conn_tls_enabled()) {
+		if (!(alloc_tls_cert = conn_g_get_own_public_cert())) {
+			error("Could not get self signed certificate for allocation response");
+			return NULL;
+		}
+	}
+
 	iter = list_iterator_create(job_req_list);
 	while ((req = (job_desc_msg_t *) list_next(iter))) {
 		if (req->alloc_sid == NO_VAL)
@@ -459,8 +528,11 @@ List slurm_allocate_het_job_blocking(List job_req_list, time_t timeout,
 
 		if (req->immediate)
 			immediate_flag = true;
+		req->alloc_tls_cert = xstrdup(alloc_tls_cert);
 	}
 	list_iterator_destroy(iter);
+
+	xfree(alloc_tls_cert);
 
 	req_msg.msg_type = REQUEST_HET_JOB_ALLOCATION;
 	req_msg.data     = job_req_list;
@@ -491,8 +563,8 @@ List slurm_allocate_het_job_blocking(List job_req_list, time_t timeout,
 	case RESPONSE_HET_JOB_ALLOCATION:
 		/* Yay, the controller has acknowledged our request!
 		 * Test if we have an allocation yet? */
-		resp = (List) resp_msg.data;
-		_het_job_alloc_test(resp, &node_cnt, &job_id);
+		resp = resp_msg.data;
+		_het_job_alloc_test(resp, &node_cnt, &step_id);
 		if (node_cnt > 0) {
 			/* yes, allocation has been granted */
 			errno = SLURM_SUCCESS;
@@ -502,15 +574,15 @@ List slurm_allocate_het_job_blocking(List job_req_list, time_t timeout,
 			/* no, logs user messages and wait for a response */
 			FREE_NULL_LIST(resp);
 			if (pending_callback != NULL)
-				pending_callback(job_id);
-			_wait_for_allocation_response(job_id, listen,
-						RESPONSE_HET_JOB_ALLOCATION,
-						timeout, (void **) &resp);
+				pending_callback(&step_id);
+			_wait_for_allocation_response(
+				&step_id, listen, RESPONSE_HET_JOB_ALLOCATION,
+				timeout, (void **) &resp);
 			/* If NULL, we didn't get the allocation in
 			 * the time desired, so just free the job id */
 			if ((resp == NULL) && (errno != ESLURM_ALREADY_DONE)) {
 				errnum = errno;
-				slurm_complete_job(job_id, -1);
+				slurm_complete_job(&step_id, -1);
 			}
 			if ((resp == NULL) && (errno == ESLURM_ALREADY_DONE))
 				already_done = true;
@@ -542,15 +614,14 @@ int slurm_job_will_run(job_desc_msg_t *req)
 	will_run_response_msg_t *will_run_resp = NULL;
 	char buf[256];
 	int rc;
-	char *cluster_name = NULL;
 	void *ptr = NULL;
 
-	if (working_cluster_rec)
-		cluster_name = working_cluster_rec->name;
-	else
-		cluster_name = slurm_conf.cluster_name;
-	if (!slurm_load_federation(&ptr) &&
-	    cluster_in_federation(ptr, cluster_name))
+	/*
+	 * If working_cluster_rec is defined, the it's already gone through
+	 * slurmdb_get_first_avail_cluster() to find the cluster to go to.
+	 */
+	if (!working_cluster_rec && !slurm_load_federation(&ptr) &&
+	    cluster_in_federation(ptr, slurm_conf.cluster_name))
 		rc = _fed_job_will_run(req, &will_run_resp, ptr);
 	else
 		rc = slurm_job_will_run2(req, &will_run_resp);
@@ -561,10 +632,19 @@ int slurm_job_will_run(job_desc_msg_t *req)
 			-1, LOG_LEVEL_INFO);
 
 	if ((rc == 0) && will_run_resp) {
+		char *cluster_name = NULL;
 		slurm_make_time_str(&will_run_resp->start_time,
 				    buf, sizeof(buf));
-		info("Job %u to start at %s using %u processors on nodes %s in partition %s",
-		     will_run_resp->job_id, buf,
+
+		if (working_cluster_rec)
+			cluster_name = working_cluster_rec->name;
+		else if (will_run_resp->cluster_name)
+			cluster_name = will_run_resp->cluster_name;
+
+		info("Job %u to start at %s%s%s a using %u processors on nodes %s in partition %s",
+		     will_run_resp->step_id.job_id, buf,
+		     cluster_name ? " on cluster " : "",
+		     cluster_name ? cluster_name : "",
 		     will_run_resp->proc_cnt,
 		     will_run_resp->node_list,
 		     will_run_resp->part_name);
@@ -600,7 +680,7 @@ int slurm_job_will_run(job_desc_msg_t *req)
  *		allocation request
  * RET SLURM_SUCCESS on success, otherwise return SLURM_ERROR with errno set
  */
-extern int slurm_het_job_will_run(List job_req_list)
+extern int slurm_het_job_will_run(list_t *job_req_list)
 {
 	job_desc_msg_t *req;
 	will_run_response_msg_t *will_run_resp;
@@ -629,7 +709,7 @@ extern int slurm_het_job_will_run(List job_req_list)
 
 		if ((rc == SLURM_SUCCESS) && will_run_resp) {
 			if (first_job_id == 0)
-				first_job_id = will_run_resp->job_id;
+				first_job_id = will_run_resp->step_id.job_id;
 			if ((first_start == 0) ||
 			    (first_start < will_run_resp->start_time))
 				first_start = will_run_resp->start_time;
@@ -747,6 +827,8 @@ slurm_job_step_create (job_step_create_request_msg_t *req,
 	slurm_msg_t_init(&resp_msg);
 	req_msg.msg_type = REQUEST_JOB_STEP_CREATE;
 	req_msg.data     = req;
+	if (req->use_protocol_ver)
+		req_msg.protocol_version = req->use_protocol_ver;
 
 re_send:
 	/* xstrdup() to be consistent with reroute and be able to free. */
@@ -834,7 +916,7 @@ extern int slurm_allocation_lookup(uint32_t jobid,
 	slurm_msg_t resp_msg;
 
 	memset(&req, 0, sizeof(req));
-	req.job_id = jobid;
+	req.step_id.job_id = jobid;
 	req.req_cluster = slurm_conf.cluster_name;
 	slurm_msg_t_init(&req_msg);
 	slurm_msg_t_init(&resp_msg);
@@ -874,7 +956,7 @@ extern int slurm_allocation_lookup(uint32_t jobid,
  * NOTE: returns information an individual job as well
  * NOTE: free the response using list_destroy()
  */
-extern int slurm_het_job_lookup(uint32_t jobid, List *info)
+extern int slurm_het_job_lookup(uint32_t jobid, list_t **info)
 {
 	job_alloc_info_msg_t req;
 	slurm_msg_t req_msg;
@@ -882,7 +964,7 @@ extern int slurm_het_job_lookup(uint32_t jobid, List *info)
 	char *stepmgr_nodename = NULL;
 
 	memset(&req, 0, sizeof(req));
-	req.job_id = jobid;
+	req.step_id.job_id = jobid;
 	req.req_cluster = slurm_conf.cluster_name;
 	slurm_msg_t_init(&req_msg);
 	slurm_msg_t_init(&resp_msg);
@@ -927,7 +1009,7 @@ extern int slurm_het_job_lookup(uint32_t jobid, List *info)
 		*info = NULL;
 		break;
 	case RESPONSE_HET_JOB_ALLOCATION:
-		*info = (List) resp_msg.data;
+		*info = resp_msg.data;
 		return SLURM_SUCCESS;
 		break;
 	default:
@@ -1037,7 +1119,7 @@ _handle_rc_msg(slurm_msg_t *msg)
 
 /*
  * Read a Slurm hostfile specified by "filename".  "filename" must contain
- * a list of Slurm NodeNames, one per line, comma seperated, or * notation.
+ * a list of Slurm NodeNames, one per line, comma separated, or * notation.
  * Reads up to "n" number of hostnames from the file. Returns a string
  * representing a hostlist ranged string of the contents of the file.
  * This is a helper function, it does not contact any Slurm daemons.
@@ -1298,8 +1380,8 @@ static int _handle_msg(slurm_msg_t *msg, uint16_t msg_type, void **resp,
 		if (job_comp_msg->job_id == job_id) {
 			info("Job has been cancelled");
 		} else {
-			verbose("Ignoring SRUN_JOB_COMPLETE message for JobId=%u (our JobId=%u)",
-				job_comp_msg->job_id, job_id);
+			verbose("Ignoring SRUN_JOB_COMPLETE message for %pI (our JobId=%u)",
+				job_comp_msg, job_id);
 			rc = 2;
 		}
 	} else {
@@ -1318,33 +1400,30 @@ static int _handle_msg(slurm_msg_t *msg, uint16_t msg_type, void **resp,
 static int _accept_msg_connection(int listen_fd, uint16_t msg_type, void **resp,
 				  uint32_t job_id)
 {
-	int	     conn_fd;
+	void *conn = NULL;
 	slurm_msg_t  *msg = NULL;
 	slurm_addr_t cli_addr;
 	int          rc = 0;
 
-	conn_fd = slurm_accept_msg_conn(listen_fd, &cli_addr);
-	if (conn_fd < 0) {
-		error("Unable to accept connection: %m");
-		return rc;
-	}
+	if (!(conn = slurm_accept_msg_conn(listen_fd, &cli_addr)))
+		return 0;
 
 	debug2("got message connection from %pA", &cli_addr);
 
 	msg = xmalloc(sizeof(slurm_msg_t));
 	slurm_msg_t_init(msg);
 
-	if ((rc = slurm_receive_msg(conn_fd, msg, 0)) != 0) {
+	if ((rc = slurm_receive_msg(conn, msg, 0)) != 0) {
 		slurm_free_msg(msg);
 
 		if (errno == EINTR) {
-			close(conn_fd);
+			conn_g_destroy(conn, true);
 			*resp = NULL;
 			return 0;
 		}
 
 		error("%s[%pA]: %m", __func__, &cli_addr);
-		close(conn_fd);
+		conn_g_destroy(conn, true);
 		return SLURM_ERROR;
 	}
 
@@ -1352,7 +1431,7 @@ static int _accept_msg_connection(int listen_fd, uint16_t msg_type, void **resp,
 
 	slurm_free_msg(msg);
 
-	close(conn_fd);
+	conn_g_destroy(conn, true);
 	return rc;
 }
 
@@ -1405,21 +1484,21 @@ static int _wait_for_alloc_rpc(const listen_t *listen, int sleep_time)
 	return 0;
 }
 
-static void _wait_for_allocation_response(uint32_t job_id,
+static void _wait_for_allocation_response(slurm_step_id_t *step_id,
 					  const listen_t *listen,
 					  uint16_t msg_type, int timeout,
 					  void **resp)
 {
 	int errnum, rc;
 
-	info("job %u queued and waiting for resources", job_id);
+	info("job %u queued and waiting for resources", step_id->job_id);
 	*resp = NULL;
 	while (true) {
 		if ((rc = _wait_for_alloc_rpc(listen, timeout)) != 1)
 			break;
 
 		if ((rc = _accept_msg_connection(listen->fd, msg_type, resp,
-						 job_id)) != 2)
+						 step_id->job_id)) != 2)
 			break;
 	}
 	if (rc <= 0) {
@@ -1430,27 +1509,29 @@ static void _wait_for_allocation_response(uint32_t job_id,
 		 * has been granted.
 		 */
 		if (msg_type == RESPONSE_RESOURCE_ALLOCATION) {
-			if (slurm_allocation_lookup(job_id,
-					(resource_allocation_response_msg_t **)
-					resp) >= 0)
+			if (slurm_allocation_lookup(
+				    step_id->job_id,
+				    (resource_allocation_response_msg_t **)
+					    resp) >= 0)
 				return;
 		} else if (msg_type == RESPONSE_HET_JOB_ALLOCATION) {
-			if (slurm_het_job_lookup(job_id, (List *) resp) >= 0)
+			if (slurm_het_job_lookup(step_id->job_id,
+						 (list_t **) resp) >= 0)
 				return;
 		} else {
 			error("%s: Invalid msg_type (%u)", __func__, msg_type);
 		}
 
-		if (slurm_get_errno() == ESLURM_JOB_PENDING) {
+		if (errno == ESLURM_JOB_PENDING) {
 			debug3("Still waiting for allocation");
 			errno = errnum;
 			return;
 		} else {
-			debug3("Unable to confirm allocation for job %u: %m",
-			       job_id);
+			debug3("Unable to confirm allocation for %pI: %m",
+			       step_id);
 			return;
 		}
 	}
-	info("job %u has been allocated resources", job_id);
+	info("job %u has been allocated resources", step_id->job_id);
 	return;
 }

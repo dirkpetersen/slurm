@@ -118,6 +118,14 @@ Only dynamic nodes that have no running jobs and that are not part of a
 reservation can be deleted.
 </p>
 
+<h2 id="topology">Topology
+<a class="slurm_link" href="#topology"></a>
+</h2>
+<p>
+Nodes can be dynamically added to and removed from topologies as described in
+the <a href="topology.html">Topology Guide</a>.
+</p>
+
 <h2 id="limitations">Limitations
 <a class="slurm_link" href="#limitations"></a>
 </h2>
@@ -130,8 +138,5 @@ suboptimal job allocations if node names represent topology of the nodes.
 </li>
 </ol>
 </p>
-
-
-<p style="text-align:center;">Last modified 13 January 2024</p>
 
 <!--#include virtual="footer.txt"-->

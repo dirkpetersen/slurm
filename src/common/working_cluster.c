@@ -58,15 +58,7 @@
 extern uint16_t slurmdb_setup_cluster_dims(void)
 {
 	return working_cluster_rec ?
-		working_cluster_rec->dimensions : SYSTEM_DIMENSIONS;
-}
-
-extern int *slurmdb_setup_cluster_dim_size(void)
-{
-	if (working_cluster_rec)
-		return working_cluster_rec->dim_size;
-
-	return NULL;
+		working_cluster_rec->dimensions : 1;
 }
 
 extern uint32_t slurmdb_setup_cluster_flags(void)
@@ -82,65 +74,75 @@ extern uint32_t slurmdb_setup_cluster_flags(void)
 #ifdef MULTIPLE_SLURMD
 	cluster_flags |= CLUSTER_FLAG_MULTSD;
 #endif
-#ifdef HAVE_FRONT_END
-	cluster_flags |= CLUSTER_FLAG_FE;
-#endif
 	return cluster_flags;
 }
 
-static uint32_t _str_2_cluster_flags(char *flags_in)
+#define T(flag, str) { flag, XSTRINGIFY(flag), str }
+static const struct {
+	slurmdb_cluster_flags_t flag;
+	char *flag_str;
+	char *str;
+} slurmdb_cluster_flags_map[] = {
+	T(CLUSTER_FLAG_DELETED, "Deleted"),
+	T(CLUSTER_FLAG_EXT, "External"),
+	T(CLUSTER_FLAG_FED, "Federation"),
+	T(CLUSTER_FLAG_MULTSD, "MultipleSlurmd"),
+	T(CLUSTER_FLAG_REGISTER, "Registering"),
+};
+#undef T
+
+static int _str_2_cluster_flags(const char *flags_in,
+				slurmdb_cluster_flags_t *flags_ptr)
 {
-	if (xstrcasestr(flags_in, "FrontEnd"))
-		return CLUSTER_FLAG_FE;
+	if (!flags_in || !flags_in[0])
+		return SLURM_SUCCESS;
 
-	if (xstrcasestr(flags_in, "MultipleSlurmd"))
-		return CLUSTER_FLAG_MULTSD;
+	for (int i = 0; i < ARRAY_SIZE(slurmdb_cluster_flags_map); i++) {
+		if (!xstrncasecmp(flags_in, slurmdb_cluster_flags_map[i].str,
+				  strlen(flags_in))) {
+			*flags_ptr |= slurmdb_cluster_flags_map[i].flag;
+			return SLURM_SUCCESS;
+		}
+	}
 
-	return (uint32_t) 0;
+	debug("%s: Unable to match %s to a slurmdbd_cluster_flags_t flag",
+	      __func__, flags_in);
+	return EINVAL;
 }
 
-
-extern uint32_t slurmdb_str_2_cluster_flags(char *flags_in)
+extern int slurmdb_str_2_cluster_flags(const char *flags_in,
+				       slurmdb_cluster_flags_t *flags_ptr)
 {
-	uint32_t cluster_flags = 0;
 	char *token, *my_flags, *last = NULL;
+	int rc = SLURM_SUCCESS;
+
+	/* Always reset flags */
+	*flags_ptr = CLUSTER_FLAG_NONE;
 
 	my_flags = xstrdup(flags_in);
 	token = strtok_r(my_flags, ",", &last);
-	while (token) {
-		cluster_flags |= _str_2_cluster_flags(token);
+	while (token && !(rc = _str_2_cluster_flags(token, flags_ptr)))
 		token = strtok_r(NULL, ",", &last);
-	}
-	xfree(my_flags);
 
-	return cluster_flags;
+	xfree(my_flags);
+	return rc;
 }
 
 /* must xfree() returned string */
-extern char *slurmdb_cluster_flags_2_str(uint32_t flags_in)
+extern char *slurmdb_cluster_flags_2_str(slurmdb_cluster_flags_t flags_in)
 {
-	char *cluster_flags = NULL;
+	char *cluster_flags = NULL, *at = NULL;
 
-	if (flags_in & CLUSTER_FLAG_FE) {
-		if (cluster_flags)
-			xstrcat(cluster_flags, ",");
-		xstrcat(cluster_flags, "FrontEnd");
+	if (!flags_in)
+		return xstrdup("None");
+
+	for (int i = 0; i < ARRAY_SIZE(slurmdb_cluster_flags_map); i++) {
+		if ((slurmdb_cluster_flags_map[i].flag & flags_in) ==
+		    slurmdb_cluster_flags_map[i].flag)
+			xstrfmtcatat(cluster_flags, &at, "%s%s",
+				     (cluster_flags ? "," : ""),
+				     slurmdb_cluster_flags_map[i].str);
 	}
-
-	if (flags_in & CLUSTER_FLAG_MULTSD) {
-		if (cluster_flags)
-			xstrcat(cluster_flags, ",");
-		xstrcat(cluster_flags, "MultipleSlurmd");
-	}
-
-	if (flags_in & CLUSTER_FLAG_EXT) {
-		if (cluster_flags)
-			xstrcat(cluster_flags, ",");
-		xstrcat(cluster_flags, "External");
-	}
-
-	if (!cluster_flags)
-		cluster_flags = xstrdup("None");
 
 	return cluster_flags;
 }

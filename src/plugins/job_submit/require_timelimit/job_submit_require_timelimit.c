@@ -38,32 +38,7 @@
 
 #include "src/slurmctld/slurmctld.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting t#include <time.h>he type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "auth" for Slurm authentication) and <method> is a
- * description of how this plugin satisfies that application.  Slurm will
- * only load authentication plugins if the plugin_type string has a prefix
- * of "auth/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-
+/* Required Slurm plugin symbols: */
 const char plugin_name[] = "Require time limit jobsubmit plugin";
 const char plugin_type[] = "job_submit/require_timelimit";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
@@ -88,7 +63,7 @@ int job_modify(job_desc_msg_t *job_desc, job_record_t *job_ptr,
 	       uint32_t submit_uid, char **err_msg)
 {
 	if (job_desc->time_limit == INFINITE) {
-		info("Bad replacement time limit for %u", job_desc->job_id);
+		info("Bad replacement time limit for %pI", &job_desc->step_id);
 		return ESLURM_INVALID_TIME_LIMIT;
 	}
 

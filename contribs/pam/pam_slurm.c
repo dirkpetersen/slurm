@@ -12,7 +12,7 @@
  *
  *  This file is part of pam_slurm, a PAM module for restricting access to
  *  the compute nodes within a cluster based on information obtained from
- *  Simple Linux Utility for Resource Managment (Slurm).  For details, see
+ *  Simple Linux Utility for Resource Management (Slurm).  For details, see
  *  <http://www.llnl.gov/linux/slurm/>.
  *
  *  pam_slurm is free software; you can redistribute it and/or modify it
@@ -68,7 +68,7 @@ struct _options {
 };
 
 /* Define the functions to be called before and after load since _init
- * and _fini are obsolete, and their use can lead to unpredicatable
+ * and _fini are obsolete, and their use can lead to unpredictable
  * results.
  */
 void __attribute__ ((constructor)) libpam_slurm_init(void);
@@ -348,12 +348,12 @@ _slurm_match_allocation(uid_t uid)
 		job_info_t *j = &msg->job_array[i];
 
 		if (j->job_state == JOB_RUNNING) {
-
-			DBG ("jobid %ld: nodes=\"%s\"", j->job_id, j->nodes);
+			DBG("jobid %ld: nodes=\"%s\"", j->step_id.job_id,
+			    j->nodes);
 
 			if (_hostrange_member(nodename, j->nodes) ) {
-				DBG ("user %ld allocated node %s in job %ld",
-				     uid, nodename, j->job_id);
+				DBG("user %ld allocated node %s in job %ld",
+				    uid, nodename, j->step_id.job_id);
 				authorized = 1;
 				break;
 			} else {
@@ -362,8 +362,9 @@ _slurm_match_allocation(uid_t uid)
 				if (nodename) {
 					if (_hostrange_member(nodename,
 							      j->nodes)) {
-						DBG ("user %ld allocated node %s in job %ld",
-						     uid, nodename, j->job_id);
+						DBG("user %ld allocated node %s in job %ld",
+						    uid, nodename,
+						    j->step_id.job_id);
 						authorized = 1;
 						xfree(nodename);
 						break;

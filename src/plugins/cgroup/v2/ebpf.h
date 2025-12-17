@@ -95,10 +95,15 @@ extern void close_ebpf_prog(bpf_program_t *close_ebpf_prog, bool def_action);
  * IN override_flag - true sets BPF_F_ALLOW_OVERRIDE flag to the program, this
  *		      indicates that any descendent cgroups bpf program will
  *		      override this bpf program
- * RET SLURM_SUCCESS on successfull load, SLURM_ERROR otherwise.
+ * RET SLURM_SUCCESS on successful load, SLURM_ERROR otherwise.
  */
 extern int load_ebpf_prog(bpf_program_t *program, const char cgroup_path[],
-			  bool override_flag);
+			  bool override_flag, int token_fd);
+
+/* BPF token section */
+extern int bpf_fsopen(void);
+extern int bpf_fsconfig(int fd);
+extern int bpf_create_token(int bpf_fs_fd);
 
 /*
  * free_ebpf_prog -Frees the memory allocated by the program

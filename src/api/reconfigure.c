@@ -51,6 +51,8 @@
 #include "src/common/timers.h"
 #include "src/common/xmalloc.h"
 
+#include "src/interfaces/conn.h"
+
 static int _send_message_controller(int dest, slurm_msg_t *req);
 
 /*
@@ -95,10 +97,31 @@ extern int slurm_ping(int dest)
 	return rc;
 }
 
+/*
+ * This will ping all controllers for the current cluster,
+ * or if --cluster=<name> is specified, it will ping the
+ * primary for a remote cluster.
+ */
 extern controller_ping_t *ping_all_controllers(void)
 {
 	controller_ping_t *pings =
 		xcalloc(slurm_conf.control_cnt + 1, sizeof(*pings));
+
+	/* Only ping primary for --cluster=cluster */
+	if (working_cluster_rec) {
+		DEF_TIMERS;
+		/* hostname is not known, use cluster name */
+		pings[0].hostname = working_cluster_rec->name;
+		pings[0].offset = 0;
+
+		START_TIMER;
+		pings[0].pinged = !slurm_ping(0);
+		END_TIMER;
+
+		pings[0].latency = TIMER_DURATION_USEC();
+
+		return pings;
+	}
 
 	for (int i = 0; i < slurm_conf.control_cnt; i++) {
 		DEF_TIMERS;
@@ -110,7 +133,7 @@ extern controller_ping_t *ping_all_controllers(void)
 		pings[i].pinged = !slurm_ping(i);
 		END_TIMER;
 
-		pings[i].latency = DELTA_TIMER;
+		pings[i].latency = TIMER_DURATION_USEC();
 	}
 
 	return pings;
@@ -167,34 +190,33 @@ extern int slurm_takeover(int backup_inx)
 static int _send_message_controller(int dest, slurm_msg_t *req)
 {
 	int rc = SLURM_SUCCESS;
-	int fd = -1;
+	void *conn = NULL;
 	slurm_msg_t resp_msg;
 
 	/*
 	 * always communicate with a single node (primary or some backup per
 	 * value of "dest")
 	 */
-	if ((fd = slurm_open_controller_conn_spec(dest,
-						  working_cluster_rec)) < 0) {
+	if (!(conn = slurm_open_controller(dest, working_cluster_rec))) {
 		slurm_seterrno_ret(SLURMCTLD_COMMUNICATIONS_CONNECTION_ERROR);
 	}
 
 	slurm_msg_set_r_uid(req, slurm_conf.slurm_user_id);
-	if (slurm_send_node_msg(fd, req) < 0) {
-		close(fd);
+	if (slurm_send_node_msg(conn, req) < 0) {
+		conn_g_destroy(conn, true);
 		slurm_seterrno_ret(SLURMCTLD_COMMUNICATIONS_SEND_ERROR);
 	}
-	slurm_msg_t_init(&resp_msg);
 
-	if ((rc = slurm_receive_msg(fd, &resp_msg, 0)) != 0) {
+	slurm_msg_t_init(&resp_msg);
+	if ((rc = slurm_receive_msg(conn, &resp_msg, 0)) != 0) {
 		slurm_free_msg_members(&resp_msg);
-		close(fd);
+		conn_g_destroy(conn, true);
 		return SLURMCTLD_COMMUNICATIONS_RECEIVE_ERROR;
 	}
 
-	if (close(fd) != SLURM_SUCCESS)
-		rc = SLURMCTLD_COMMUNICATIONS_SHUTDOWN_ERROR;
-	else if (resp_msg.msg_type != RESPONSE_SLURM_RC)
+	conn_g_destroy(conn, true);
+
+	if (resp_msg.msg_type != RESPONSE_SLURM_RC)
 		rc = SLURM_UNEXPECTED_MSG_ERROR;
 	else
 		rc = slurm_get_return_code(resp_msg.msg_type,

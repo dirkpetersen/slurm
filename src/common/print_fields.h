@@ -65,11 +65,16 @@ struct print_field {
 };
 
 typedef struct {
+	uint32_t array_job_id;
 	uint32_t array_task_id;
-	char *first_step_name;
 	char *first_step_node;
-	uint32_t jobid;
+	bool is_srun;
+	bool io_per_task;
 	char *jobname;
+	uint32_t nodeid;
+	uint16_t restart_cnt;
+	slurm_step_id_t step_id;
+	uint32_t taskid;
 	char *user;
 	char *work_dir;
 } job_std_pattern_t;
@@ -85,7 +90,7 @@ extern int print_fields_have_header;
 extern char *fields_delimiter;
 
 extern void destroy_print_field(void *object);
-extern void print_fields_header(List print_fields_list);
+extern void print_fields_header(list_t *print_fields_list);
 extern void print_fields_date(print_field_t *field, void *input, int last);
 extern void print_fields_str(print_field_t *field, void *input, int last);
 extern void print_fields_double(print_field_t *field, void *input, int last);
@@ -99,6 +104,7 @@ extern void print_fields_time_from_mins(print_field_t *field,
 					void *input, int last);
 extern void print_fields_time_from_secs(print_field_t *field,
 					void *input, int last);
+extern void print_fields_sluid(print_field_t *field, void *input, int last);
 extern void print_fields_char_list(print_field_t *field, void *input, int last);
 extern char *expand_stdio_fields(char *stdio_path, job_std_pattern_t *job);
 

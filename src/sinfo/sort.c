@@ -90,7 +90,7 @@ static int _sort_by_weight(void *void1, void *void2);
 /*****************************************************************************
  * Global Sort Function
  *****************************************************************************/
-void sort_sinfo_list(List sinfo_list)
+void sort_sinfo_list(list_t *sinfo_list)
 {
 	int i;
 
@@ -630,8 +630,8 @@ static int _sort_by_partition(void *void1, void *void2)
 	_get_sinfo_from_void(&sinfo1, &sinfo2, void1, void2);
 
 	if (part_order) {
-		diff = slurm_sort_uint_list_asc(&sinfo1->part_inx,
-						&sinfo2->part_inx);
+		diff = slurm_sort_uint16_list_asc(&sinfo1->part_inx,
+						  &sinfo2->part_inx);
 	} else {
 		if (sinfo1->part_info && sinfo1->part_info->name)
 			val1 = sinfo1->part_info->name;

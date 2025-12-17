@@ -66,9 +66,10 @@ int rollback_flag;       /* immediate execute=1, else = 0 */
 int with_assoc_flag = 0;
 void *db_conn = NULL;
 uint32_t my_uid = 0;
-List g_qos_list = NULL;
-List g_res_list = NULL;
-List g_tres_list = NULL;
+char *my_user_name = NULL;
+list_t *g_qos_list = NULL;
+list_t *g_res_list = NULL;
+list_t *g_tres_list = NULL;
 const char *mime_type = NULL; /* mimetype if we are using data_parser */
 const char *data_parser = NULL; /* data_parser args */
 
@@ -84,6 +85,7 @@ static void	_show_it(int argc, char **argv);
 static void	_modify_it(int argc, char **argv);
 static void	_delete_it(int argc, char **argv);
 static int	_get_command(int *argc, char **argv);
+static int	_ping(int argc, char **argv);
 static void     _print_version(void);
 static int	_process_command(int argc, char **argv);
 static void	_usage(void);
@@ -157,6 +159,11 @@ int main(int argc, char **argv)
 			PRINT_FIELDS_PARSABLE_NO_ENDING;
 			break;
 		case (int)'Q':
+			if (quiet_flag == -1) {
+				fprintf(stderr,
+					"conflicting 'quiet' and 'verbose' options\n");
+				exit(1);
+			}
 			quiet_flag = 1;
 			break;
 		case (int)'r':
@@ -166,6 +173,11 @@ int main(int argc, char **argv)
 			with_assoc_flag = 1;
 			break;
 		case (int)'v':
+			if (quiet_flag == 1) {
+				fprintf(stderr,
+					"conflicting 'quiet' and 'verbose' options\n");
+				exit(1);
+			}
 			quiet_flag = -1;
 			verbosity++;
 			break;
@@ -180,14 +192,12 @@ int main(int argc, char **argv)
 		case OPT_LONG_JSON :
 			mime_type = MIME_TYPE_JSON;
 			data_parser = optarg;
-			if (serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))
-				fatal("JSON plugin load failure");
+			serializer_required(MIME_TYPE_JSON);
 			break;
 		case OPT_LONG_YAML :
 			mime_type = MIME_TYPE_YAML;
 			data_parser = optarg;
-			if (serializer_g_init(MIME_TYPE_YAML_PLUGIN, NULL))
-				fatal("YAML plugin load failure");
+			serializer_required(MIME_TYPE_YAML);
 			break;
 		default:
 			exit_code = 1;
@@ -200,6 +210,11 @@ int main(int argc, char **argv)
 	if (verbosity) {
 		opts.stderr_level += verbosity;
 		opts.prefix_level = 1;
+		log_alter(opts, 0, NULL);
+	}
+
+	if (quiet_flag == 1) {
+		opts.stderr_level = LOG_LEVEL_ERROR;
 		log_alter(opts, 0, NULL);
 	}
 
@@ -218,6 +233,7 @@ int main(int argc, char **argv)
 		have_db_conn = true;
 
 	my_uid = getuid();
+	my_user_name = uid_to_string_cached(my_uid);
 
 	if (persist_conn_flags & PERSIST_FLAG_P_USER_CASE)
 		user_case_norm = false;
@@ -271,10 +287,15 @@ int main(int argc, char **argv)
 	if (local_exit_code)
 		exit_code = local_exit_code;
 	slurmdb_connection_close(&db_conn);
-	acct_storage_g_fini();
+
+#ifdef MEMORY_LEAK_DEBUG
+	log_fini();
+	slurm_fini();
+	uid_cache_clear();
 	FREE_NULL_LIST(g_qos_list);
 	FREE_NULL_LIST(g_res_list);
 	FREE_NULL_LIST(g_tres_list);
+#endif
 
 	exit(exit_code);
 }
@@ -387,6 +408,60 @@ static int _get_command (int *argc, char **argv)
 	return 0;
 }
 
+static void _set_ping_exit_code(slurmdbd_ping_t *ping)
+{
+	static bool slurmdbd_up = false;
+
+	if (ping->pinged) {
+		exit_code = SLURM_SUCCESS;
+		slurmdbd_up = true;
+	} else if (!slurmdbd_up) {
+		/* don't overwrite exit code if another slurmdbd is up */
+		exit_code = 1;
+	}
+}
+
+static void _print_db_ping(slurmdbd_ping_t *ping)
+{
+	char *state;
+	char *mode;
+
+	if (ping->pinged)
+		state = "UP";
+	else
+		state = "DOWN";
+
+	if (ping->offset == 0)
+		mode = "primary";
+	else
+		mode = "backup";
+
+	printf("slurmdbd(%s) at %s is %s\n", mode, ping->hostname, state);
+}
+
+static int _ping(int argc, char **argv)
+{
+	int rc = SLURM_SUCCESS;
+	slurmdbd_ping_t *pings = NULL;
+
+	if (!(pings = slurmdb_ping_all())) {
+		error("Failed to perform slurmdbd pings");
+		return SLURM_ERROR;
+	}
+
+	if (mime_type) {
+		DATA_DUMP_CLI_SINGLE(OPENAPI_SLURMDBD_PING_RESP, pings, argc,
+				     argv, db_conn, mime_type, data_parser, rc);
+	} else  {
+		for (int i = 0; pings[i].hostname; i++) {
+			_print_db_ping(&pings[i]);
+			_set_ping_exit_code(&pings[i]);
+		}
+	}
+
+	xfree(pings);
+	return rc;
+}
 
 static void _print_version(void)
 {
@@ -449,6 +524,9 @@ static int _process_command (int argc, char **argv)
 			fprintf (stderr, "too many arguments for keyword:%s\n",
 				 argv[0]);
 		}
+		log_options_t opts = LOG_OPTS_STDERR_ONLY;
+		opts.stderr_level = LOG_LEVEL_ERROR;
+		log_alter(opts, 0, NULL);
 		quiet_flag = 1;
 	} else if ((xstrncasecmp(argv[0], "exit", MAX(command_len, 4)) == 0) ||
 		   (xstrncasecmp(argv[0], "\\q", MAX(command_len, 2)) == 0) ||
@@ -487,7 +565,19 @@ static int _process_command (int argc, char **argv)
 				 "too many arguments for %s keyword\n",
 				 argv[0]);
 		}
+		log_options_t opts = LOG_OPTS_STDERR_ONLY;
+		opts.stderr_level += verbosity;
+		log_alter(opts, 0, NULL);
 		quiet_flag = -1;
+	} else if (xstrncasecmp(argv[0], "ping", MAX(command_len, 4)) == 0) {
+		if (argc > 1) {
+			exit_code = 1;
+			fprintf(stderr, "too many arguments for %s keyword\n",
+				argv[0]);
+		}
+
+		if (_ping(argc, argv))
+			fprintf(stderr, "unable to run ping\n");
 	} else if (xstrncasecmp(argv[0], "readonly",
 				MAX(command_len, 4)) == 0) {
 		if (argc > 1) {
@@ -524,18 +614,25 @@ static int _process_command (int argc, char **argv)
 			my_end = parse_time(argv[2], 1);
 		if (argc > 3)
 			archive_data = atoi(argv[3]);
-		if (slurmdb_usage_roll(db_conn, my_start,
-				       my_end, archive_data, NULL)
-		   == SLURM_SUCCESS) {
+		if (slurmdb_usage_roll(db_conn, my_start, my_end, archive_data,
+				       NULL) == SLURM_SUCCESS) {
 			if (commit_check("Would you like to commit rollup?")) {
-				slurmdb_connection_commit(db_conn, 1);
+				exit_code =
+					slurmdb_connection_commit(db_conn, 1);
+				if (exit_code != SLURM_SUCCESS)
+					fprintf(stderr, " Error committing changes: %s\n",
+						slurm_strerror(exit_code));
 			} else {
 				printf(" Rollup Discarded\n");
-				slurmdb_connection_commit(db_conn, 0);
+				exit_code =
+					slurmdb_connection_commit(db_conn, 0);
+				if (exit_code != SLURM_SUCCESS)
+					fprintf(stderr, " Error rolling back changes: %s\n",
+						slurm_strerror(exit_code));
 			}
 		}
-	} else if (xstrncasecmp(argv[0], "shutdown",
-				MAX(command_len, 4)) == 0) {
+	} else if (xstrncasecmp(argv[0], "shutdown", MAX(command_len, 4)) ==
+		   0) {
 		if (argc > 1) {
 			exit_code = 1;
 			fprintf (stderr,

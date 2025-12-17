@@ -50,34 +50,11 @@
 #include "src/lua/slurm_lua.h"
 #include "src/slurmctld/slurmctld.h"
 
-/*
- * These variables are required by the generic plugin interface.  If they
- * are not found in the plugin, the plugin loader will ignore it.
- *
- * plugin_name - a string giving a human-readable description of the
- * plugin.  There is no maximum length, but the symbol must refer to
- * a valid string.
- *
- * plugin_type - a string suggesting the type of the plugin or its
- * applicability to a particular form of data or method of data handling.
- * If the low-level plugin API is used, the contents of this string are
- * unimportant and may be anything.  Slurm uses the higher-level plugin
- * interface which requires this string to be of the form
- *
- *	<application>/<method>
- *
- * where <application> is a description of the intended application of
- * the plugin (e.g., "jobcomp" for Slurm job completion logging) and <method>
- * is a description of how this plugin satisfies that application.  Slurm will
- * only load job completion logging plugins if the plugin_type string has a
- * prefix of "jobcomp/".
- *
- * plugin_version - an unsigned 32-bit integer containing the Slurm version
- * (major.minor.micro combined into a single number).
- */
-const char plugin_name[]       	= "Job completion logging LUA plugin";
-const char plugin_type[]       	= "jobcomp/lua";
-const uint32_t plugin_version	= SLURM_VERSION_NUMBER;
+/* Required Slurm plugin symbols: */
+const char plugin_name[] = "Job completion logging LUA plugin";
+const char plugin_type[] = "jobcomp/lua";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
 static char *lua_script_path;
 static lua_State *L = NULL;
 static time_t lua_script_last_loaded = (time_t) 0;
@@ -149,10 +126,6 @@ static int _set_job_rec_field_index(lua_State *st)
 	return SLURM_SUCCESS;
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	int rc = SLURM_SUCCESS;
@@ -164,13 +137,13 @@ extern int init(void)
 	slurm_mutex_lock(&lua_lock);
 	rc = slurm_lua_loadscript(&L, "job_comp/lua",
 				  lua_script_path, req_fxns,
-				  &lua_script_last_loaded, NULL);
+				  &lua_script_last_loaded, NULL, NULL);
 	slurm_mutex_unlock(&lua_lock);
 
 	return rc;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	if (L) {
 		lua_close(L);
@@ -180,8 +153,6 @@ extern int fini(void)
 	xfree(lua_script_path);
 
 	slurm_lua_fini();
-
-	return SLURM_SUCCESS;
 }
 
 /*
@@ -194,13 +165,14 @@ extern int jobcomp_p_set_location(void)
 	return SLURM_SUCCESS;
 }
 
-extern int jobcomp_p_log_record(job_record_t *job_ptr)
+extern int jobcomp_p_record_job_end(job_record_t *job_ptr, uint32_t event)
 {
 	int rc;
 	slurm_mutex_lock(&lua_lock);
 
 	rc = slurm_lua_loadscript(&L, "jobcomp/lua", lua_script_path,
-				  req_fxns, &lua_script_last_loaded, NULL);
+				  req_fxns, &lua_script_last_loaded, NULL,
+				  NULL);
 
 	if (rc != SLURM_SUCCESS)
 		goto out;
@@ -234,7 +206,12 @@ out:	slurm_mutex_unlock(&lua_lock);
 	return rc;
 }
 
-extern List jobcomp_p_get_jobs(void *job_cond)
+extern list_t *jobcomp_p_get_jobs(void *job_cond)
 {
 	return NULL;
+}
+
+extern int jobcomp_p_record_job_start(job_record_t *job_ptr, uint32_t event)
+{
+	return SLURM_SUCCESS;
 }

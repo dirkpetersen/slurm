@@ -40,6 +40,7 @@
 #define __GENERIC_PLUGIN_H__
 
 #include <inttypes.h>
+#include <stdbool.h>
 #include <sys/types.h>
 #include <dirent.h>
 
@@ -102,7 +103,8 @@ extern int plugin_peek(const char *fq_path, char *plugin_type,
  *
  * RET SLURM_SUCCESS or error
  */
-extern int plugin_load_from_file(plugin_handle_t *pph, const char *fq_path);
+extern int plugin_load_from_file(plugin_handle_t *pph, const char *fq_path,
+				 bool required);
 
 /*
  * load plugin and link hooks.
@@ -188,6 +190,6 @@ extern int plugin_context_destroy(plugin_context_t *c);
  * IN plugin_type - Type of plugin to search for in the plugin_dir.
  * RET list of plugin names, NULL if none found.
  */
-extern List plugin_get_plugins_of_type(char *plugin_type);
+extern list_t *plugin_get_plugins_of_type(char *plugin_type);
 
 #endif /*__GENERIC_PLUGIN_H__*/

@@ -35,7 +35,6 @@
 
 #define _GNU_SOURCE
 
-#include <sched.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/mount.h>
@@ -171,6 +170,9 @@ extern int setup_imex_channel(uint32_t channel, bool create_ns)
 	}
 	umask(mask);
 	xfree(path);
+
+	log_flag(SWITCH, "Successfully setup IMEX channel ID %d at %s",
+                 channel, path);
 
 	return rc;
 }

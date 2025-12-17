@@ -154,6 +154,7 @@ static void _parse_create(int argc, char **argv)
 		case OPT_LONG_BUNDLE:
 		case 'b':
 			xfree(state.bundle);
+			xfree(state.orig_bundle);
 			state.bundle = xstrdup(optarg);
 			state.orig_bundle = xstrdup(optarg);
 			break;
@@ -162,13 +163,13 @@ static void _parse_create(int argc, char **argv)
 			state.console_socket = xstrdup(optarg);
 			break;
 		case OPT_LONG_NO_PIVOT:
-			info("WARNING: ignoring --no-pivot argument");
+			debug("WARNING: ignoring --no-pivot argument");
 			break;
 		case OPT_LONG_NO_NEW_KEYRING:
-			info("WARNING: ignoring --no-new-keyring argument");
+			debug("WARNING: ignoring --no-new-keyring argument");
 			break;
 		case OPT_LONG_PRESERVE_FDS:
-			info("WARNING: ignoring --preserve-fds argument");
+			debug("WARNING: ignoring --preserve-fds argument");
 			break;
 		case OPT_LONG_PID_FILE:
 			xfree(state.pid_file);
@@ -252,7 +253,7 @@ static void _parse_kill(int argc, char **argv)
 				&option_index)) != -1) {
 		switch (c) {
 		case OPT_LONG_ALL:
-			info("WARNING: ignoring --all argument");
+			debug("WARNING: ignoring --all argument");
 			break;
 		default:
 			fatal("unknown argument: %s", argv[optopt]);
@@ -524,7 +525,7 @@ static int _parse_commandline(int argc, char **argv)
 				&option_index)) != -1) {
 		switch (c) {
 		case OPT_LONG_CGROUP_MANAGER:
-			info("WARNING: ignoring --cgroup-manager argument");
+			debug("WARNING: ignoring --cgroup-manager argument");
 			break;
 		case OPT_LONG_LOG_FILE :
 			xfree(log_file);
@@ -554,10 +555,10 @@ static int _parse_commandline(int argc, char **argv)
 			state.root_dir = xstrdup(optarg);
 			break;
 		case OPT_LONG_ROOTLESS:
-			info("WARNING: ignoring --rootless argument");
+			debug("WARNING: ignoring --rootless argument");
 			break;
 		case OPT_LONG_SYSTEMD_CGROUP:
-			info("WARNING: ignoring --systemd-cgroup argument");
+			debug("WARNING: ignoring --systemd-cgroup argument");
 			break;
 		case '?':
 		case OPT_LONG_HELP:
@@ -640,7 +641,7 @@ static void _set_root()
 		return;
 
 	if (!getuid())
-		fatal("scrun is being run as root and is likely inside of a username space. Refusing to guess path for --root. It must be explicilty provided.");
+		fatal("scrun is being run as root and is likely inside of a username space. Refusing to guess path for --root. It must be explicitly provided.");
 
 	path = xstrdup_printf("/run/user/%d/", getuid());
 	rc = _try_tmp_path(path);
@@ -675,9 +676,6 @@ extern int main(int argc, char **argv)
 	argv_offset = _parse_commandline(argc, argv) - 1;
 
 	slurm_init(slurm_conf_filename);
-	if ((rc = gres_init()))
-		fatal("%s: Unable to GRES plugins: %s", __func__,
-		      slurm_strerror(rc));
 	if ((rc = get_oci_conf(&oci_conf)))
 		fatal("%s: unable to load oci.conf: %s",
 		      __func__, slurm_strerror(rc));
@@ -687,9 +685,7 @@ extern int main(int argc, char **argv)
 	if (!state.root_dir || !state.root_dir[0])
 		_set_root();
 
-	if ((rc = serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL)))
-		fatal("%s: error loading JSON parser: %s", __func__,
-		      slurm_strerror(rc));
+	serializer_required(MIME_TYPE_JSON);
 
 	if (get_log_level() >= LOG_LEVEL_DEBUG2) {
 		for (int i = 0; i < argc; i++)
@@ -723,12 +719,9 @@ extern int main(int argc, char **argv)
 	FREE_NULL_OCI_CONF(oci_conf);
 	xfree(slurm_conf_filename);
 	xfree(command_argv);
-	auth_g_fini();
 	fini_setproctitle();
-	gres_fini();
-	select_g_fini();
+	slurm_fini();
 	log_fini();
-	slurm_conf_destroy();
 #endif /* MEMORY_LEAK_DEBUG */
 
 	return rc;
